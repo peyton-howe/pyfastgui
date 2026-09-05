@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fastgui-core",
+    "crates/fastgui-render",
+    "crates/fastgui-render-vk",
+    "crates/fastgui-render-mtl",
+    "crates/fastgui-chrome",
+    "crates/fastgui-interop-cuda",
+    "crates/fastgui-py",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[profile.dev]
+# Vulkan validation + ash are slow uninstrumented; keep deps optimized in dev builds.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,0 +1,10 @@
+[package]
+name = "fastgui-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+crossbeam-channel = "0.5"
+taffy = "0.12"

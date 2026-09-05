@@ -1,0 +1,11 @@
+[package]
+name = "fastgui-chrome"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+fastgui-core = { path = "../fastgui-core" }
+cosmic-text = "0.14"
+tiny-skia = "0.11"

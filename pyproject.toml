@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "fastgui"
+version = "0.0.1"
+description = "Lightweight, GPU-native, no-GIL-safe Python GUI toolkit"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+manifest-path = "crates/fastgui-py/Cargo.toml"
+python-source = "python"
+module-name = "fastgui._fastgui"

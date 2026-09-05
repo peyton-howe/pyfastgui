@@ -1,0 +1,27 @@
+# Rust
+/target/
+
+# Python / maturin
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+dist/
+*.pyd
+*.pdb
+python/fastgui/*.pyd
+python/fastgui/*.pdb
+
+# Local wheels / build leftovers
+*.whl
+/wheels/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
