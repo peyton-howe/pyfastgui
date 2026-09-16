@@ -1,8 +1,4 @@
 //! Metal rendering backend (macOS) for fast-gui.
-//!
-//! No CUDA interop path -- Apple hasn't shipped an NVIDIA GPU since ~2019, so there is no
-//! zero-copy CUDA<->Metal surface to build (see `command::Command`'s doc comment).
-//! `Viewport.submit_frame()`'s CPU-copy path works unchanged.
 
 mod app;
 mod command;

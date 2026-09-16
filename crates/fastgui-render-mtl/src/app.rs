@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use fastgui_chrome::ChromeRenderer;
 use fastgui_core::widget::{WidgetId, WidgetKind, WidgetTree};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
@@ -40,13 +40,19 @@ pub enum RunError {
 
 struct App {
     title: String,
+    /// Layout / hit-test size in points (the Python `width`/`height`).
     width: u32,
     height: u32,
+    /// Backing-store size in pixels, from winit `Resized` / `inner_size`.
+    physical_width: u32,
+    physical_height: u32,
+    scale_factor: f64,
     clear_color: [f32; 4],
     handles: RenderThreadHandles,
     widget_tree: WidgetTree,
     chrome: ChromeRenderer,
     last_chrome_size: Option<(u32, u32)>,
+    last_raster_scale: f64,
     /// Set by `MutateWidgetTree` (`set_content` / `set_viewport`). When false, the window is
     /// just a clear color -- `basic_window.py` -- and we skip chrome rasterization entirely.
     has_widget_content: bool,
@@ -83,19 +89,27 @@ impl App {
     }
 
     fn upload_active_content(&mut self) -> Result<(), MtlRendererError> {
-        if !self.has_widget_content {
+        if !self.has_widget_content || self.physical_width == 0 || self.physical_height == 0 {
             return Ok(());
         }
 
-        let size_changed = self.last_chrome_size != Some((self.width, self.height));
+        let size_changed = self.last_chrome_size != Some((self.width, self.height))
+            || (self.last_raster_scale - self.scale_factor).abs() > 1e-6;
         let dragging_panel = self.dragging_panel_title.is_some();
         let chrome_dirty = self.widget_tree.is_dirty() || size_changed || dragging_panel;
         if chrome_dirty {
             self.widget_tree.compute_layout(self.width as f32, self.height as f32);
             let drop_indicator = self.hover_region.map(|(_, rect, zone)| (rect, zone));
-            let frame = self.chrome.rasterize(&self.widget_tree, self.width, self.height, drop_indicator);
+            let frame = self.chrome.rasterize(
+                &self.widget_tree,
+                self.physical_width,
+                self.physical_height,
+                drop_indicator,
+                self.scale_factor as f32,
+            );
             self.widget_tree.clear_dirty();
             self.last_chrome_size = Some((self.width, self.height));
+            self.last_raster_scale = self.scale_factor;
             if let Some(renderer) = &mut self.renderer {
                 renderer.set_chrome_frame(frame)?;
             }
@@ -132,7 +146,7 @@ impl App {
             };
             let Some(rect) = self.widget_tree.absolute_rect(id) else { continue };
             if rect.width >= 1.0 && rect.height >= 1.0 {
-                draws.push((*viewport_id, rect));
+                draws.push((*viewport_id, scale_rect(rect, self.scale_factor as f32)));
             }
         }
         draws
@@ -347,11 +361,18 @@ impl App {
         window.set_cursor(icon.unwrap_or(winit::window::CursorIcon::Default));
     }
 
-    /// Apply queued commands and (re-)render one frame right now. Unlike
-    /// `fastgui-render-vk::app`'s equivalent, there's no swapchain-recreation cost to debounce
-    /// around: `MetalRenderer::resize` only updates the `CAMetalLayer`'s `drawableSize` (no GPU
-    /// object recreation at all), so `WindowEvent::Resized` applies it immediately instead of
-    /// waiting for a settled debounce window.
+    fn apply_physical_size(&mut self, physical: PhysicalSize<u32>) {
+        self.physical_width = physical.width;
+        self.physical_height = physical.height;
+        if let Some(window) = &self.window {
+            self.scale_factor = window.scale_factor();
+        }
+        let logical = physical.to_logical::<f64>(self.scale_factor.max(0.01));
+        self.width = logical.width.round().max(0.0) as u32;
+        self.height = logical.height.round().max(0.0) as u32;
+    }
+
+    /// Drain queued commands and render one frame immediately.
     fn render_now(&mut self, event_loop: &ActiveEventLoop) {
         self.drain_commands();
         if let Err(err) = self.upload_active_content() {
@@ -387,7 +408,10 @@ impl ApplicationHandler for App {
             }
         };
 
-        match MetalRenderer::new(&window, self.width, self.height) {
+        self.scale_factor = window.scale_factor();
+        self.apply_physical_size(window.inner_size());
+
+        match MetalRenderer::new(&window, self.physical_width, self.physical_height) {
             Ok(renderer) => {
                 self.renderer = Some(renderer);
                 window.request_redraw();
@@ -403,22 +427,23 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.scale_factor = scale_factor;
+            }
             WindowEvent::Resized(size) => {
-                self.width = size.width;
-                self.height = size.height;
+                self.apply_physical_size(size);
                 if let Some(renderer) = &mut self.renderer {
-                    if let Err(err) = renderer.resize(self.width, self.height) {
+                    if let Err(err) = renderer.resize(self.physical_width, self.physical_height) {
                         self.error = Some(err.into());
                         event_loop.exit();
                         return;
                     }
                 }
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                self.render_now(event_loop);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = (position.x as f32, position.y as f32);
+                let logical = position.to_logical::<f64>(self.scale_factor.max(0.01));
+                self.cursor = (logical.x as f32, logical.y as f32);
                 let dragging = self.dragging_slider.is_some()
                     || self.dragging_splitter.is_some()
                     || self.dragging_panel_title.is_some()
@@ -490,11 +515,15 @@ pub fn run(
         title: title.to_owned(),
         width,
         height,
+        physical_width: width,
+        physical_height: height,
+        scale_factor: 1.0,
         clear_color,
         handles,
         widget_tree: WidgetTree::new(),
         chrome: ChromeRenderer::new(),
         last_chrome_size: None,
+        last_raster_scale: 0.0,
         has_widget_content: false,
         cursor: (0.0, 0.0),
         dragging_slider: None,
@@ -511,5 +540,14 @@ pub fn run(
     match app.error {
         Some(err) => Err(err),
         None => Ok(()),
+    }
+}
+
+fn scale_rect(rect: fastgui_core::widget::Rect, scale: f32) -> fastgui_core::widget::Rect {
+    fastgui_core::widget::Rect {
+        x: rect.x * scale,
+        y: rect.y * scale,
+        width: rect.width * scale,
+        height: rect.height * scale,
     }
 }

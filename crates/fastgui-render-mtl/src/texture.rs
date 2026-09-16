@@ -10,18 +10,8 @@ use objc2_metal::{
 
 use crate::error::MtlRendererError as Error;
 
-/// A GPU-sampled RGBA8 texture the CPU writes into every frame -- the Metal counterpart to
-/// `fastgui-render-vk::ViewportTexture`, which instead persistently maps a host-visible Vulkan
-/// image and memcpys into it respecting the driver-reported row pitch. Metal has no equivalent
-/// "map once, write forever" API for a sampled texture; `replaceRegion` is the sanctioned way to
-/// get CPU bytes into one, and it handles any internal row padding/tiling itself -- there's no
-/// row-pitch bookkeeping to do by hand here the way `ViewportTexture::upload` needs.
-///
-/// `StorageModeShared` unconditionally: on Apple Silicon (unified memory) this is already the
-/// fastest option, and this project's primary target hardware is Apple Silicon. A discrete-GPU
-/// Intel Mac would do better with `Managed` storage plus an explicit `didModifyRange` sync after
-/// each `replaceRegion` -- not implemented here, mirroring the Vulkan backend's own carried-
-/// forward simplifications (see `ViewportTexture`'s single-buffered-upload caveat there).
+/// CPU-writable RGBA8 texture sampled each frame. `StorageModeShared` is the right default on
+/// unified memory; `replaceRegion` copies tightly packed `CpuFrame` bytes (no row-pitch).
 pub struct ViewportTexture {
     pub texture: Retained<ProtocolObject<dyn MTLTexture>>,
     pub width: u32,

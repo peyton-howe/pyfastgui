@@ -149,7 +149,7 @@ impl App {
         if chrome_dirty {
             self.widget_tree.compute_layout(self.width as f32, self.height as f32);
             let drop_indicator = self.hover_region.map(|(_, rect, zone)| (rect, zone));
-            let frame = self.chrome.rasterize(&self.widget_tree, self.width, self.height, drop_indicator);
+            let frame = self.chrome.rasterize(&self.widget_tree, self.width, self.height, drop_indicator, 1.0);
             self.widget_tree.clear_dirty();
             self.last_chrome_size = Some((self.width, self.height));
             if let Some(renderer) = &mut self.renderer {

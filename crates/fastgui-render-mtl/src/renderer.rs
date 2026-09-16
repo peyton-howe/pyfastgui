@@ -6,7 +6,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::ClassType;
 use objc2_app_kit::NSView;
-use objc2_foundation::{CGPoint, CGRect, CGSize};
+use objc2_foundation::CGSize;
 use objc2_metal::{
     MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
@@ -24,9 +24,7 @@ struct SampledLayer {
 }
 
 /// Clears the layer to a solid color every frame and, once a viewport source has content, draws
-/// it as a full-window (or per-`Viewport`-widget-rect) textured quad on top -- the Metal
-/// counterpart to `fastgui-render-vk::VulkanRenderer`. No CUDA interop path: see
-/// `crate::command::Command`'s doc comment for why that's out of scope on macOS.
+/// it as a full-window (or per-`Viewport`-widget-rect) textured quad on top.
 pub struct MetalRenderer {
     // Kept alive for `resize()` (reads `.window().backingScaleFactor()`) -- otherwise unused
     // after `new()` sets `wantsLayer`/`layer` once.
@@ -58,9 +56,9 @@ impl MetalRenderer {
         let view: Retained<NSView> =
             unsafe { Retained::retain(handle.ns_view.as_ptr().cast()) }.ok_or(Error::NotAppKit)?;
 
-        let device = unsafe { MTLCreateSystemDefaultDevice() };
+        // Create-rule (+1). `from_raw` takes that ownership; `retain` would leak the device.
         let device: Retained<ProtocolObject<dyn MTLDevice>> =
-            unsafe { Retained::retain(device) }.ok_or(Error::NoDevice)?;
+            unsafe { Retained::from_raw(MTLCreateSystemDefaultDevice()) }.ok_or(Error::NoDevice)?;
         let queue = device.newCommandQueue().ok_or(Error::NoCommandQueue)?;
 
         // UNORM, deliberately not SRGB -- same reasoning as `fastgui-render-vk::VulkanRenderer`'s
@@ -109,10 +107,9 @@ impl MetalRenderer {
             return Ok(());
         }
 
+        let bounds = self.view.bounds();
+        self.layer.setFrame(bounds);
         let scale = self.view.window().map(|w| w.backingScaleFactor()).unwrap_or(1.0);
-        let point_size =
-            CGSize { width: width as f64 / scale, height: height as f64 / scale };
-        self.layer.setFrame(CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: point_size });
         self.layer.setContentsScale(scale);
         unsafe {
             self.layer.setDrawableSize(CGSize { width: width as f64, height: height as f64 });

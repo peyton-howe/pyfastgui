@@ -39,12 +39,8 @@ fragment float4 viewport_fragment(VertexOut in [[stage_in]],
 }
 "#;
 
-/// Draws a GPU texture as a full-window quad -- the Metal counterpart to
-/// `fastgui-render-vk::ViewportPipeline`. Unlike the Vulkan backend (one descriptor set per
-/// sampled layer, since `VkDescriptorSet` binds to a specific `vk::ImageView`), Metal's render
-/// encoder takes a texture/sampler directly per draw call (`setFragmentTexture`/
-/// `setFragmentSamplerState`) -- no per-layer allocation needed here at all, just one shared
-/// pipeline state and sampler for every chrome/viewport layer.
+/// Draws a GPU texture as a full-window (or per-rect) textured quad. One pipeline state and
+/// sampler are shared across chrome and every viewport layer.
 pub struct ViewportPipeline {
     state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
@@ -88,7 +84,7 @@ impl ViewportPipeline {
         sampler_descriptor.setTAddressMode(MTLSamplerAddressMode::ClampToEdge);
         let sampler = device
             .newSamplerStateWithDescriptor(&sampler_descriptor)
-            .expect("newSamplerStateWithDescriptor only returns None for an invalid descriptor");
+            .ok_or(Error::NoSampler)?;
 
         Ok(Self { state, sampler })
     }

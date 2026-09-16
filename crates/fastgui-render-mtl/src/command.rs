@@ -5,14 +5,7 @@ use fastgui_core::{CommandReceiver, CommandSender, Readback};
 use winit::event_loop::EventLoopProxy;
 
 /// Mutations a `Window` can receive from any Python thread, applied by the render thread once
-/// per frame -- the Metal-backend counterpart to `fastgui-render-vk::Command`. No
-/// `CreateCudaSurface` variant here: Apple hasn't shipped an NVIDIA GPU since ~2019, so there is
-/// no zero-copy CUDA<->Metal path to expose. `Viewport.create_cuda_surface()` is rejected at the
-/// `fastgui-py` boundary on macOS instead of ever reaching this command queue -- see
-/// `fastgui-py`'s `Viewport::create_cuda_surface`.
-///
-/// CPU viewport frames never flow through this queue -- they use `fastgui_core::FrameSlot`
-/// (latest-wins), same as the Vulkan backend.
+/// per frame. CPU viewport frames use `fastgui_core::FrameSlot` (latest-wins), not this queue.
 pub enum Command {
     SetClearColor([f32; 4]),
     MutateWidgetTree(Box<dyn FnOnce(&mut WidgetTree) + Send>),
