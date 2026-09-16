@@ -1,15 +1,19 @@
+mod backend;
 mod widgets;
 
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+#[cfg(not(target_os = "macos"))]
+use std::sync::Arc;
 
 use std::sync::atomic::AtomicU64;
 
-use fastgui_core::{
-    command_channel, oneshot_channel, CommandReceiver, CpuFrame, FrameSlot, PixelFormat, Readback,
-};
+use backend::{Command, CommandDispatch, EventWaker, RenderThreadHandles};
+use fastgui_core::{command_channel, CommandReceiver, CpuFrame, FrameSlot, PixelFormat, Readback};
+#[cfg(not(target_os = "macos"))]
+use fastgui_core::oneshot_channel;
+#[cfg(not(target_os = "macos"))]
 use fastgui_interop_cuda::{CudaContext, CudaStream, ExternalMemory, ExternalSemaphore};
-use fastgui_render_vk::{Command, CommandDispatch, EventWaker, RenderThreadHandles};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -22,6 +26,7 @@ fn next_viewport_id() -> u64 {
     NEXT_VIEWPORT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn cuda_err(err: fastgui_interop_cuda::CudaError) -> PyErr {
     PyRuntimeError::new_err(err.to_string())
 }
@@ -95,6 +100,9 @@ impl Viewport {
     /// **Unverified**: written against the CUDA driver API and Vulkan external-memory specs,
     /// but never run against a real CUDA-capable GPU during development. See
     /// `fastgui_interop_cuda`'s crate docs (in the Rust source) for the full caveat.
+    ///
+    /// Not available on macOS — see the `#[cfg(target_os = "macos")]` override below.
+    #[cfg(not(target_os = "macos"))]
     fn create_cuda_surface(&self, py: Python<'_>, width: u32, height: u32) -> PyResult<CudaSurface> {
         let dispatch = self
             .dispatch
@@ -143,6 +151,18 @@ impl Viewport {
             })
         })
     }
+
+    /// Apple hasn't shipped an NVIDIA GPU since ~2019, so there is no zero-copy CUDA<->Metal
+    /// surface to allocate here — see `fastgui_render_mtl::Command`'s doc comment for the same
+    /// reasoning one layer down. Use `Viewport.submit_frame()` (CPU copy) instead.
+    #[cfg(target_os = "macos")]
+    fn create_cuda_surface(&self, _py: Python<'_>, _width: u32, _height: u32) -> PyResult<CudaSurface> {
+        Err(PyRuntimeError::new_err(
+            "CUDA interop is not supported on macOS -- Apple has not shipped an NVIDIA GPU \
+             since ~2019, so there is no zero-copy CUDA<->Metal path. Use \
+             Viewport.submit_frame() (CPU copy) instead.",
+        ))
+    }
 }
 
 impl Viewport {
@@ -155,6 +175,7 @@ impl Viewport {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 struct CudaSurfaceInner {
     semaphore: ExternalSemaphore,
     stream: CudaStream,
@@ -167,6 +188,9 @@ struct CudaSurfaceInner {
 /// `signal_ready()` once a frame is complete.
 ///
 /// **Unverified** — see `Viewport.create_cuda_surface`.
+///
+/// Not available on macOS — see the stub definition below.
+#[cfg(not(target_os = "macos"))]
 #[pyclass]
 struct CudaSurface {
     _context: CudaContext,
@@ -179,6 +203,7 @@ struct CudaSurface {
     target_value: Arc<std::sync::atomic::AtomicU64>,
 }
 
+#[cfg(not(target_os = "macos"))]
 #[pymethods]
 impl CudaSurface {
     #[getter]
@@ -217,6 +242,17 @@ impl CudaSurface {
         })
     }
 }
+
+/// Never constructed — `Viewport::create_cuda_surface` always errors before reaching one on
+/// macOS (see its `#[cfg(target_os = "macos")]` override). Exists only so this type name and
+/// `_fastgui`'s `m.add_class::<CudaSurface>()` registration stay the same across platforms.
+#[cfg(target_os = "macos")]
+#[pyclass]
+struct CudaSurface;
+
+#[cfg(target_os = "macos")]
+#[pymethods]
+impl CudaSurface {}
 
 /// A top-level application window. `run()` opens it and blocks the calling thread, rendering
 /// until the user closes it.
@@ -404,7 +440,7 @@ impl Window {
                 clear_color: clear_color_readback,
                 waker: self.dispatch.waker.clone(),
             };
-            fastgui_render_vk::run(&title, width, height, initial_color, handles)
+            backend::run(&title, width, height, initial_color, handles)
                 .map_err(|err| PyRuntimeError::new_err(err.to_string()))
         })
     }

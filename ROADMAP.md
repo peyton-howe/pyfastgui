@@ -73,11 +73,22 @@ crates/
                               code) — run with `cargo run --example resize_probe -p
                               fastgui-render-vk` if live resize ever regresses; see M6 status's
                               "Tenth round" for what it found and why it's kept
-  fastgui-render-mtl/    STUB ONLY — empty placeholder for M5 (Metal, macOS). Not started.
+  fastgui-render-mtl/    Metal backend (macOS), via objc2-metal/objc2-quartz-core — M5, see its
+                          status section below for what's verified vs. not
+    src/renderer.rs         MetalRenderer: CAMetalLayer/device/pipeline setup, chrome + Viewport
+                              texture upload, render
+    src/app.rs               winit ApplicationHandler — mirrors fastgui-render-vk::app closely
+                              (same widget/drag logic), no CUDA, no resize debounce
+    src/pipeline.rs          ViewportPipeline: MSL fullscreen-triangle + sampling shaders
+    src/texture.rs           ViewportTexture: MTLTexture + replaceRegion CPU upload
   fastgui-chrome/        cosmic-text + tiny-skia widget rasterizer (ChromeRenderer)
   fastgui-interop-cuda/  CUDA driver API FFI, dynamically loads nvcuda.dll. UNVERIFIED — see M3.
   fastgui-py/            PyO3 bindings
-    src/lib.rs               Window, Viewport, CudaSurface
+    src/backend.rs           cfg-picks fastgui-render-mtl (macOS) vs fastgui-render-vk
+                              (else) so the rest of this crate names Command/CommandDispatch/
+                              EventWaker/RenderThreadHandles/run without a cfg at each call site
+    src/lib.rs               Window, Viewport, CudaSurface (macOS: stub that always errors —
+                              see M5's status section)
     src/widgets.rs            Box/Label/Button/Slider/Splitter/Panel, DescribedWidget
                               tree-building (see M6 status for Splitter/Panel)
 python/
@@ -188,15 +199,65 @@ Known simplifications carried forward from M4 (fine for now, worth knowing about
 - Single-buffered CPU-uploaded textures (M2/M4) can occasionally show one torn frame under
   fast updates — documented in code, non-fatal.
 
-## M5 — Metal backend (macOS) — deferred, user will do this on their Mac
+## M5 — Metal backend (macOS)
 
-Not started beyond the empty `fastgui-render-mtl` stub crate. Per the original architecture
-plan: Metal device/swapchain (`objc2-metal` or `metal-rs`), `IOSurface`-based texture import
-for OpenGL/Metal sources, and an explicit documented fallback for CUDA sources on macOS (no
-zero-copy path exists — NVIDIA GPUs haven't shipped in Macs since ~2019 — fall back through
-the existing `CpuFrame`/CPU-copy path). Should implement the same `fastgui_render::Renderer`
-trait `fastgui-render-vk` already established, so `fastgui-py` doesn't need to change to pick
-it up.
+### Status as of 2026-09-05
+
+Landed: `fastgui-render-mtl` is a full parallel implementation of `fastgui-render-vk`'s
+non-CUDA functionality — `MetalRenderer` (device/`CAMetalLayer`/pipeline setup, chrome +
+per-`Viewport` texture upload, render), `ViewportPipeline` (MSL fullscreen-triangle vertex
+shader + sampling fragment shader, compiled from an embedded source string, same trick
+`viewport.vert`/`.frag` use in GLSL), `ViewportTexture` (`MTLTexture` + `replaceRegion` CPU
+upload), and its own `app.rs`/`command.rs`/`error.rs` mirroring the Vulkan backend's shapes
+closely enough that `fastgui-py` picks whichever backend applies via a tiny `cfg`-gated
+`backend` shim module (`crates/fastgui-py/src/backend.rs`) instead of the (largely unused)
+`fastgui_render::Renderer` trait.
+
+**Binding choice: `objc2-metal`/`objc2-quartz-core`, not `metal-rs`.** Both were on the table;
+`objc2-metal` won because it was already resolved in `Cargo.lock` (pulled in transitively by
+`winit`'s own macOS backend, which uses `objc2`/`objc2-app-kit` for `NSWindow`/`NSView`) —
+using it keeps the whole stack on one Objective-C runtime instead of mixing in `metal-rs`'s
+older `objc`-crate-based one, and it's the same kind of direct, 1:1-with-Apple's-headers
+binding style this project already chose for Vulkan (`ash`) over a higher-level wrapper.
+
+**Architecture notes:**
+- `CAMetalLayer` is attached directly to winit's own `NSView` (`view.setWantsLayer(true)` +
+  `view.setLayer(metal_layer.as_super())`) — layer-*hosting*, not layer-*backed*, which means
+  (unlike a plain auto-backed view) AppKit does **not** keep the layer's `frame`/`contentsScale`
+  in sync with the view on its own. `MetalRenderer::resize()` does that explicitly every call:
+  recomputes the layer's point-space `frame` from the view's `backingScaleFactor` and sets
+  `drawableSize` in physical pixels.
+- No resize-debounce logic (unlike `fastgui-render-vk::app`'s `RESIZE_DEBOUNCE`, a ~2s-stall
+  DWM/swapchain-recreation workaround specific to Windows): `CAMetalLayer::setDrawableSize` is
+  cheap (no GPU object recreation), so `app.rs` applies a resize immediately on every
+  `WindowEvent::Resized`.
+- No CUDA interop path at all (`fastgui_render_mtl::Command` has no `CreateCudaSurface`
+  variant) — Apple hasn't shipped an NVIDIA GPU since ~2019, so there's no zero-copy
+  CUDA↔Metal surface to build. `fastgui-py`'s `Viewport.create_cuda_surface` is
+  `#[cfg(target_os = "macos")]`-overridden to return a clear `RuntimeError` instead of ever
+  reaching the render thread; `Viewport.submit_frame()` (CPU copy) works unchanged.
+- `ViewportTexture` uses `MTLStorageModeShared` unconditionally — correct and fast on Apple
+  Silicon's unified memory (this project's primary target), but leaves a real optimization on
+  the table for a discrete-GPU Intel Mac (`Managed` storage + explicit `didModifyRange` sync),
+  mirroring the Vulkan backend's own carried-forward single-buffered-upload simplification.
+
+**Verification — real but partial.** `cargo check --workspace` is clean (including
+`fastgui-render-vk` still compiling fine on macOS, now simply unused there — `fastgui-py`
+selects the backend via `target.'cfg(target_os = "macos")'.dependencies` in its `Cargo.toml`).
+`maturin develop` builds and installs a real extension module; both `basic_window.py`
+(clear-color-only path) and `widgets_demo.py` (the full path: MSL shader compile → render
+pipeline state → texture upload → sampler → `drawPrimitives` → present, via
+`fastgui-chrome`'s text/widget rasterization) launch, sit at 0% CPU under `ControlFlow::Wait`
+(not busy-looping or erroring in a retry loop) for 20+ seconds, and shut down cleanly on
+`SIGTERM` with no crash report. **This session's sandbox had no Screen Recording/Accessibility
+permission** (`screencapture`/`osascript`/`Quartz` all refused), so none of this was confirmed
+by an actual screenshot or by interactively clicking the button/dragging the slider — only by
+process behavior and the absence of errors/crashes. Whoever picks this up next on a normal
+interactive desktop session should: screenshot `widgets_demo.py` to confirm the button/label/
+slider actually render (not just that nothing crashed), confirm click/drag input work (same
+gap M4/M6 flagged for other sessions' sandboxes), and try `dock_layout.py`/`live_camera_feed.py`
+for the per-`Viewport`-widget-rect draw path (only chrome's full-window draw has been exercised
+so far).
 
 ## M6 — remaining work (this session's scope, per explicit user choice)
 

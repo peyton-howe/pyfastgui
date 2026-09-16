@@ -7,7 +7,7 @@ use fastgui_core::widget::{
     ChangeCallback, ClickCallback, Color, PanelDropCallback, SplitDirection, TabSelectCallback, WidgetId, WidgetKind,
     WidgetTree,
 };
-use fastgui_render_vk::{Command, CommandDispatch};
+use crate::backend::{Command, CommandDispatch};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyList};

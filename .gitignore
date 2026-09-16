@@ -12,8 +12,10 @@ __pycache__/
 dist/
 *.pyd
 *.pdb
+*.so
 python/fastgui/*.pyd
 python/fastgui/*.pdb
+python/fastgui/*.so
 
 # Local wheels / build leftovers
 *.whl
