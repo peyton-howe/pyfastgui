@@ -34,17 +34,21 @@ impl ChromeRenderer {
     }
 
     /// Rasterize `tree` (whose layout must already be up to date — call
-    /// `WidgetTree::compute_layout` first) into a `width`x`height` RGBA8 frame. `drop_indicator`
-    /// — `(region rect, zone)` — draws a translucent highlight over the sub-area of that region a
-    /// dragged `Panel` title bar would land in if released right now (see
-    /// `fastgui-render-vk::app`'s panel-drag handling); `None` when no drag is in progress.
+    /// `WidgetTree::compute_layout` first) into a `width`x`height` RGBA8 frame. Layout rects and
+    /// font sizes are in the same units as `compute_layout` and are multiplied by `scale` so a
+    /// HiDPI window can keep layout in points while the pixmap matches backing pixels.
+    /// `drop_indicator` — `(region rect, zone)` — draws a translucent highlight over the sub-area
+    /// of that region a dragged `Panel` title bar would land in if released right now; `None`
+    /// when no drag is in progress.
     pub fn rasterize(
         &mut self,
         tree: &WidgetTree,
         width: u32,
         height: u32,
         drop_indicator: Option<(fastgui_core::widget::Rect, DropZone)>,
+        scale: f32,
     ) -> CpuFrame {
+        let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
         let mut pixmap = Pixmap::new(width.max(1), height.max(1)).expect("nonzero dimensions");
         pixmap.fill(to_tiny_skia_color(BACKGROUND));
 
@@ -52,29 +56,30 @@ impl ChromeRenderer {
             let (Some(rect), Some(kind)) = (tree.absolute_rect(id), tree.kind(id)) else {
                 continue;
             };
+            let rect = scale_rect(rect, scale);
             match kind {
                 WidgetKind::Container { background, .. } => {
                     fill_rect(&mut pixmap, rect, *background);
                 }
                 WidgetKind::Label { text, font_size, color } => {
-                    self.draw_text(&mut pixmap, rect, text, *font_size, *color);
+                    self.draw_text(&mut pixmap, rect, text, *font_size * scale, *color);
                 }
                 WidgetKind::Button { text, font_size, text_color, background, .. } => {
                     fill_rect(&mut pixmap, rect, *background);
-                    self.draw_text(&mut pixmap, rect, text, *font_size, *text_color);
+                    self.draw_text(&mut pixmap, rect, text, *font_size * scale, *text_color);
                 }
                 WidgetKind::Slider { value, min, max, track_color, thumb_color, .. } => {
-                    draw_slider(&mut pixmap, rect, *value, *min, *max, *track_color, *thumb_color);
+                    draw_slider(&mut pixmap, rect, *value, *min, *max, *track_color, *thumb_color, scale);
                 }
                 WidgetKind::Splitter { bar_color, .. } => {
                     fill_rect(&mut pixmap, rect, *bar_color);
                 }
                 WidgetKind::TabBar { titles, active, font_size, text_color, active_color, inactive_color, .. } => {
-                    self.draw_tab_bar(&mut pixmap, rect, titles, *active, *font_size, *text_color, *active_color, *inactive_color);
+                    self.draw_tab_bar(&mut pixmap, rect, titles, *active, *font_size * scale, *text_color, *active_color, *inactive_color);
                 }
                 WidgetKind::PanelTitleBar { title, font_size, text_color, background, .. } => {
                     fill_rect(&mut pixmap, rect, *background);
-                    self.draw_text(&mut pixmap, rect, title, *font_size, *text_color);
+                    self.draw_text(&mut pixmap, rect, title, *font_size * scale, *text_color);
                 }
                 WidgetKind::Viewport { .. } => {
                     // Placeholder only — the GPU draws the real frame in this rect after chrome.
@@ -84,7 +89,7 @@ impl ChromeRenderer {
         }
 
         if let Some((region_rect, zone)) = drop_indicator {
-            fill_rect(&mut pixmap, drop_zone_rect(region_rect, zone), DROP_INDICATOR_COLOR);
+            fill_rect(&mut pixmap, scale_rect(drop_zone_rect(region_rect, zone), scale), DROP_INDICATOR_COLOR);
         }
 
         CpuFrame { width, height, format: PixelFormat::Rgba8, data: pixmap.data().to_vec() }
@@ -162,6 +167,7 @@ impl Default for ChromeRenderer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_slider(
     pixmap: &mut Pixmap,
     rect: fastgui_core::widget::Rect,
@@ -170,10 +176,11 @@ fn draw_slider(
     max: f32,
     track_color: Color,
     thumb_color: Color,
+    scale: f32,
 ) {
     const THUMB_RADIUS: f32 = 8.0;
 
-    let track_height = (rect.height * 0.3).max(2.0);
+    let track_height = (rect.height * 0.3).max(2.0 * scale);
     let track_y = rect.y + (rect.height - track_height) / 2.0;
     fill_rect(
         pixmap,
@@ -186,7 +193,7 @@ fn draw_slider(
     let thumb_y = rect.y + rect.height / 2.0;
 
     let mut path_builder = tiny_skia::PathBuilder::new();
-    path_builder.push_circle(thumb_x, thumb_y, THUMB_RADIUS);
+    path_builder.push_circle(thumb_x, thumb_y, THUMB_RADIUS * scale);
     if let Some(path) = path_builder.finish() {
         let mut paint = Paint::default();
         let [r, g, b, a] = thumb_color.0;
@@ -208,6 +215,15 @@ fn drop_zone_rect(region: fastgui_core::widget::Rect, zone: DropZone) -> fastgui
         DropZone::Right => Rect { x: region.x + region.width / 2.0, width: region.width / 2.0, ..region },
         DropZone::Top => Rect { height: region.height / 2.0, ..region },
         DropZone::Bottom => Rect { y: region.y + region.height / 2.0, height: region.height / 2.0, ..region },
+    }
+}
+
+fn scale_rect(rect: fastgui_core::widget::Rect, scale: f32) -> fastgui_core::widget::Rect {
+    fastgui_core::widget::Rect {
+        x: rect.x * scale,
+        y: rect.y * scale,
+        width: rect.width * scale,
+        height: rect.height * scale,
     }
 }
 

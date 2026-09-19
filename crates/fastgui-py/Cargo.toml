@@ -12,5 +12,10 @@ crate-type = ["cdylib"]
 [dependencies]
 fastgui-core = { path = "../fastgui-core" }
 fastgui-interop-cuda = { path = "../fastgui-interop-cuda" }
-fastgui-render-vk = { path = "../fastgui-render-vk" }
 pyo3 = { version = "0.29", features = ["extension-module"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fastgui-render-mtl = { path = "../fastgui-render-mtl" }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+fastgui-render-vk = { path = "../fastgui-render-vk" }

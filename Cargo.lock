@@ -431,6 +431,7 @@ version = "0.0.1"
 dependencies = [
  "fastgui-core",
  "fastgui-interop-cuda",
+ "fastgui-render-mtl",
  "fastgui-render-vk",
  "pyo3",
 ]
@@ -446,7 +447,18 @@ dependencies = [
 name = "fastgui-render-mtl"
 version = "0.0.1"
 dependencies = [
+ "crossbeam-channel",
+ "fastgui-chrome",
+ "fastgui-core",
  "fastgui-render",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "objc2-metal",
+ "objc2-quartz-core",
+ "raw-window-handle",
+ "thiserror 2.0.19",
+ "winit",
 ]
 
 [[package]]
