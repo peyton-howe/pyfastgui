@@ -932,8 +932,8 @@ Concrete and fully achievable/verifiable on this machine (at least the Windows l
   under `python/examples/`, pulled from each script's own docstring rather than re-describing
   them from scratch so the two can't drift silently), a widget API summary pointing at
   `__init__.pyi` for full signatures, and a known-limitations section (CUDA path unverified —
-  see M3, macOS not implemented — see M5, the remaining `DockArea`/floating-panel gaps, no
-  automated tests yet, mutually-exclusive `Viewport`/chrome).
+  see M3; macOS now has a Metal backend — see M5; the remaining `DockArea`/floating-panel
+  gaps; no GPU/window integration suite yet).
 - `docs/ARCHITECTURE.md`: crate-by-crate tour, then the threading model section this item was
   really about — `command_channel` (unbounded, ordered, fire-and-forget mutations) vs.
   `FrameSlot` (latest-wins mailbox, drops superseded frames on purpose) vs. `oneshot_channel`

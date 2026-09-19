@@ -1,14 +1,15 @@
 # fast-gui
 
 Lightweight, GPU-native, no-GIL-safe Python GUI toolkit, written in Rust (PyO3 bindings) with
-a native Vulkan renderer. Designed from the ground up for CPython's free-threaded (`Py_GIL_DISABLED`)
-build: every mutator is a message sent to a dedicated render thread over a lock-free queue, so
-nothing about the API requires holding the GIL, and multiple threads can safely drive the UI at
-once.
+a native GPU renderer — Vulkan on Windows and Linux, Metal on macOS. Designed from the ground
+up for CPython's free-threaded (`Py_GIL_DISABLED`) build: every mutator is a message sent to a
+dedicated render thread over a lock-free queue, so nothing about the API requires holding the
+GIL, and multiple threads can safely drive the UI at once.
 
 > **Status:** pre-alpha, actively developed, not yet published as a package. See
 > [ROADMAP.md](ROADMAP.md) for the full milestone-by-milestone history and current work.
-> Windows + Vulkan is the only platform verified so far — see [Known limitations](#known-limitations).
+> Windows (Vulkan) and macOS (Metal) are the platforms exercised so far — see
+> [Known limitations](#known-limitations).
 
 ## Why
 
@@ -17,15 +18,15 @@ CPU-bound abstraction that doesn't take advantage of the GPU already sitting in 
 fast-gui instead:
 
 - Renders everything — widget chrome and arbitrary GPU/CPU frame content (`Viewport`) — through
-  one Vulkan swapchain, with widget chrome rasterized via `cosmic-text` + `tiny-skia` and
-  uploaded as a single texture per frame.
+  a native GPU backend (Vulkan on Windows/Linux, Metal on macOS), with widget chrome rasterized
+  via `cosmic-text` + `tiny-skia` and uploaded as a single texture per frame.
 - Treats every widget mutation (`label.set_text(...)`, `slider.set_value(...)`, dragging a
   panel) as a command sent across a channel to the render thread, rather than requiring the
   caller to be "on the UI thread" — the free-threaded Python build can call into fast-gui from
   any thread without contention.
-- Supports zero-copy GPU interop: a CUDA kernel can write directly into a texture Vulkan
-  displays next frame, with no CPU round-trip (see `Viewport.create_cuda_surface` — currently
-  unverified on real hardware, see below).
+- Supports zero-copy GPU interop on the Vulkan backend: a CUDA kernel can write directly into a
+  texture displayed next frame, with no CPU round-trip (see `Viewport.create_cuda_surface` —
+  currently unverified on real hardware, and not available on macOS; see below).
 
 ## Quickstart
 
@@ -68,7 +69,7 @@ fast-gui isn't published yet — build it from source with [maturin](https://www
 git clone <this repo>
 cd fast-gui
 python -m venv .venv
-.venv\Scripts\activate      # PowerShell: .venv\Scripts\Activate.ps1
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install maturin numpy
 maturin develop --release
 ```
@@ -79,6 +80,9 @@ You'll also need the platform toolchain fast-gui itself builds against:
 - On Windows: MSVC Build Tools, and the [Vulkan SDK](https://vulkan.lunarg.com/) (needed to
   recompile `crates/fastgui-render-vk/shaders/*.spv` if you touch the shaders; prebuilt `.spv`
   files are checked in so a plain build doesn't need the SDK).
+- On macOS: Xcode Command Line Tools. Metal is part of the OS; there is no Vulkan SDK step.
+  `fastgui-py` selects the Metal backend automatically on this platform.
+- On Linux: a Vulkan-capable driver. Same shader note as Windows — prebuilt `.spv` is checked in.
 
 `maturin develop` builds the Rust extension and installs it editable into whichever venv is
 active — re-run it after any change under `crates/`. If you're testing against both a regular
@@ -96,7 +100,7 @@ All under [`python/examples/`](python/examples/), runnable directly once install
 | [`basic_window.py`](python/examples/basic_window.py) | Minimal window bring-up. |
 | [`threaded_mutation.py`](python/examples/threaded_mutation.py) | Calling a `Window` mutator concurrently from several threads — no GIL, no crash. |
 | [`live_camera_feed.py`](python/examples/live_camera_feed.py) | Streaming numpy frames into a `Viewport` from a background thread. |
-| [`cuda_viewport.py`](python/examples/cuda_viewport.py) | GPU-to-GPU CUDA→Vulkan interop, zero CPU copy. **Unverified — no NVIDIA GPU has tested this path, see below.** |
+| [`cuda_viewport.py`](python/examples/cuda_viewport.py) | GPU-to-GPU CUDA→Vulkan interop, zero CPU copy. **Unverified — no NVIDIA GPU has tested this path. Not available on macOS.** |
 | [`widgets_demo.py`](python/examples/widgets_demo.py) | `Box` layout, `Label`, `Button`, `Slider`, click/drag input. |
 | [`dock_layout.py`](python/examples/dock_layout.py) | A `DockArea` of resizable, titled `Panel`s with a live `Viewport` in the center. |
 | [`dock_rearrange_demo.py`](python/examples/dock_rearrange_demo.py) | Drag a panel's title bar to split or tab-merge regions, including dropping at the window's outer edge to span the whole dock area. |
@@ -125,20 +129,21 @@ its default is there.
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the crate layout and threading model in
 more depth. Short version: `fastgui-core` owns the cross-thread primitives (a command queue for
 fire-and-forget mutations, a latest-wins mailbox for frame data, a retained-mode widget tree
-over `taffy`) and is renderer-agnostic; `fastgui-render-vk` is the Vulkan backend and owns the
-actual window/event loop; `fastgui-chrome` rasterizes widget chrome into a texture that
-`fastgui-render-vk` uploads and displays like any other frame; `fastgui-py` is the PyO3 layer
-tying it all to a Python API.
+over `taffy`) and is renderer-agnostic; `fastgui-render-vk` (Windows/Linux) and
+`fastgui-render-mtl` (macOS) own the window and event loop; `fastgui-chrome` rasterizes widget
+chrome into a texture the active backend uploads and displays like any other frame; `fastgui-py`
+is the PyO3 layer and picks the backend with `cfg(target_os = "macos")`.
 
 ## Known limitations
 
-- **CUDA interop is unverified on real hardware.** The Vulkan-side export path
-  (`VK_KHR_external_memory_win32` + `VK_KHR_timeline_semaphore`) has been validated with zero
-  Vulkan validation errors on real (AMD) hardware, but the CUDA-side import has never run
-  against an actual NVIDIA GPU — this machine only has an integrated AMD GPU. Treat
-  `Viewport.create_cuda_surface` as unverified until someone runs it on NVIDIA hardware.
-- **No macOS support yet.** `fastgui-render-mtl` is an empty stub; Metal is planned (M5 in
-  ROADMAP.md) but not started.
+- **CUDA interop is unverified on real hardware, and is Vulkan-only.** The Vulkan-side export
+  path (`VK_KHR_external_memory_win32` + `VK_KHR_timeline_semaphore`) has been validated with
+  zero Vulkan validation errors on real (AMD) hardware, but the CUDA-side import has never run
+  against an actual NVIDIA GPU. On macOS there is no CUDA↔Metal path;
+  `Viewport.create_cuda_surface` raises `RuntimeError`. Treat the CUDA API as unverified until
+  someone runs it on NVIDIA hardware.
+- **Linux is less exercised than Windows and macOS.** It uses the same Vulkan backend as
+  Windows, but day-to-day bring-up has been on those two platforms.
 - **No text wrapping, scrolling, or keyboard input/focus handling** for any widget yet.
 - **`DockArea` gaps**: dropping a panel onto an *existing* `Tabs` group's center (to grow it
   past 2 members) isn't supported yet — only forming a new 2-member group, or ungrouping one
@@ -148,7 +153,7 @@ tying it all to a Python API.
   and `WidgetTree` layout/hit-test; `python -m unittest tests.test_dock_area` (from `python/`)
   covers `DockArea` tree surgery. There is no GPU/window integration suite yet.
 - **`.venv`/`env` are local, machine-specific dev environments**, not checked in — a fresh
-  clone needs its own `python -m venv` plus the Rust/Vulkan toolchain described in
+  clone needs its own `python -m venv` plus the Rust and platform GPU toolchain described in
   [Install](#install) before anything builds.
 
 ## Contributing / picking up development

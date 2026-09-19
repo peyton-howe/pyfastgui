@@ -18,8 +18,8 @@ crates/
                               Viewport), WidgetId, Color, hit_test / find_region_at, DropZone
 
   fastgui-render/         Renderer trait — the interface a GPU backend implements. Backend-
-                          agnostic; fastgui-py depends on this, not on fastgui-render-vk,
-                          in principle (in practice only the Vulkan backend exists so far).
+                          agnostic. In practice `fastgui-py` cfg-picks `fastgui-render-vk` or
+                          `fastgui-render-mtl` rather than dispatching through this trait.
 
   fastgui-render-vk/      The Vulkan backend (Windows + Linux). Owns the actual OS window and
                           event loop — this is the crate with a `fn main`-shaped entry point,
@@ -37,14 +37,25 @@ crates/
     shaders/                  viewport.vert/.frag source + precompiled .spv (checked in, so a
                               plain build doesn't need the Vulkan SDK)
 
-  fastgui-render-mtl/     Empty stub for a future Metal (macOS) backend. Would implement the
-                          same fastgui-render::Renderer trait so fastgui-py doesn't change.
+  fastgui-render-mtl/     The Metal backend (macOS). Same role as fastgui-render-vk: owns the
+                          OS window and event loop. Selected automatically by fastgui-py on
+                          macOS. No CUDA interop path — Viewport.create_cuda_surface raises
+                          on this platform; CPU submit_frame is unchanged.
+    src/renderer.rs          MetalRenderer: system MTLDevice, CAMetalLayer on winit's NSView,
+                              chrome + per-Viewport MTLTexture upload via replaceRegion
+    src/app.rs                winit ApplicationHandler mirroring fastgui-render-vk::app
+                              (widget/drag/dock logic, layout in points, chrome at backing
+                              scale)
+    src/command.rs            Command enum: SetClearColor, MutateWidgetTree (no CreateCudaSurface)
+    src/pipeline.rs           ViewportPipeline: MSL fullscreen-triangle + sampler
+    src/texture.rs            ViewportTexture: StorageModeShared MTLTexture + replaceRegion
 
   fastgui-chrome/         Widget rasterizer: walks a WidgetTree and draws it into one RGBA8
                           buffer via cosmic-text (text shaping) + tiny-skia (2D rasterization).
-                          That buffer is uploaded through the same ViewportTexture path M2
-                          built for arbitrary frame content — chrome is, from the renderer's
-                          perspective, just another frame.
+                          Layout units are multiplied by a scale factor so HiDPI backends can
+                          keep layout in points while the pixmap matches backing pixels. The
+                          buffer is uploaded through the same CPU-texture path Viewport frames
+                          use — chrome is, from the renderer's perspective, just another frame.
 
   fastgui-interop-cuda/   Raw CUDA driver API FFI (struct layouts transcribed from NVIDIA's own
                           cuda-python bindings generator), dynamically loading nvcuda.dll via
@@ -53,7 +64,9 @@ crates/
                           without a working CUDA driver.
 
   fastgui-py/             PyO3 bindings — the only crate that knows about Python.
-    src/lib.rs                Window, Viewport, CudaSurface pyclasses
+    src/backend.rs            cfg-picks fastgui-render-mtl on macOS, fastgui-render-vk elsewhere
+    src/lib.rs                Window, Viewport, CudaSurface pyclasses (create_cuda_surface is a
+                              RuntimeError stub on macOS)
     src/widgets.rs             Label/Button/Slider/Box/Splitter/Panel/Tabs pyclasses, the
                               DescribedWidget tree-building/attach machinery
 
@@ -124,7 +137,8 @@ composing child `Label`/`Container` nodes. This sidesteps a real bug class hit e
 docking work: `align-items: stretch` combined with taffy's intrinsic text measurement squeezed
 and clipped title/tab text when it was built from composed children instead.
 
-Mouse input is dispatched by `fastgui-render-vk::app`: hit-testing walks the tree for the
+Mouse input is dispatched by each backend's `app` (`fastgui-render-vk` or
+`fastgui-render-mtl`): hit-testing walks the tree for the
 topmost widget under the cursor (`hit_test`) for normal clicks, or the topmost *drop region*
 (`find_region_at`, which only considers `Container` nodes carrying a `region_id` — dock regions
 never overlap, unlike arbitrary widgets, so this is a cheaper and more specific query) while a
@@ -136,14 +150,18 @@ target_id, zone`) via a callback, and decides how to restructure its own tree fr
 
 ## Rendering pipeline
 
-Each frame clears the swapchain, then optionally draws widget chrome (a full-window CPU raster
-from `fastgui-chrome`, uploaded through a host-visible `LINEAR` `R8G8B8A8_UNORM` texture) and
-then any in-tree `Viewport` widgets on top, each sampled into its layout rect via the same
-fullscreen-triangle pipeline (no vertex buffer — positions come from `gl_VertexIndex`; a
-smaller Vulkan viewport/scissor places that triangle in the widget's rect). `Window.set_viewport`
-is just `set_content` of a filling `Viewport` widget. The swapchain surface format is `_UNORM`,
-not `_SRGB` — an early bug had the GPU silently gamma-re-encoding colors that were already
-final display bytes, washing out midtones.
+Each frame clears the surface, then optionally draws widget chrome (a full-window CPU raster
+from `fastgui-chrome`) and then any in-tree `Viewport` widgets on top, each sampled into its
+layout rect via a fullscreen-triangle pipeline (no vertex buffer). `Window.set_viewport` is just
+`set_content` of a filling `Viewport` widget. Color surfaces are `_UNORM` / `BGRA8Unorm`, not
+sRGB — an early bug had the GPU silently gamma-re-encoding colors that were already final
+display bytes, washing out midtones.
+
+On Vulkan, chrome is uploaded through a host-visible `LINEAR` `R8G8B8A8_UNORM` image; vertex
+IDs come from `gl_VertexIndex`, and a smaller viewport/scissor places the triangle in the
+widget's rect. On Metal the same picture is a `CAMetalLayer` drawable, `MTLTexture` +
+`replaceRegion` for CPU bytes, and MSL `vertex_id`. Layout and hit-testing stay in points;
+chrome rasterizes at the window's backing scale so Retina chrome matches the Python window size.
 
 CUDA interop (`fastgui-interop-cuda`, `CudaSharedTexture`) is the one path that bypasses the CPU
 upload entirely: a device-local image is exported via `VK_KHR_external_memory_win32` and
@@ -162,8 +180,9 @@ Roughly, the checklist an existing widget's implementation demonstrates:
    otherwise it's just a layout container and composes existing children.
 3. Add a pyclass in `fastgui-py::widgets` with a `describe()` that builds a `DescribedWidget`,
    and wire any special attach-time cross-referencing into `attach()` if needed.
-4. Handle any new input behavior (click, drag) in `fastgui-render-vk::app`'s `handle_mouse_press`
-   / cursor-move / release dispatch.
+4. Handle any new input behavior (click, drag) in both backends' `app` (`fastgui-render-vk`
+   and `fastgui-render-mtl`) `handle_mouse_press` / cursor-move / release dispatch — they
+   mirror each other.
 5. Add the type stub in `python/fastgui/__init__.pyi`.
 6. Verify by actually running an example — see ROADMAP.md's "How this project has been built"
    for why this step isn't optional.
