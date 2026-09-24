@@ -312,7 +312,10 @@ impl<B: SurfaceBackend> App<B> {
             .with_decorations(false)
             // Still need custom edge hit-testing (borderless has no OS resize chrome); this
             // flag mainly keeps the window eligible for programmatic `set_inner_size`.
-            .with_resizable(true);
+            .with_resizable(true)
+            // Hidden until the first frame: building a backend (a whole Vulkan instance and
+            // swapchain) is slow, and Windows shows a visible window blank white meanwhile.
+            .with_visible(false);
         let window = event_loop.create_window(attributes)?;
         let scale_factor = window.scale_factor();
         let physical = window.inner_size();
@@ -341,9 +344,12 @@ impl<B: SurfaceBackend> App<B> {
             dragging_slider: None,
             dragging_splitter: None,
         };
-        floater.window.request_redraw();
         self.floating_by_region.insert(region_id, window_id);
         self.floating.insert(window_id, floater);
+        // Show, then present right away so the blank window lasts one frame, not the whole
+        // backend build. A render failure is recorded in `self.error` and exits the loop.
+        self.floating[&window_id].window.set_visible(true);
+        self.render_floater(event_loop, window_id);
         Ok(())
     }
 
@@ -855,7 +861,11 @@ impl<B: SurfaceBackend> App<B> {
             .with_position(position)
             .with_decorations(false)
             .with_resizable(false)
-            .with_window_level(WindowLevel::AlwaysOnTop);
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            // Hidden while the backend is built (see `add_floating_panel`), and never
+            // activated, so showing it can't take focus or the drag from the main window.
+            .with_visible(false)
+            .with_active(false);
         let window = event_loop.create_window(attributes)?;
         let _ = window.set_cursor_hittest(false);
         let scale_factor = window.scale_factor();
@@ -874,10 +884,10 @@ impl<B: SurfaceBackend> App<B> {
         );
         widget_tree.clear_dirty();
         renderer.set_chrome_frame(frame).map_err(RunError::Renderer)?;
+        window.set_visible(true);
         renderer
             .render_frame(TEAR_GHOST_CLEAR, true, &[])
             .map_err(RunError::Renderer)?;
-        window.request_redraw();
 
         // Chrome is baked into the renderer once; the ghost only needs to follow the cursor.
         drop((widget_tree, chrome, logical, scale_factor));
