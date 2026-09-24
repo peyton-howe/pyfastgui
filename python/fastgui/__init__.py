@@ -2,7 +2,7 @@ from ._fastgui import Box, Button, CudaSurface, Label, Panel, Slider, Splitter, 
 
 _REGIONS = ("center", "left", "right", "top", "bottom")
 
-# Matches `fastgui-render-vk::app`'s `ROOT_REGION_ID` — sent as `target_id` when a panel is
+# Matches `fastgui-app`'s `ROOT_REGION_ID` — sent as `target_id` when a panel is
 # dropped near the *window's* outer edge (not a specific panel's), meaning "wrap the whole
 # DockArea", not "split just whatever panel happens to be under the cursor". Never a real
 # `Panel`/`Tabs` id (`next_region_id()`, Rust-side, starts at 1).

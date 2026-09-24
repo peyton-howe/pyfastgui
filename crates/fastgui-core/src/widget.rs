@@ -121,7 +121,7 @@ pub enum WidgetKind {
     },
     /// A draggable divider between two sibling panes (`first`/`second`, both children of the
     /// same parent as this node). Dragging updates `ratio` and the render thread reassigns
-    /// `first`/`second`'s `flex_grow` to match — see `fastgui-render-vk::app`'s
+    /// `first`/`second`'s `flex_grow` to match — see `fastgui-app::app`'s
     /// `update_dragged_splitter`. The bar itself has no children; it's a thin leaf sized by its
     /// own fixed-`thickness` style.
     Splitter {
@@ -137,7 +137,7 @@ pub enum WidgetKind {
     /// `fastgui-py::widgets::Panel`'s history). `content_ids` are this tab strip's sibling
     /// content-wrapper nodes (same parent `Box`, one per tab, in title order); clicking a header
     /// segment sets `active` and flips the clicked wrapper's style to `Display::Flex` and every
-    /// other wrapper's to `Display::None` — see `fastgui-render-vk::app`'s tab click handling.
+    /// other wrapper's to `Display::None` — see `fastgui-app::app`'s tab click handling.
     /// `panel_ids`/`on_drop`/`on_close` (parallel to `titles`, one entry per tab) let a tab be
     /// dragged out or closed. Each tab's `panel_id` is its member `Panel`'s region id; `on_drop`
     /// / `on_close` come from that panel's rearrange/close handlers.
@@ -156,7 +156,7 @@ pub enum WidgetKind {
     },
     /// A `Panel`'s title bar, self-contained like `TabBar` (own background+text, no child
     /// `Label`). `panel_id` matches its `Panel`'s outer `Container { region_id, .. }`, giving it
-    /// an identity: dragging this bar (`fastgui-render-vk::app`'s panel-drag handling) and
+    /// an identity: dragging this bar (`fastgui-app::app`'s panel-drag handling) and
     /// releasing over another region calls `on_drop(panel_id, target_region_id, zone)` — the
     /// same callback on every `PanelTitleBar` a `DockArea` built, letting Python's `DockArea`
     /// restructure its tree and ask the `Window` to re-attach it. Standalone `Panel`s (not in a
@@ -293,7 +293,7 @@ impl WidgetTree {
         self.mark_dirty();
     }
 
-    /// Used by `Splitter` drag-resize (`fastgui-render-vk::app::update_dragged_splitter`) to
+    /// Used by `Splitter` drag-resize (`fastgui-app::app::update_dragged_splitter`) to
     /// resize a pane without needing to reconstruct its whole `Style` at the call site.
     pub fn set_flex_grow(&mut self, id: WidgetId, flex_grow: f32) {
         let Some(mut style) = self.taffy.style(id).ok().cloned() else { return };
@@ -302,7 +302,7 @@ impl WidgetTree {
         self.mark_dirty();
     }
 
-    /// Used by `TabBar` click handling (`fastgui-render-vk::app`) to show/hide a tab's content
+    /// Used by `TabBar` click handling (`fastgui-app::app`) to show/hide a tab's content
     /// wrapper without touching anything else about its style.
     pub fn set_display(&mut self, id: WidgetId, visible: bool) {
         let Some(mut style) = self.taffy.style(id).ok().cloned() else { return };
