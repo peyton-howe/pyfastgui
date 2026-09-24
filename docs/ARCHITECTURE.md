@@ -17,13 +17,11 @@ crates/
     src/widget.rs             WidgetTree (wraps taffy::TaffyTree), WidgetKind (including
                               Viewport), WidgetId, Color, hit_test / find_region_at, DropZone
 
-  fastgui-render/         Renderer trait — the interface a GPU backend implements. Backend-
-                          agnostic. In practice `fastgui-py` cfg-picks `fastgui-render-vk` or
-                          `fastgui-render-mtl` rather than dispatching through this trait.
-
   fastgui-render-vk/      The Vulkan backend (Windows + Linux). Owns the actual OS window and
                           event loop — this is the crate with a `fn main`-shaped entry point,
-                          conceptually, even though it's a library.
+                          conceptually, even though it's a library. Selected by `fastgui-py`
+                          via `cfg(not(target_os = "macos"))` — there is no shared Renderer
+                          trait; the cfg dependency switch is the backend boundary.
     src/renderer.rs          VulkanRenderer: instance/device/swapchain setup, dynamic rendering
                               (VK_KHR_dynamic_rendering — no render pass/framebuffer objects)
     src/app.rs                winit ApplicationHandler: drains the command queue, handles

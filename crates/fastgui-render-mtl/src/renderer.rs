@@ -280,22 +280,4 @@ fn widget_rect_to_mtl(
     ))
 }
 
-impl fastgui_render::Renderer for MetalRenderer {
-    type Error = Error;
 
-    fn new(
-        window: &(impl HasWindowHandle + HasDisplayHandle),
-        width: u32,
-        height: u32,
-    ) -> Result<Self, Self::Error> {
-        MetalRenderer::new(window, width, height)
-    }
-
-    fn resize(&mut self, width: u32, height: u32) -> Result<(), Self::Error> {
-        MetalRenderer::resize(self, width, height)
-    }
-
-    fn render_frame(&mut self, color: [f32; 4]) -> Result<(), Self::Error> {
-        MetalRenderer::render_frame(self, color, false, &[])
-    }
-}

@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/fastgui-core",
-    "crates/fastgui-render",
     "crates/fastgui-render-vk",
     "crates/fastgui-render-mtl",
     "crates/fastgui-chrome",

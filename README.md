@@ -1,10 +1,11 @@
-# fast-gui
+# fastgui
 
-Lightweight, GPU-native, no-GIL-safe Python GUI toolkit, written in Rust (PyO3 bindings) with
-a native GPU renderer — Vulkan on Windows and Linux, Metal on macOS. Designed from the ground
-up for CPython's free-threaded (`Py_GIL_DISABLED`) build: every mutator is a message sent to a
-dedicated render thread over a lock-free queue, so nothing about the API requires holding the
-GIL, and multiple threads can safely drive the UI at once.
+Lightweight, GPU-native, no-GIL-safe Python GUI toolkit (`import fastgui`), written in Rust
+(PyO3 bindings) with a native GPU renderer — Vulkan on Windows and Linux, Metal on macOS.
+This repository is named `pyfastgui`. Designed from the ground up for CPython's free-threaded
+(`Py_GIL_DISABLED`) build: every mutator is a message sent to a dedicated render thread over a
+lock-free queue, so nothing about the API requires holding the GIL, and multiple threads can
+safely drive the UI at once.
 
 > **Status:** pre-alpha, actively developed, not yet published as a package. See
 > [ROADMAP.md](ROADMAP.md) for the full milestone-by-milestone history and current work.
@@ -15,14 +16,14 @@ GIL, and multiple threads can safely drive the UI at once.
 
 Most Python GUI toolkits either wrap a heavyweight native toolkit (Qt, GTK) or render via a
 CPU-bound abstraction that doesn't take advantage of the GPU already sitting in every machine.
-fast-gui instead:
+fastgui instead:
 
 - Renders everything — widget chrome and arbitrary GPU/CPU frame content (`Viewport`) — through
   a native GPU backend (Vulkan on Windows/Linux, Metal on macOS), with widget chrome rasterized
   via `cosmic-text` + `tiny-skia` and uploaded as a single texture per frame.
 - Treats every widget mutation (`label.set_text(...)`, `slider.set_value(...)`, dragging a
   panel) as a command sent across a channel to the render thread, rather than requiring the
-  caller to be "on the UI thread" — the free-threaded Python build can call into fast-gui from
+  caller to be "on the UI thread" — the free-threaded Python build can call into fastgui from
   any thread without contention.
 - Supports zero-copy GPU interop on the Vulkan backend: a CUDA kernel can write directly into a
   texture displayed next frame, with no CPU round-trip (see `Viewport.create_cuda_surface` —
@@ -34,7 +35,7 @@ fast-gui instead:
 import fastgui as fg
 
 def main() -> None:
-    window = fg.Window(title="Hello, fast-gui", width=800, height=500)
+    window = fg.Window(title="Hello, fastgui", width=800, height=500)
 
     counter = {"n": 0}
     label = fg.Label("Count: 0", font_size=20.0)
@@ -63,18 +64,18 @@ python your_script.py
 
 ## Install
 
-fast-gui isn't published yet — build it from source with [maturin](https://www.maturin.rs/):
+fastgui isn't published yet — build it from source with [maturin](https://www.maturin.rs/):
 
 ```
 git clone <this repo>
-cd fast-gui
+cd pyfastgui
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install maturin numpy
 maturin develop --release
 ```
 
-You'll also need the platform toolchain fast-gui itself builds against:
+You'll also need the platform toolchain fastgui itself builds against:
 
 - Rust (stable, via [rustup](https://rustup.rs/)) — `rust-toolchain.toml` pins the channel/target.
 - On Windows: MSVC Build Tools, and the [Vulkan SDK](https://vulkan.lunarg.com/) (needed to
@@ -132,7 +133,8 @@ fire-and-forget mutations, a latest-wins mailbox for frame data, a retained-mode
 over `taffy`) and is renderer-agnostic; `fastgui-render-vk` (Windows/Linux) and
 `fastgui-render-mtl` (macOS) own the window and event loop; `fastgui-chrome` rasterizes widget
 chrome into a texture the active backend uploads and displays like any other frame; `fastgui-py`
-is the PyO3 layer and picks the backend with `cfg(target_os = "macos")`.
+is the PyO3 layer and picks the backend with `cfg(target_os = "macos")` (there is no shared
+`Renderer` trait dispatch — the cfg switch is the backend boundary).
 
 ## Known limitations
 
@@ -149,6 +151,8 @@ is the PyO3 layer and picks the backend with `cfg(target_os = "macos")`.
   past 2 members) isn't supported yet — only forming a new 2-member group, or ungrouping one
   back out. Floating panels (`add_floating_panel`) can't be dragged into or out of a `DockArea`,
   and aren't resizable.
+- **`Viewport.submit_frame` always copies** the numpy/buffer into an owned `Vec<u8>` before
+  upload. Expected for the CPU path; a packed-RGBA camera feed will want a fewer-copy path later.
 - **Automated tests are still thin.** `cargo test -p fastgui-core` covers `FrameSlot`, `DropZone`,
   and `WidgetTree` layout/hit-test; `python -m unittest tests.test_dock_area` (from `python/`)
   covers `DockArea` tree surgery. There is no GPU/window integration suite yet.
