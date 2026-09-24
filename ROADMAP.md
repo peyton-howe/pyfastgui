@@ -916,6 +916,21 @@ and each fixes a visible symptom — don't "simplify" them away:
   `Grab`/`Grabbing` to the 4-arrow move cursor on Windows, and macOS/Linux use the hand only for
   dragging content, not windows.
 
+**Chrome text perf (after the extract).** Measured before touching the "dirty-rect / retained
+chrome" idea: for a dock-demo-sized tree (6 panels, 78 text items) a full chrome rasterize was
+13.7ms at 1× and **38.3ms at 2×** (Retina, and Windows at 150–200% now that Vulkan renders at
+HiDPI scale) — and chrome re-rasterizes on every slider drag, `set_text`, and panel-drag frame.
+~96% of that was text, and almost all of *that* was `draw_text` calling tiny-skia's
+`fill_rect` once per glyph pixel (~146k calls/frame at 2×); glyph rasterization itself is
+cached by `SwashCache` and cost 0.13ms. Blending glyph pixels straight into the pixmap's
+premultiplied RGBA bytes took it to **3.2ms at 1× / 4.5ms at 2×**. The text origin is now
+snapped to whole pixels (the old AA `fill_rect` at a fractional origin smeared each glyph pixel
+across neighbours at 1.5×). What's left is ~2.9ms of re-shaping every string each dirty frame
+(flat across scale) + ~1.6ms of widget fills and buffer alloc/copy at 2×. Dirty-rect tracking
+would only save that last ~1.6ms, so it's not worth its complexity; next steps if chrome ever
+shows up again are caching shaped `Buffer`s by (text, size, width), then measuring the
+full-texture GPU upload (unmeasured) before considering partial uploads.
+
 ### 6A. Docking/panel system (full scope)
 
 Build bottom-up; each step is independently useful and testable, so verify as you go rather
