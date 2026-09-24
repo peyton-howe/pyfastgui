@@ -184,6 +184,15 @@ impl App {
                             floater.has_widget_content = true;
                             floater.window.request_redraw();
                         }
+                    } else if let Some(pending) =
+                        self.pending_floaters.iter_mut().find(|(id, ..)| *id == region_id)
+                    {
+                        // Window not created yet: run after its `build` instead of dropping it.
+                        let build = std::mem::replace(&mut pending.6, Box::new(|_| {}));
+                        pending.6 = Box::new(move |tree| {
+                            build(tree);
+                            mutation(tree);
+                        });
                     }
                 }
                 Command::AddFloatingPanel {
@@ -270,6 +279,25 @@ impl App {
             (_, _, _, true) => Some(ResizeEdge::Bottom),
             _ => None,
         }
+    }
+
+    /// Resize edge under a floater's cursor, unless the cursor is on a title-bar × — the
+    /// resize strip along the top/right edges would otherwise swallow part of that button.
+    fn floating_resize_edge_at_cursor(floater: &FloatingWindow) -> Option<ResizeEdge> {
+        let (x, y) = floater.cursor;
+        let on_close_button = floater.widget_tree.hit_test(x, y).is_some_and(|id| {
+            matches!(
+                floater.widget_tree.kind(id),
+                Some(WidgetKind::PanelTitleBar { on_close: Some(_), .. })
+            ) && floater
+                .widget_tree
+                .absolute_rect(id)
+                .is_some_and(|rect| fastgui_core::widget::close_button_rect(rect).contains(x, y))
+        });
+        if on_close_button {
+            return None;
+        }
+        Self::classify_float_resize_edge(floater.width as f32, floater.height as f32, x, y)
     }
 
     fn resize_edge_cursor(edge: ResizeEdge) -> winit::window::CursorIcon {
@@ -555,10 +583,9 @@ impl App {
         let Some(floater) = self.floating.get(&window_id) else { return };
         let cursor = floater.cursor;
         let region_id = floater.region_id;
-        // Edge/corner resize takes priority over title-bar move (top few points are resize).
-        if let Some(edge) =
-            Self::classify_float_resize_edge(floater.width as f32, floater.height as f32, cursor.0, cursor.1)
-        {
+        // Edge/corner resize takes priority over title-bar move (top few points are resize),
+        // except on the title-bar ×.
+        if let Some(edge) = Self::floating_resize_edge_at_cursor(floater) {
             let scale = floater.scale_factor.max(0.01);
             let Ok(inner) = floater.window.inner_position() else { return };
             let Ok(outer) = floater.window.outer_position() else { return };
@@ -1270,12 +1297,7 @@ impl App {
             floater.window.set_cursor(winit::window::CursorIcon::Grabbing);
             return;
         }
-        if let Some(edge) = Self::classify_float_resize_edge(
-            floater.width as f32,
-            floater.height as f32,
-            floater.cursor.0,
-            floater.cursor.1,
-        ) {
+        if let Some(edge) = Self::floating_resize_edge_at_cursor(floater) {
             floater.window.set_cursor(Self::resize_edge_cursor(edge));
             return;
         }
@@ -1317,13 +1339,47 @@ impl App {
         floater.height = logical.height.round().max(0.0) as u32;
     }
 
-    /// Drain queued commands and render one frame immediately (main + every floater).
+    /// Drain queued commands and render one frame immediately (main + every floater). Used by
+    /// drag/resize paths, where a floater drag also has to repaint the main window's drop
+    /// highlight. `RedrawRequested` uses `render_window` instead.
     fn render_now(&mut self, event_loop: &ActiveEventLoop) {
         self.drain_commands(event_loop);
+        if !self.render_main(event_loop) {
+            return;
+        }
+        let floating_ids: Vec<WindowId> = self.floating.keys().copied().collect();
+        for window_id in floating_ids {
+            if !self.render_floater(event_loop, window_id) {
+                return;
+            }
+        }
+        if let Some(ghost) = &mut self.tear_ghost {
+            if let Err(err) = ghost.renderer.render_frame(TEAR_GHOST_CLEAR, true, &[]) {
+                self.error = Some(err.into());
+                event_loop.exit();
+            }
+        }
+    }
+
+    /// Drain queued commands and render only `window_id` — what that window's own
+    /// `RedrawRequested` does. A wake asks every window to redraw, so rendering all of them
+    /// from each redraw would cost (floaters + 1)² frames per wake instead of one per window.
+    fn render_window(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId) {
+        self.drain_commands(event_loop);
+        if self.window.as_ref().is_some_and(|w| w.id() == window_id) {
+            self.render_main(event_loop);
+        } else {
+            self.render_floater(event_loop, window_id);
+        }
+    }
+
+    /// Render the main window. Returns `false` (after recording the error and exiting) on
+    /// failure.
+    fn render_main(&mut self, event_loop: &ActiveEventLoop) -> bool {
         if let Err(err) = self.upload_active_content() {
             self.error = Some(err.into());
             event_loop.exit();
-            return;
+            return false;
         }
         let draws = self.viewport_draws();
         let draw_chrome = self.has_widget_content;
@@ -1332,33 +1388,30 @@ impl App {
             if let Err(err) = renderer.render_frame(clear_color, draw_chrome, &draws) {
                 self.error = Some(err.into());
                 event_loop.exit();
-                return;
+                return false;
             }
         }
+        true
+    }
 
-        let floating_ids: Vec<WindowId> = self.floating.keys().copied().collect();
-        for window_id in floating_ids {
-            let Some(floater) = self.floating.get_mut(&window_id) else { continue };
-            if let Err(err) = Self::upload_floating_content(floater) {
-                self.error = Some(err.into());
-                event_loop.exit();
-                return;
-            }
-            let draws = Self::floating_viewport_draws(floater);
-            let draw_chrome = floater.has_widget_content;
-            if let Err(err) = floater.renderer.render_frame(clear_color, draw_chrome, &draws) {
-                self.error = Some(err.into());
-                event_loop.exit();
-                return;
-            }
+    /// Render one floating window. Returns `false` (after recording the error and exiting) on
+    /// failure; a floater that's already gone is not a failure.
+    fn render_floater(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId) -> bool {
+        let clear_color = self.clear_color;
+        let Some(floater) = self.floating.get_mut(&window_id) else { return true };
+        if let Err(err) = Self::upload_floating_content(floater) {
+            self.error = Some(err.into());
+            event_loop.exit();
+            return false;
         }
-
-        if let Some(ghost) = &mut self.tear_ghost {
-            if let Err(err) = ghost.renderer.render_frame(TEAR_GHOST_CLEAR, true, &[]) {
-                self.error = Some(err.into());
-                event_loop.exit();
-            }
+        let draws = Self::floating_viewport_draws(floater);
+        let draw_chrome = floater.has_widget_content;
+        if let Err(err) = floater.renderer.render_frame(clear_color, draw_chrome, &draws) {
+            self.error = Some(err.into());
+            event_loop.exit();
+            return false;
         }
+        true
     }
 }
 
@@ -1484,7 +1537,7 @@ impl ApplicationHandler for App {
                 }
             },
             WindowEvent::RedrawRequested => {
-                self.render_now(event_loop);
+                self.render_window(event_loop, window_id);
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
             _ => {}
@@ -1589,7 +1642,7 @@ impl App {
                 }
             },
             WindowEvent::RedrawRequested => {
-                self.render_now(event_loop);
+                self.render_window(event_loop, window_id);
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
             _ => {}

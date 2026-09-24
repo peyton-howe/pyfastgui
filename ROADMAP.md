@@ -862,8 +862,8 @@ modulo the "confirm interactively when convenient" items above.
 **6A follow-up (tabs grow + floating re-dock).** Two of the originally scoped-out gaps are now
 implemented: dropping onto an existing `Tabs` center appends the dragged panel (new tab becomes
 active), and a `Window.add_floating_panel` panel whose window content is a `DockArea` can be
-dropped back onto a docked region or the window's outer edge. Floating-panel *resize*, and
-dragging a docked panel *out* into a new floater, are still out of scope. Headless coverage is
+dropped back onto a docked region or the window's outer edge. (Floating-panel resize and
+dock → float tear-off followed — see below.) Headless coverage is
 in `python/tests/test_dock_area.py`; the live drag gesture has the same "confirm interactively"
 caveat as the rest of 6A.
 

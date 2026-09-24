@@ -152,9 +152,9 @@ class Window:
     def add_floating_panel(self, panel: Panel, x: float, y: float, width: float, height: float) -> None:
         """Open `panel` as a real OS window at `(x, y)` relative to this window's inner origin,
         sized `(width, height)`. Draggable anywhere on screen; resize via edge/corner drag; if
-        this window's content is a `DockArea`, droppable back onto a docked region to re-dock.
-        A docked panel can't be dragged out into a new floater. Survives later `set_content`
-        calls until re-docked."""
+        this window's content is a `DockArea`, droppable back onto a docked region to re-dock
+        (whether that `set_content` call came before or after this one). Survives later
+        `set_content` calls until re-docked or closed."""
         ...
     @property
     def clear_color(self) -> tuple[float, float, float, float]: ...

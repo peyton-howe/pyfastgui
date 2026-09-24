@@ -167,6 +167,28 @@ class DockAreaTreeTests(unittest.TestCase):
         self.assertIsNotNone(_find_leaf(dock._root["second"], b.id))
         self.assertIsNone(window._peek_floating_panel(c.id))
 
+    def test_floating_added_before_set_content_can_redock(self):
+        a, b = _panel("A"), _panel("B")
+        dock = DockArea()
+        dock.add_panel(a, region="center")
+        window = Window()
+        window.add_floating_panel(b, 10.0, 10.0, 200.0, 100.0)
+        window.set_content(dock)
+        dock._on_rearrange(b.id, a.id, "right")
+        self.assertEqual(dock._root["second"]["widget"].id, b.id)
+        self.assertIsNone(window._peek_floating_panel(b.id))
+
+    def test_floating_survives_switch_to_non_dock_content(self):
+        a, b = _panel("A"), _panel("B")
+        dock = DockArea()
+        dock.add_panel(a, region="center")
+        window = Window()
+        window.set_content(dock)
+        window.add_floating_panel(b, 10.0, 10.0, 200.0, 100.0)
+        window.set_content(Label("plain"))
+        window.set_content(dock)
+        self.assertIsNotNone(window._peek_floating_panel(b.id))
+
     def test_floating_unknown_target_leaves_floater(self):
         a, b = _panel("A"), _panel("B")
         dock = DockArea()

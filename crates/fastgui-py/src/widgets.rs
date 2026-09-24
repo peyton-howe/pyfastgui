@@ -938,6 +938,30 @@ impl Panel {
         self.region_id
     }
 
+    /// Replace both handlers (`None` clears one) — how a floater follows whatever the window's
+    /// content currently is. Returns whether either changed, compared with Python `==` since
+    /// each `dock._on_rearrange` read is a fresh (but equal) bound-method object.
+    pub(crate) fn replace_dock_handlers(
+        &self,
+        py: Python<'_>,
+        rearrange: Option<Py<PyAny>>,
+        close: Option<Py<PyAny>>,
+    ) -> bool {
+        let replace = |cell: &Mutex<Option<Py<PyAny>>>, new: Option<Py<PyAny>>| {
+            let mut slot = cell.lock().unwrap_or_else(|p| p.into_inner());
+            let same = match (slot.as_ref(), new.as_ref()) {
+                (None, None) => true,
+                (Some(old), Some(new)) => old.bind(py).eq(new.bind(py)).unwrap_or(false),
+                _ => false,
+            };
+            *slot = new;
+            !same
+        };
+        let rearrange_changed = replace(&self.rearrange_handler, rearrange);
+        let close_changed = replace(&self.close_handler, close);
+        rearrange_changed || close_changed
+    }
+
     /// Used by `Tabs::describe` to pull just the title text and content widget out of a `Panel`
     /// used as a tab — a `Tabs` draws one combined header strip already serving as "the title",
     /// so it doesn't attach each member `Panel`'s own title bar (that would show it twice).
