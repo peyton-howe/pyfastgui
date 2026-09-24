@@ -31,6 +31,24 @@ pub enum Command {
         respond: OneshotSender<Result<CudaExportHandles, VkRendererError>>,
     },
     MutateWidgetTree(Box<dyn FnOnce(&mut WidgetTree) + Send>),
+    /// Widget setter targeting a floating panel's own tree (ids are not unique across trees).
+    MutateFloatingTree {
+        region_id: u64,
+        mutation: Box<dyn FnOnce(&mut WidgetTree) + Send>,
+    },
+    /// Open `region_id` as a real OS window — see `fastgui-render-mtl::Command::AddFloatingPanel`.
+    AddFloatingPanel {
+        region_id: u64,
+        title: String,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        build: Box<dyn FnOnce(&mut WidgetTree) + Send>,
+    },
+    RemoveFloatingPanel {
+        region_id: u64,
+    },
 }
 
 /// Wakes a `ControlFlow::Wait` event loop from any thread (a Python worker submitting a
@@ -55,14 +73,20 @@ impl EventWaker {
 }
 
 /// Command sender that also wakes the render thread, so `ControlFlow::Wait` does not sleep
-/// through queued mutations or CUDA-surface replies.
+/// through queued mutations or CUDA-surface replies. `floating_region` is `Some` for widgets
+/// attached inside a floating OS window so later mutators hit that window's tree.
 #[derive(Clone)]
 pub struct CommandDispatch {
     pub sender: CommandSender<Command>,
     pub waker: EventWaker,
+    pub floating_region: Option<u64>,
 }
 
 impl CommandDispatch {
+    pub fn for_floating(&self, region_id: u64) -> Self {
+        Self { sender: self.sender.clone(), waker: self.waker.clone(), floating_region: Some(region_id) }
+    }
+
     pub fn send(&self, command: Command) -> Result<(), crossbeam_channel::SendError<Command>> {
         self.sender.send(command)?;
         self.waker.wake();

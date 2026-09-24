@@ -1,6 +1,7 @@
-"""M6 demo: floating panels — an always-on-top region simulated within the single window (not a
-real second OS window; see ROADMAP.md's M6 status for why). Grab its title bar and drag it around
-on top of the regular docked content. Not resizable and not re-dockable in this pass.
+"""M6 demo: floating panels as real OS windows. Grab the title bar to move it anywhere on
+screen (including outside the main window / onto another monitor), drag an edge/corner to
+resize, or drop it onto a docked region (center to tab-merge, edge to split) to re-dock.
+From the dock: drag a docked panel outside the main window and release to tear it out.
 """
 
 import fastgui as fg

@@ -105,7 +105,7 @@ All under [`python/examples/`](python/examples/), runnable directly once install
 | [`dock_layout.py`](python/examples/dock_layout.py) | A `DockArea` of resizable, titled `Panel`s with a live `Viewport` in the center. |
 | [`dock_rearrange_demo.py`](python/examples/dock_rearrange_demo.py) | Drag a panel's title bar to split or tab-merge regions, including dropping at the window's outer edge to span the whole dock area. |
 | [`tabs_demo.py`](python/examples/tabs_demo.py) | Multiple `Panel`s sharing one `DockArea` region via `Tabs`, switched by clicking a header segment. |
-| [`floating_panel_demo.py`](python/examples/floating_panel_demo.py) | An always-on-top panel dragged freely over the rest of the window. |
+| [`floating_panel_demo.py`](python/examples/floating_panel_demo.py) | A panel in its own OS window: move it anywhere (including another monitor), resize from its edges, re-dock by dropping it onto the dock, or tear a docked panel out. |
 
 ## Widget API
 
@@ -113,10 +113,10 @@ All under [`python/examples/`](python/examples/), runnable directly once install
   `Splitter` (draggable divider between two panes).
 - **Content**: `Label`, `Button`, `Slider`, `Viewport` (arbitrary CPU/GPU frame content).
 - **Docking**: `Panel` (titled, draggable container), `Tabs` (several `Panel`s sharing one
-  region), `DockArea` (a split-tree of panels/tabs with full drag-to-rearrange — split, tab-merge,
-  ungroup, and whole-window edge drops; see its docstring in
-  [`python/fastgui/__init__.py`](python/fastgui/__init__.py) for the couple of gestures not
-  supported yet).
+  region), `DockArea` (a split-tree of panels/tabs with full drag-to-rearrange — split, tab-merge
+  including growing an existing `Tabs` group, ungroup, whole-window edge drops, and re-docking
+  a floating panel; see its docstring in
+  [`python/fastgui/__init__.py`](python/fastgui/__init__.py) for the remaining gaps).
 - **Window**: `Window(title, width, height)` — `set_content(widget)`, `set_clear_color(...)`,
   `add_floating_panel(panel, x, y, width, height)`, `.run()` (blocks, owns the render loop).
 
@@ -145,10 +145,8 @@ is the PyO3 layer and picks the backend with `cfg(target_os = "macos")`.
 - **Linux is less exercised than Windows and macOS.** It uses the same Vulkan backend as
   Windows, but day-to-day bring-up has been on those two platforms.
 - **No text wrapping, scrolling, or keyboard input/focus handling** for any widget yet.
-- **`DockArea` gaps**: dropping a panel onto an *existing* `Tabs` group's center (to grow it
-  past 2 members) isn't supported yet — only forming a new 2-member group, or ungrouping one
-  back out. Floating panels (`add_floating_panel`) can't be dragged into or out of a `DockArea`,
-  and aren't resizable.
+- **`DockArea` / floating**: floating panels are real OS windows (move, resize, tear out by
+  dragging a docked panel outside the main window, re-dock by dropping onto the dock).
 - **Automated tests are still thin.** `cargo test -p fastgui-core` covers `FrameSlot`, `DropZone`,
   and `WidgetTree` layout/hit-test; `python -m unittest tests.test_dock_area` (from `python/`)
   covers `DockArea` tree surgery. There is no GPU/window integration suite yet.
@@ -161,5 +159,5 @@ is the PyO3 layer and picks the backend with `cfg(target_os = "macos")`.
 This project has been built session-by-session with an AI pair-programmer, using
 [ROADMAP.md](ROADMAP.md) as the persistent memory between sessions — it documents not just
 what's done but *why*, including bugs found and fixed along the way and the reasoning behind
-non-obvious design choices (e.g. why floating panels are simulated within one window rather than
-real OS windows). Read it before making non-trivial changes.
+non-obvious design choices (e.g. how floating panels moved from in-window overlays to real OS
+windows). Read it before making non-trivial changes.

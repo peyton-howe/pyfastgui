@@ -1,11 +1,8 @@
 """M6 demo: drag-to-rearrange. Four docked panels — grab any panel's title bar and drop it on
 another panel's edges (splits that region) or its center (merges the two into a new `Tabs`
-group). A translucent overlay previews where it'll land while you drag.
-
-Known gaps this demo can't exercise (see ROADMAP.md's M6 status / DockArea's docstring): a panel
-that's already inside a `Tabs` group isn't itself draggable yet, and dropping onto an existing
-`Tabs`' center isn't supported — only forming a *new* two-tab group by dropping one Panel onto
-another.
+group). Drop onto an existing `Tabs` header/center to add another tab, or drag a tab/panel
+out: a ghost preview follows the mouse; release outside the main window to tear it into a
+floating OS window, or onto a dock target to re-dock. Click × on a title bar or tab to close.
 """
 
 import fastgui as fg

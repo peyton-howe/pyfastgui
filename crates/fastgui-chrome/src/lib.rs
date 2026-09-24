@@ -74,12 +74,50 @@ impl ChromeRenderer {
                 WidgetKind::Splitter { bar_color, .. } => {
                     fill_rect(&mut pixmap, rect, *bar_color);
                 }
-                WidgetKind::TabBar { titles, active, font_size, text_color, active_color, inactive_color, .. } => {
-                    self.draw_tab_bar(&mut pixmap, rect, titles, *active, *font_size * scale, *text_color, *active_color, *inactive_color);
+                WidgetKind::TabBar {
+                    titles,
+                    active,
+                    font_size,
+                    text_color,
+                    active_color,
+                    inactive_color,
+                    on_close,
+                    ..
+                } => {
+                    self.draw_tab_bar(
+                        &mut pixmap,
+                        rect,
+                        titles,
+                        *active,
+                        *font_size * scale,
+                        *text_color,
+                        *active_color,
+                        *inactive_color,
+                        on_close.as_slice(),
+                    );
                 }
-                WidgetKind::PanelTitleBar { title, font_size, text_color, background, .. } => {
+                WidgetKind::PanelTitleBar {
+                    title,
+                    font_size,
+                    text_color,
+                    background,
+                    on_close,
+                    ..
+                } => {
                     fill_rect(&mut pixmap, rect, *background);
-                    self.draw_text(&mut pixmap, rect, title, *font_size * scale, *text_color);
+                    let close = fastgui_core::widget::close_button_rect(rect);
+                    let text_rect = if on_close.is_some() {
+                        fastgui_core::widget::Rect {
+                            width: (rect.width - close.width).max(0.0),
+                            ..rect
+                        }
+                    } else {
+                        rect
+                    };
+                    self.draw_text(&mut pixmap, text_rect, title, *font_size * scale, *text_color);
+                    if on_close.is_some() {
+                        self.draw_text(&mut pixmap, close, "×", *font_size * scale, *text_color);
+                    }
                 }
                 WidgetKind::Viewport { .. } => {
                     // Placeholder only — the GPU draws the real frame in this rect after chrome.
@@ -143,6 +181,7 @@ impl ChromeRenderer {
         text_color: Color,
         active_color: Color,
         inactive_color: Color,
+        on_close: &[Option<fastgui_core::widget::PanelCloseCallback>],
     ) {
         if titles.is_empty() || rect.width <= 0.0 {
             return;
@@ -156,7 +195,21 @@ impl ChromeRenderer {
                 height: rect.height,
             };
             fill_rect(pixmap, segment_rect, if index == active { active_color } else { inactive_color });
-            self.draw_text(pixmap, segment_rect, title, font_size, text_color);
+            let closable = on_close.get(index).is_some_and(|c| c.is_some());
+            let text_rect = if closable {
+                let close = fastgui_core::widget::close_button_rect(segment_rect);
+                fastgui_core::widget::Rect {
+                    width: (segment_rect.width - close.width).max(0.0),
+                    ..segment_rect
+                }
+            } else {
+                segment_rect
+            };
+            self.draw_text(pixmap, text_rect, title, font_size, text_color);
+            if closable {
+                let close = fastgui_core::widget::close_button_rect(segment_rect);
+                self.draw_text(pixmap, close, "×", font_size, text_color);
+            }
         }
     }
 }
@@ -210,7 +263,7 @@ fn draw_slider(
 fn drop_zone_rect(region: fastgui_core::widget::Rect, zone: DropZone) -> fastgui_core::widget::Rect {
     use fastgui_core::widget::Rect;
     match zone {
-        DropZone::Center => region,
+        DropZone::Center | DropZone::Float => region,
         DropZone::Left => Rect { width: region.width / 2.0, ..region },
         DropZone::Right => Rect { x: region.x + region.width / 2.0, width: region.width / 2.0, ..region },
         DropZone::Top => Rect { height: region.height / 2.0, ..region },
