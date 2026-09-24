@@ -906,5 +906,3 @@ impl Drop for VulkanRenderer {
         }
     }
 }
-
-

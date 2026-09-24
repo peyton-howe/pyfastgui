@@ -279,5 +279,3 @@ fn widget_rect_to_mtl(
         MTLScissorRect { x: x as usize, y: y as usize, width: w as usize, height: h as usize },
     ))
 }
-
-

@@ -8,7 +8,7 @@ import fastgui as fg
 
 
 def main() -> None:
-    window = fg.Window(title="fast-gui — M6 floating panel", width=900, height=560)
+    window = fg.Window(title="fastgui — M6 floating panel", width=900, height=560)
 
     dock = fg.DockArea()
     dock.add_panel(
