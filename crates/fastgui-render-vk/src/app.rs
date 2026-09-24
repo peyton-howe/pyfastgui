@@ -48,6 +48,18 @@ const ROOT_REGION_ID: u64 = 0;
 /// there" (that's `DropZone::classify`'s job, for the normal per-panel case).
 const OUTER_EDGE_MARGIN: f32 = 24.0;
 
+/// Title-bar hover/drag cursors. winit maps `Grab`/`Grabbing` to the 4-arrow move cursor on
+/// Windows (it has no hand cursor), which looks wrong for a title bar — native title bars and
+/// dock panels there keep the plain arrow while dragging.
+#[cfg(target_os = "windows")]
+const GRAB_CURSOR: winit::window::CursorIcon = winit::window::CursorIcon::Default;
+#[cfg(target_os = "windows")]
+const GRABBING_CURSOR: winit::window::CursorIcon = winit::window::CursorIcon::Default;
+#[cfg(not(target_os = "windows"))]
+const GRAB_CURSOR: winit::window::CursorIcon = winit::window::CursorIcon::Grab;
+#[cfg(not(target_os = "windows"))]
+const GRABBING_CURSOR: winit::window::CursorIcon = winit::window::CursorIcon::Grabbing;
+
 /// Hit-test margin (physical pixels) for floating-window edge/corner resize.
 const FLOAT_RESIZE_MARGIN: f32 = 6.0;
 /// Minimum floating-window inner size in logical points (clamped via `* scale_factor` in physical).
@@ -1318,7 +1330,7 @@ impl App {
     fn update_cursor_icon(&mut self) {
         let Some(window) = &self.window else { return };
         if self.dragging_panel_title.is_some() || self.dragging_floating_panel.is_some() {
-            window.set_cursor(winit::window::CursorIcon::Grabbing);
+            window.set_cursor(GRABBING_CURSOR);
             return;
         }
         let hovered = self
@@ -1330,7 +1342,7 @@ impl App {
                 fastgui_core::widget::SplitDirection::Column => winit::window::CursorIcon::RowResize,
             }),
             Some(WidgetKind::PanelTitleBar { on_drop, floating, .. }) if on_drop.is_some() || *floating => {
-                Some(winit::window::CursorIcon::Grab)
+                Some(GRAB_CURSOR)
             }
             _ => None,
         };
@@ -1351,7 +1363,7 @@ impl App {
             return;
         }
         if dragging {
-            floater.window.set_cursor(winit::window::CursorIcon::Grabbing);
+            floater.window.set_cursor(GRABBING_CURSOR);
             return;
         }
         if let Some(edge) = Self::floating_resize_edge_at_cursor(floater) {
@@ -1367,7 +1379,7 @@ impl App {
                 fastgui_core::widget::SplitDirection::Column => winit::window::CursorIcon::RowResize,
             }),
             Some(WidgetKind::PanelTitleBar { on_drop, floating, .. }) if on_drop.is_some() || *floating => {
-                Some(winit::window::CursorIcon::Grab)
+                Some(GRAB_CURSOR)
             }
             _ => None,
         };

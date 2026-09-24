@@ -105,7 +105,7 @@ All under [`python/examples/`](python/examples/), runnable directly once install
 | [`dock_layout.py`](python/examples/dock_layout.py) | A `DockArea` of resizable, titled `Panel`s with a live `Viewport` in the center. |
 | [`dock_rearrange_demo.py`](python/examples/dock_rearrange_demo.py) | Drag a panel's title bar to split or tab-merge regions, including dropping at the window's outer edge to span the whole dock area. |
 | [`tabs_demo.py`](python/examples/tabs_demo.py) | Multiple `Panel`s sharing one `DockArea` region via `Tabs`, switched by clicking a header segment. |
-| [`floating_panel_demo.py`](python/examples/floating_panel_demo.py) | An always-on-top panel dragged freely over the rest of the window. |
+| [`floating_panel_demo.py`](python/examples/floating_panel_demo.py) | A panel in its own OS window: move it anywhere (including another monitor), resize from its edges, re-dock by dropping it onto the dock, or tear a docked panel out. |
 
 ## Widget API
 
