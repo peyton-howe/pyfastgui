@@ -109,9 +109,9 @@ class Panel:
 class Tabs:
     """Several `Panel`s sharing one region: one combined header strip (each panel's `title`,
     not its own title bar) with only the active tab's content visible. Click a header segment
-    to switch, or drag one out onto another `DockArea` region to ungroup it. Also valid as a
-    `DockArea` drop *target* (drop a `Panel` on it to split that region) — see `DockArea`'s
-    docstring for what's not supported yet."""
+    to switch, or drag one out onto another `DockArea` region to ungroup it. Also a drop
+    target: drop a `Panel` on an edge to split the region, or on the center to add another tab
+    to this group."""
 
     def __init__(
         self,
@@ -139,10 +139,10 @@ class Tabs:
 
 class DockArea:
     """A split-tree of titled `Panel`s (or `Tabs` groups), built one `add_panel` call at a
-    time, with drag-to-rearrange: drag a `Panel`'s title bar (or a tab's own header segment,
-    to ungroup it) onto another region to move it there. Not yet supported (see ROADMAP.md's
-    M6 status): dropping onto an existing `Tabs`' center, and dragging a floating panel into
-    or out of a `DockArea`."""
+    time, with drag-to-rearrange: drag a `Panel`'s title bar (or a tab's own header segment)
+    onto another region to move it, onto an existing `Tabs` center to add a tab, or outside
+    the main window to tear it out into a floating OS window. Click × on a title bar or tab
+    to close. Floating panels can be dropped back into this dock."""
 
     def __init__(self) -> None: ...
     def add_panel(self, panel: Panel | Tabs, region: str = "center", size: float = 0.25) -> None: ...
@@ -153,11 +153,12 @@ class Window:
     def set_viewport(self, viewport: Viewport) -> None: ...
     def set_content(self, widget: Widget) -> None: ...
     def add_floating_panel(self, panel: Panel, x: float, y: float, width: float, height: float) -> None:
-        """Add `panel` as an always-on-top region floating over whatever `set_content` shows,
-        at `(x, y, width, height)` in physical pixels. Simulated within this one window (not a
-        real second OS window — see ROADMAP.md's M6 status for why): draggable via its title
-        bar, not resizable, and not dockable back into a `DockArea` in this pass. Survives
-        later `set_content` calls, including ones a `DockArea` rearrange triggers internally."""
+        """Open `panel` as a real OS window at `(x, y)` relative to this window's inner origin,
+        sized `(width, height)`. Draggable anywhere on screen; resize via edge/corner drag; if
+        this window's content is a `DockArea`, droppable back onto a docked region to re-dock
+        (whether that `set_content` call came before or after this one). Survives later
+        `set_content` calls until re-docked or closed. Always closeable via its title-bar ×
+        (or the OS close shortcut, e.g. Alt+F4), whatever the window's content is."""
         ...
     @property
     def clear_color(self) -> tuple[float, float, float, float]: ...
