@@ -270,11 +270,14 @@ struct Window {
     dispatch: CommandDispatch,
     receiver: Mutex<Option<CommandReceiver<Command>>>,
     clear_color: Readback<[f32; 4]>,
-    /// Every `Panel` ever passed to `add_floating_panel`, with its current `(x, y, width,
-    /// height)` — re-described and re-attached on every `set_content` (which otherwise resets
-    /// the whole tree and would silently drop them, e.g. every time a `DockArea` rearrange
-    /// calls `set_content` again internally).
+    /// Every `Panel` ever passed to `add_floating_panel`, with its initial `(x, y, width,
+    /// height)`. Each lives in its own OS window (not in the main widget tree). Removed by
+    /// `_take_floating_panel` when dropped back into a `DockArea`.
     floating_panels: Mutex<Vec<(Py<PyAny>, f32, f32, f32, f32)>>,
+    /// The widget last passed to `set_content`. Used so `add_floating_panel` (and a later
+    /// `set_content` that replaces the tree) can bind each floating panel's rearrange handler
+    /// to a `DockArea._on_rearrange` when that's the window content.
+    content: Mutex<Option<Py<PyAny>>>,
 }
 
 #[pymethods]
@@ -288,10 +291,11 @@ impl Window {
             title: title.to_owned(),
             width,
             height,
-            dispatch: CommandDispatch { sender, waker },
+            dispatch: CommandDispatch { sender, waker, floating_region: None },
             receiver: Mutex::new(Some(receiver)),
             clear_color: Readback::new(DEFAULT_CLEAR_COLOR),
             floating_panels: Mutex::new(Vec::new()),
+            content: Mutex::new(None),
         }
     }
 
@@ -328,30 +332,20 @@ impl Window {
     /// own callback (which only ever fires once the window is already running) is always fine.
     fn set_content(self_: &Bound<'_, Self>, widget: &Bound<'_, PyAny>) -> PyResult<()> {
         widgets::bind_dispatch(widget, &self_.borrow().dispatch);
+        {
+            let window = self_.borrow();
+            *window.content.lock().unwrap_or_else(|p| p.into_inner()) = Some(widget.clone().unbind());
+        }
+        // If this content is a `DockArea`, floating panels need its rearrange handler so they
+        // can be dropped back in. Bind *before* re-describing them so the attached title bars
+        // carry `on_drop`.
+        bind_floating_panels_to_content(self_, widget);
+
         let mut described = widgets::describe(widget)?;
         described.force_fill();
 
-        // Re-describe every floating panel too — `tree.reset()` below wipes the whole tree, and
-        // this is the only place that happens, so it's the only place that can put them back.
-        // Needed for drag-to-rearrange: a `DockArea` rearrange calls this method again on its
-        // own (see `Window`'s doc comment on `floating_panels`), and floating panels must
-        // survive that exactly like they'd survive any other `set_content` call.
-        let floating_described = {
-            let window = self_.borrow();
-            let floating = window.floating_panels.lock().unwrap_or_else(|p| p.into_inner());
-            floating
-                .iter()
-                .map(|(panel, x, y, width, height)| {
-                    Python::attach(|py| {
-                        let panel = panel.bind(py).cast::<widgets::Panel>().map_err(|_| {
-                            PyRuntimeError::new_err("internal error: a non-Panel ended up in floating_panels")
-                        })?;
-                        panel.borrow().describe_floating(*x, *y, *width, *height)
-                    })
-                })
-                .collect::<PyResult<Vec<_>>>()?
-        };
-
+        // Floating panels are real OS windows (see `add_floating_panel`), not overlays in this
+        // tree — a rearrange-triggered `set_content` must rebuild only the main dock content.
         let dispatch = self_.borrow().dispatch.clone();
         let closure_dispatch = dispatch.clone();
         dispatch
@@ -359,9 +353,6 @@ impl Window {
                 tree.reset();
                 let root = tree.root();
                 widgets::attach(tree, root, described, &closure_dispatch);
-                for floating in floating_described {
-                    widgets::attach(tree, root, floating, &closure_dispatch);
-                }
             })))
             .map_err(|_| PyRuntimeError::new_err("window has already closed"))?;
 
@@ -374,20 +365,12 @@ impl Window {
         Ok(())
     }
 
-    /// Add `panel` as an always-on-top floating region — an approximation of a real floating
-    /// window (a second native OS window per floating panel) simulated *within* this single
-    /// window instead, at `(x, y, width, height)` in the same physical-pixel coordinates as
-    /// everything else. Chosen deliberately over real multi-window support: that would need
-    /// reworking `fastgui-render-vk`'s one-`Window`/one-swapchain-per-`App` assumption, a much
-    /// bigger and riskier change than this session had appetite for (see ROADMAP.md's M6
-    /// status) — the real trade-off here is losing "drag onto a second monitor" and "separate
-    /// taskbar entry", not anything about how it renders or drags.
-    ///
-    /// Draggable via its title bar (moves the panel directly; unlike a docked `Panel`'s title
-    /// bar, this never goes through drop-zone/rearrange logic — see `WidgetKind::PanelTitleBar`'s
-    /// doc comment). Not resizable, and not re-dockable back into a `DockArea`, in this pass.
-    /// Persists across future `set_content` calls (including ones a `DockArea` rearrange
-    /// triggers internally) — see `Window`'s doc comment on `floating_panels`.
+    /// Add `panel` as a real OS window (separate from this window's surface), initially placed
+    /// at `(x, y)` relative to this window's inner origin with the given size. Draggable via its
+    /// title bar anywhere on screen — including onto another monitor — and resizable via
+    /// edge/corner drag. If this window's content is a `DockArea`, dropping the floater onto a
+    /// docked region (or this window's outer edge) re-docks it. A docked panel can't be dragged
+    /// *out* into a new floater. Survives later `set_content` calls until re-docked.
     fn add_floating_panel(
         self_: &Bound<'_, Self>,
         panel: &Bound<'_, PyAny>,
@@ -400,8 +383,22 @@ impl Window {
             .cast::<widgets::Panel>()
             .map_err(|_| PyValueError::new_err("add_floating_panel expects a Panel"))?;
         panel_ref.borrow().set_floating();
-        widgets::bind_dispatch(panel, &self_.borrow().dispatch);
-        let described = panel_ref.borrow().describe_floating(x, y, width, height)?;
+        let region_id = panel_ref.borrow().region_id();
+        let title = panel_ref.borrow().title();
+        let dispatch = self_.borrow().dispatch.for_floating(region_id);
+        widgets::bind_dispatch(panel, &dispatch);
+        if let Some(content) = self_
+            .borrow()
+            .content
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|c| c.clone_ref(self_.py()))
+        {
+            bind_panel_to_dock_rearrange(&panel_ref, content.bind(self_.py()));
+        }
+        let mut described = panel_ref.borrow().describe_window_content()?;
+        described.force_fill();
 
         {
             let window = self_.borrow();
@@ -409,14 +406,58 @@ impl Window {
             floating.push((panel.clone().unbind(), x, y, width, height));
         }
 
-        let dispatch = self_.borrow().dispatch.clone();
         let closure_dispatch = dispatch.clone();
         dispatch
-            .send(Command::MutateWidgetTree(Box::new(move |tree| {
-                let root = tree.root();
-                widgets::attach(tree, root, described, &closure_dispatch);
-            })))
+            .send(Command::AddFloatingPanel {
+                region_id,
+                title,
+                x,
+                y,
+                width,
+                height,
+                build: Box::new(move |tree| {
+                    let root = tree.root();
+                    widgets::attach(tree, root, described, &closure_dispatch);
+                }),
+            })
             .map_err(|_| PyRuntimeError::new_err("window has already closed"))
+    }
+
+    /// Look up a still-floating panel by its stable region id without removing it. Used by
+    /// `DockArea._on_rearrange` to decide whether a dragged id that's missing from the dock tree
+    /// is a re-dockable floater, *before* committing the tree mutation.
+    #[pyo3(name = "_peek_floating_panel")]
+    fn peek_floating_panel(self_: &Bound<'_, Self>, region_id: u64) -> Option<Py<PyAny>> {
+        let py = self_.py();
+        let window = self_.borrow();
+        let floating = window.floating_panels.lock().unwrap_or_else(|p| p.into_inner());
+        floating.iter().find_map(|(panel, ..)| {
+            let bound = panel.bind(py).cast::<widgets::Panel>().ok()?;
+            (bound.borrow().region_id() == region_id).then(|| panel.clone_ref(py))
+        })
+    }
+
+    /// Remove a floating panel from this window's bookkeeping, clear its floating flag, and
+    /// close its OS window. Called by `DockArea._on_rearrange` once a re-dock drop has a valid
+    /// target.
+    #[pyo3(name = "_take_floating_panel")]
+    fn take_floating_panel(self_: &Bound<'_, Self>, region_id: u64) -> Option<Py<PyAny>> {
+        let py = self_.py();
+        let window = self_.borrow();
+        let mut floating = window.floating_panels.lock().unwrap_or_else(|p| p.into_inner());
+        let index = floating.iter().position(|(panel, ..)| {
+            panel
+                .bind(py)
+                .cast::<widgets::Panel>()
+                .ok()
+                .is_some_and(|bound| bound.borrow().region_id() == region_id)
+        })?;
+        let (panel, ..) = floating.remove(index);
+        if let Ok(bound) = panel.bind(py).cast::<widgets::Panel>() {
+            bound.borrow().clear_floating();
+        }
+        let _ = window.dispatch.send(Command::RemoveFloatingPanel { region_id });
+        Some(panel)
     }
 
     /// Open the window and block the calling thread, rendering until it is closed. Can only
@@ -443,6 +484,30 @@ impl Window {
             backend::run(&title, width, height, initial_color, handles)
                 .map_err(|err| PyRuntimeError::new_err(err.to_string()))
         })
+    }
+}
+
+/// If `content` is a `DockArea` (exposes `_on_rearrange`), bind that handler onto `panel` so
+/// dragging the floating title bar can re-dock. Silently no-ops for any other content widget.
+fn bind_panel_to_dock_rearrange(panel: &Bound<'_, widgets::Panel>, content: &Bound<'_, PyAny>) {
+    if let Ok(handler) = content.getattr("_on_rearrange") {
+        if handler.is_callable() {
+            panel.borrow().set_rearrange_handler(handler.unbind());
+        }
+    }
+}
+
+fn bind_floating_panels_to_content(window: &Bound<'_, Window>, content: &Bound<'_, PyAny>) {
+    let py = window.py();
+    let panels: Vec<Py<PyAny>> = {
+        let borrowed = window.borrow();
+        let floating = borrowed.floating_panels.lock().unwrap_or_else(|p| p.into_inner());
+        floating.iter().map(|(panel, ..)| panel.clone_ref(py)).collect()
+    };
+    for panel in panels {
+        if let Ok(bound) = panel.bind(py).cast::<widgets::Panel>() {
+            bind_panel_to_dock_rearrange(&bound, content);
+        }
     }
 }
 

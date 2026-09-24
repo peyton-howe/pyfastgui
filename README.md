@@ -113,10 +113,10 @@ All under [`python/examples/`](python/examples/), runnable directly once install
   `Splitter` (draggable divider between two panes).
 - **Content**: `Label`, `Button`, `Slider`, `Viewport` (arbitrary CPU/GPU frame content).
 - **Docking**: `Panel` (titled, draggable container), `Tabs` (several `Panel`s sharing one
-  region), `DockArea` (a split-tree of panels/tabs with full drag-to-rearrange — split, tab-merge,
-  ungroup, and whole-window edge drops; see its docstring in
-  [`python/fastgui/__init__.py`](python/fastgui/__init__.py) for the couple of gestures not
-  supported yet).
+  region), `DockArea` (a split-tree of panels/tabs with full drag-to-rearrange — split, tab-merge
+  including growing an existing `Tabs` group, ungroup, whole-window edge drops, and re-docking
+  a floating panel; see its docstring in
+  [`python/fastgui/__init__.py`](python/fastgui/__init__.py) for the remaining gaps).
 - **Window**: `Window(title, width, height)` — `set_content(widget)`, `set_clear_color(...)`,
   `add_floating_panel(panel, x, y, width, height)`, `.run()` (blocks, owns the render loop).
 
@@ -145,10 +145,8 @@ is the PyO3 layer and picks the backend with `cfg(target_os = "macos")`.
 - **Linux is less exercised than Windows and macOS.** It uses the same Vulkan backend as
   Windows, but day-to-day bring-up has been on those two platforms.
 - **No text wrapping, scrolling, or keyboard input/focus handling** for any widget yet.
-- **`DockArea` gaps**: dropping a panel onto an *existing* `Tabs` group's center (to grow it
-  past 2 members) isn't supported yet — only forming a new 2-member group, or ungrouping one
-  back out. Floating panels (`add_floating_panel`) can't be dragged into or out of a `DockArea`,
-  and aren't resizable.
+- **`DockArea` / floating**: floating panels are real OS windows (move, resize, tear out by
+  dragging a docked panel outside the main window, re-dock by dropping onto the dock).
 - **Automated tests are still thin.** `cargo test -p fastgui-core` covers `FrameSlot`, `DropZone`,
   and `WidgetTree` layout/hit-test; `python -m unittest tests.test_dock_area` (from `python/`)
   covers `DockArea` tree surgery. There is no GPU/window integration suite yet.

@@ -857,9 +857,33 @@ Viewport-inside-a-dock-panel, idle `ControlFlow::Wait`, `.gitignore`, and headle
 (`fastgui-core` + `python/tests/test_dock_area.py`) landed after 6A. Still not started: wheel
 packaging (6B), polish pass (6D). Docs (6C) are done — see its own section below. **6A itself (splitter, static dock, tabs — including ungrouping,
 drag-to-rearrange — including whole-area edge drops, floating panels) is now feature-complete**
-modulo the "confirm interactively when convenient" items above and the remaining explicitly-
-scoped-out gaps (dropping onto an existing `Tabs`' center, and floating-panel resize/re-dock)
-noted in `DockArea`'s and `Window.add_floating_panel`'s own docstrings.
+modulo the "confirm interactively when convenient" items above.
+
+**6A follow-up (tabs grow + floating re-dock).** Two of the originally scoped-out gaps are now
+implemented: dropping onto an existing `Tabs` center appends the dragged panel (new tab becomes
+active), and a `Window.add_floating_panel` panel whose window content is a `DockArea` can be
+dropped back onto a docked region or the window's outer edge. Floating-panel *resize*, and
+dragging a docked panel *out* into a new floater, are still out of scope. Headless coverage is
+in `python/tests/test_dock_area.py`; the live drag gesture has the same "confirm interactively"
+caveat as the rest of 6A.
+
+**6A follow-up (floating as real OS windows).** Floating panels are no longer overlays clipped to
+the main window: each `add_floating_panel` opens an undecorated winit window that can be dragged
+anywhere on screen (including onto another monitor). Re-dock still works by mapping the screen
+cursor into the main window's dock drop zones. Implemented in both Metal and Vulkan apps.
+
+**6A follow-up (floating resize).** Undecorated floaters resize via a 6px edge/corner hit-test
+(custom chrome — no OS resize border). Title-bar interior still moves; top few pixels resize.
+Min size 160×100 logical.
+
+**6A follow-up (dock → float tear-off).** Drag a docked panel or tab outside the main window and
+release: `DropZone::Float` tears it out via `add_floating_panel`. Empty docks stay as window
+content (blank `Box`) so a later re-dock still works.
+
+**6A follow-up (tear-off ghost preview).** While dragging a docked panel, after a short move
+threshold a mouse-transparent AlwaysOnTop ghost window (title bar + body chrome) follows the
+cursor; the real panel stays docked until release (Qt-style non-opaque / preview undock). Dock
+drop highlights still update on the main window.
 
 ### 6A. Docking/panel system (full scope)
 

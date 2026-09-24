@@ -25,9 +25,11 @@ impl Color {
 pub type ClickCallback = Arc<dyn Fn() + Send + Sync>;
 pub type ChangeCallback = Arc<dyn Fn(f32) + Send + Sync>;
 pub type TabSelectCallback = Arc<dyn Fn(usize) + Send + Sync>;
-/// `(dragged_region_id, target_region_id, zone)`, fired when a `PanelTitleBar` drag ends over a
-/// drop-eligible region — see `WidgetKind::PanelTitleBar`'s doc comment.
-pub type PanelDropCallback = Arc<dyn Fn(u64, u64, DropZone) + Send + Sync>;
+/// `(dragged_region_id, target_region_id, zone, float_rect)`.
+/// `float_rect` is `Some((x, y, width, height))` in main-window client coords when `zone` is
+/// `Float` (tear a docked panel out into an OS window); `None` for ordinary dock rearrange.
+pub type PanelDropCallback =
+    Arc<dyn Fn(u64, u64, DropZone, Option<(f32, f32, f32, f32)>) + Send + Sync>;
 
 /// Which axis a `Splitter` divides its two panes along — matches the parent `Box`'s own
 /// `flex_direction` (a `Splitter` is itself a row/column container; see
@@ -39,7 +41,9 @@ pub enum SplitDirection {
 }
 
 /// Where a dragged panel was released relative to the region it was dropped on — `Center` means
-/// "merge as a tab", the others mean "split the target and put the dragged panel on that edge".
+/// "merge as a tab", the edge variants mean "split the target and put the dragged panel on that
+/// edge", and `Float` means "tear out into a floating OS window" (cursor released outside the
+/// main window with no dock hover).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropZone {
     Center,
@@ -47,6 +51,7 @@ pub enum DropZone {
     Right,
     Top,
     Bottom,
+    Float,
 }
 
 impl DropZone {
@@ -156,13 +161,12 @@ pub enum WidgetKind {
     /// restructure its tree and ask the `Window` to re-attach it. Standalone `Panel`s (not in a
     /// `DockArea`) just have `on_drop: None`, so dragging their title bar is a no-op.
     ///
-    /// `floating`/`container_id` are for `Window.add_floating_panel` instead: when `floating` is
-    /// true, dragging this bar repositions `container_id` (this title bar's own parent — the
-    /// `Panel`'s outer `Container`, absolutely positioned — see `WidgetTree::set_position`)
-    /// directly rather than going through the drop-zone/`on_drop` machinery, since a floating
-    /// panel is just moved, not rearranged into the dock tree. `container_id` is `None` only
-    /// transiently between this node's own creation and its parent's (see `attach`'s doc
-    /// comment on backfilling it) — never observed unset by anything that matters.
+    /// `floating`/`container_id` are for `Window.add_floating_panel`: when `floating` is true,
+    /// this panel lives in its own OS window and dragging the title bar moves that window
+    /// (via `set_outer_position`), including outside the main window. If `on_drop` is also set
+    /// (main window content is a `DockArea`), the same drag drives drop-zone hover on the main
+    /// window so releasing over a docked region re-docks the panel. `container_id` is still
+    /// backfilled by `attach` for compatibility; OS-window drag no longer uses `set_position`.
     PanelTitleBar {
         panel_id: u64,
         title: String,
@@ -382,18 +386,36 @@ impl WidgetTree {
 
     /// Find the `DockArea` region (a `Container { region_id: Some(_), .. }` — a `Panel`'s or
     /// `Tabs`' own outer container) containing `(x, y)`, for drag-and-drop drop-target
-    /// hit-testing. Unlike `hit_test`, this deliberately isn't "topmost wins": regions never
-    /// overlap (each occupies a distinct rect via the `Splitter` tree they're arranged in), so
-    /// any match is *the* match, and a region's rect always contains whatever's drawn on top of
-    /// it (its title bar, content, etc.) — walking to find one that both carries a `region_id`
+    /// hit-testing. Unlike `hit_test`, this deliberately isn't "topmost wins": docked regions
+    /// never overlap (each occupies a distinct rect via the `Splitter` tree they're arranged in),
+    /// so any match is *the* match, and a region's rect always contains whatever's drawn on top
+    /// of it (its title bar, content, etc.) — walking to find one that both carries a `region_id`
     /// and contains the point is enough, no z-order tie-breaking needed.
+    ///
+    /// Absolutely-positioned containers (floating panels) also carry a `region_id` but are
+    /// overlays, not dock drop targets — skip them so a drop lands on the docked region
+    /// underneath rather than on the floating panel the cursor is visually over.
     pub fn find_region_at(&self, x: f32, y: f32) -> Option<(u64, Rect)> {
         self.walk().find_map(|id| {
             let Some(WidgetKind::Container { region_id: Some(region_id), .. }) = self.kind(id) else {
                 return None;
             };
+            if self.taffy.style(id).ok().is_some_and(|s| s.position == Position::Absolute) {
+                return None;
+            }
             let rect = self.absolute_rect(id)?;
             rect.contains(x, y).then_some((*region_id, rect))
+        })
+    }
+
+    /// Absolute rect of the `Container` carrying `region_id`, if any — used when tearing a
+    /// docked panel out to size the new floating window.
+    pub fn find_region_rect(&self, region_id: u64) -> Option<Rect> {
+        self.walk().find_map(|id| {
+            let Some(WidgetKind::Container { region_id: Some(rid), .. }) = self.kind(id) else {
+                return None;
+            };
+            (*rid == region_id).then(|| self.absolute_rect(id)).flatten()
         })
     }
 }
@@ -545,6 +567,38 @@ mod tests {
         assert_eq!(found.0, 7);
         assert_eq!(found.1.width, 100.0);
         assert_eq!(found.1.height, 80.0);
+    }
+
+    #[test]
+    fn find_region_at_skips_floating_overlay() {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let docked = tree.new_node(
+            Style {
+                size: Size { width: Dimension::percent(1.0), height: Dimension::percent(1.0) },
+                ..Default::default()
+            },
+            WidgetKind::Container { background: Color::TRANSPARENT, region_id: Some(1) },
+        );
+        let floating = tree.new_node(
+            Style {
+                position: Position::Absolute,
+                inset: taffy::prelude::Rect {
+                    left: LengthPercentageAuto::length(10.0),
+                    top: LengthPercentageAuto::length(10.0),
+                    right: LengthPercentageAuto::auto(),
+                    bottom: LengthPercentageAuto::auto(),
+                },
+                size: Size { width: Dimension::length(50.0), height: Dimension::length(50.0) },
+                ..Default::default()
+            },
+            WidgetKind::Container { background: Color::TRANSPARENT, region_id: Some(2) },
+        );
+        tree.add_child(root, docked);
+        tree.add_child(root, floating);
+        tree.compute_layout(100.0, 80.0);
+        let found = tree.find_region_at(20.0, 20.0).expect("docked region under overlay");
+        assert_eq!(found.0, 1);
     }
 
     #[test]

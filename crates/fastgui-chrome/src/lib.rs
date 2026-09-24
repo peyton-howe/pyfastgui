@@ -210,7 +210,7 @@ fn draw_slider(
 fn drop_zone_rect(region: fastgui_core::widget::Rect, zone: DropZone) -> fastgui_core::widget::Rect {
     use fastgui_core::widget::Rect;
     match zone {
-        DropZone::Center => region,
+        DropZone::Center | DropZone::Float => region,
         DropZone::Left => Rect { width: region.width / 2.0, ..region },
         DropZone::Right => Rect { x: region.x + region.width / 2.0, width: region.width / 2.0, ..region },
         DropZone::Top => Rect { height: region.height / 2.0, ..region },
