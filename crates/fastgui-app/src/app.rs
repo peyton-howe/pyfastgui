@@ -1394,9 +1394,12 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::Wait);
 
+        // Hidden until the first frame, like floaters (see `add_floating_panel`): otherwise
+        // Windows shows the main window blank white while the backend is built.
         let attributes = Window::default_attributes()
             .with_title(self.title.clone())
-            .with_inner_size(LogicalSize::new(f64::from(self.width), f64::from(self.height)));
+            .with_inner_size(LogicalSize::new(f64::from(self.width), f64::from(self.height)))
+            .with_visible(false);
         let window = match event_loop.create_window(attributes) {
             Ok(window) => window,
             Err(err) => {
@@ -1413,8 +1416,12 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
             Ok(renderer) => {
                 self.renderer = Some(renderer);
                 self.last_applied_physical = (self.physical_width, self.physical_height);
-                window.request_redraw();
+                window.set_visible(true);
+                let window_id = window.id();
                 self.window = Some(window);
+                // Draws whatever `set_content` already queued. Pending floaters open after,
+                // so they appear above the main window.
+                self.render_window(event_loop, window_id);
             }
             Err(err) => {
                 self.error = Some(RunError::Renderer(err));
