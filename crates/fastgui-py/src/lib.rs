@@ -58,6 +58,10 @@ impl Viewport {
     /// buffer protocol) as the viewport's next frame. Three-channel (RGB) input is expanded
     /// to RGBA with alpha=255. Safe to call from any thread, as often as you like — only the
     /// most recent unconsumed frame is ever displayed.
+    ///
+    /// Copies the buffer into an owned `Vec<u8>` today (`PyBuffer::to_vec`). Fine for demos and
+    /// moderate rates; a camera/high-FPS path that is already packed RGBA will want a later
+    /// zero-copy or fewer-copy upload when the array is C-contiguous RGBA8.
     fn submit_frame(&self, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let buffer = PyBuffer::<u8>::get(data)?;
         let shape = buffer.shape();
@@ -283,7 +287,7 @@ struct Window {
 #[pymethods]
 impl Window {
     #[new]
-    #[pyo3(signature = (title="fast-gui", width=1280, height=720))]
+    #[pyo3(signature = (title="fastgui", width=1280, height=720))]
     fn new(title: &str, width: u32, height: u32) -> Self {
         let (sender, receiver) = command_channel();
         let waker = EventWaker::default();

@@ -5,7 +5,7 @@
 //! drops stale frames) than the command queue (in-order, never drops). M4 adds the retained
 //! widget tree (`widget` module), backed by `taffy` for layout; `fastgui-chrome` rasterizes it
 //! and `fastgui-render-vk` displays the result the same way it displays a CPU-uploaded
-//! `Viewport` frame. See the fast-gui plan for the milestone breakdown.
+//! `Viewport` frame. See ROADMAP.md for the milestone breakdown.
 
 mod frame;
 mod queue;

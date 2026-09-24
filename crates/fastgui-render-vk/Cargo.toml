@@ -8,7 +8,6 @@ publish.workspace = true
 [dependencies]
 fastgui-chrome = { path = "../fastgui-chrome" }
 fastgui-core = { path = "../fastgui-core" }
-fastgui-render = { path = "../fastgui-render" }
 crossbeam-channel = "0.5"
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug"] }
 ash-window = "0.13"

@@ -35,7 +35,7 @@ def camera_thread(viewport: fg.Viewport, stop: threading.Event) -> None:
 
 
 def main() -> None:
-    window = fg.Window(title="fast-gui — M2 live feed", width=WIDTH, height=HEIGHT)
+    window = fg.Window(title="fastgui — M2 live feed", width=WIDTH, height=HEIGHT)
     viewport = fg.Viewport()
     window.set_viewport(viewport)
 

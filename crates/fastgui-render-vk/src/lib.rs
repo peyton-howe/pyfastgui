@@ -1,4 +1,4 @@
-//! Vulkan rendering backend (Windows + Linux) for fast-gui.
+//! Vulkan rendering backend (Windows + Linux) for fastgui.
 
 mod app;
 mod command;

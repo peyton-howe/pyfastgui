@@ -906,23 +906,3 @@ impl Drop for VulkanRenderer {
         }
     }
 }
-
-impl fastgui_render::Renderer for VulkanRenderer {
-    type Error = Error;
-
-    fn new(
-        window: &(impl HasWindowHandle + HasDisplayHandle),
-        width: u32,
-        height: u32,
-    ) -> Result<Self, Self::Error> {
-        VulkanRenderer::new(window, width, height)
-    }
-
-    fn resize(&mut self, width: u32, height: u32) -> Result<(), Self::Error> {
-        VulkanRenderer::resize(self, width, height)
-    }
-
-    fn render_frame(&mut self, color: [f32; 4]) -> Result<(), Self::Error> {
-        VulkanRenderer::render_frame(self, color, false, &[])
-    }
-}

@@ -1,4 +1,4 @@
-//! Metal rendering backend (macOS) for fast-gui.
+//! Metal rendering backend (macOS) for fastgui.
 
 mod app;
 mod command;

@@ -7,7 +7,7 @@ import fastgui as fg
 
 
 def main() -> None:
-    window = fg.Window(title="fast-gui — M6 tabs", width=900, height=560)
+    window = fg.Window(title="fastgui — M6 tabs", width=900, height=560)
 
     count = 0
     count_label = fg.Label("Count: 0", font_size=20.0)
