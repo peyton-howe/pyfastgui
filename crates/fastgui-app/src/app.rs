@@ -121,6 +121,10 @@ struct App<B: SurfaceBackend> {
     dock_tear_press_cursor: Option<(f32, f32)>,
     /// Live ghost preview while tearing a docked panel out (destroyed on mouse-up).
     tear_ghost: Option<TearGhost<B>>,
+    /// Region id of a panel just torn out while its ghost is kept on screen. The ghost sits
+    /// always-on-top exactly where the new floater opens, so it stays until that floater
+    /// presents its first frame instead of leaving a blank window during the handoff.
+    tear_handoff: Option<u64>,
     last_drag_render: Instant,
     /// Physical size the main surface was last resized to (Debounced policy).
     last_applied_physical: (u32, u32),
@@ -146,6 +150,19 @@ impl<B: SurfaceBackend> App<B> {
     /// Apply every command queued since the last frame.
     /// Needs `event_loop` so `AddFloatingPanel` can create additional winit windows.
     fn drain_commands(&mut self, event_loop: &ActiveEventLoop) {
+        self.drain_command_queue(event_loop);
+        // The float callback sends `AddFloatingPanel` synchronously, so it has been applied by
+        // now. If no floater exists for the handoff region, Python declined to float it —
+        // don't leave the ghost stranded.
+        if let Some(region_id) = self.tear_handoff {
+            if !self.floating_by_region.contains_key(&region_id) {
+                self.tear_handoff = None;
+                self.tear_ghost = None;
+            }
+        }
+    }
+
+    fn drain_command_queue(&mut self, event_loop: &ActiveEventLoop) {
         while let Ok(command) = self.handles.commands.try_recv() {
             match command {
                 Command::SetClearColor(color) => {
@@ -885,6 +902,8 @@ impl<B: SurfaceBackend> App<B> {
             if dx * dx + dy * dy < TEAR_GHOST_THRESHOLD * TEAR_GHOST_THRESHOLD {
                 return;
             }
+            // A new drag replaces any ghost still covering a previous tear-off's floater.
+            self.tear_handoff = None;
             if let Err(err) = self.spawn_tear_ghost(event_loop) {
                 self.error = Some(err);
                 event_loop.exit();
@@ -904,6 +923,9 @@ impl<B: SurfaceBackend> App<B> {
     }
 
     fn handle_panel_drop(&mut self) {
+        // Held locally: every path drops it here except a tear-off, which hands it to
+        // `tear_handoff` to cover the new floater until its first frame.
+        let ghost = self.tear_ghost.take();
         self.destroy_tear_ghost();
         let Some((bar_id, dragged_region_id)) = self.dragging_panel_title.take() else {
             self.dock_tear_grab = None;
@@ -940,6 +962,10 @@ impl<B: SurfaceBackend> App<B> {
             fastgui_core::widget::DropZone::Float,
             Some((fx, fy, fw, fh)),
         );
+        if ghost.is_some() {
+            self.tear_ghost = ghost;
+            self.tear_handoff = Some(dragged_region_id);
+        }
     }
 
     /// Apply an in-progress edge/corner resize using screen-space deltas from press.
@@ -1328,6 +1354,10 @@ impl<B: SurfaceBackend> App<B> {
             event_loop.exit();
             return false;
         }
+        if self.tear_handoff == Some(floater.region_id) {
+            self.tear_handoff = None;
+            self.tear_ghost = None;
+        }
         true
     }
 
@@ -1531,10 +1561,18 @@ impl<B: SurfaceBackend> App<B> {
             WindowEvent::Resized(size) => {
                 let resize_result = {
                     let Some(floater) = self.floating.get_mut(&window_id) else { return };
+                    // Windows sends a same-size `Resized` when a new floater is first shown.
+                    // Recreating the swapchain for it costs a ~2s DWM stall (see
+                    // `RESIZE_DEBOUNCE`) with the window left blank, so skip no-op resizes.
+                    let unchanged = (size.width, size.height) == (floater.physical_width, floater.physical_height);
                     Self::apply_floating_physical_size(floater, size);
-                    floater
-                        .renderer
-                        .resize(floater.physical_width, floater.physical_height)
+                    if unchanged {
+                        Ok(())
+                    } else {
+                        floater
+                            .renderer
+                            .resize(floater.physical_width, floater.physical_height)
+                    }
                 };
                 if let Err(err) = resize_result {
                     self.error = Some(RunError::Renderer(err));
@@ -1648,6 +1686,7 @@ pub fn run<B: SurfaceBackend>(
         dock_tear_title: None,
         dock_tear_press_cursor: None,
         tear_ghost: None,
+        tear_handoff: None,
         last_drag_render: Instant::now(),
         last_applied_physical: (width, height),
         last_resize_event: Instant::now(),
