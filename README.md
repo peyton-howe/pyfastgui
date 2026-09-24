@@ -159,5 +159,5 @@ is the PyO3 layer and picks the backend with `cfg(target_os = "macos")`.
 This project has been built session-by-session with an AI pair-programmer, using
 [ROADMAP.md](ROADMAP.md) as the persistent memory between sessions — it documents not just
 what's done but *why*, including bugs found and fixed along the way and the reasoning behind
-non-obvious design choices (e.g. why floating panels are simulated within one window rather than
-real OS windows). Read it before making non-trivial changes.
+non-obvious design choices (e.g. how floating panels moved from in-window overlays to real OS
+windows). Read it before making non-trivial changes.

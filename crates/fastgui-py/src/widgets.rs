@@ -986,9 +986,9 @@ impl Panel {
             .map(|cb| cb.clone_ref(py))
     }
 
-    /// Called once by `Window.add_floating_panel` (`fastgui-py::lib`), before its first
-    /// `describe_floating` — makes every future `describe()`/`describe_floating()` build this
-    /// panel's title bar with `floating: true`. Cleared by `clear_floating` when the panel is
+    /// Called by `Window.add_floating_panel` (`fastgui-py::lib`), before its
+    /// `describe_window_content` — makes every future `describe()` build this panel's title bar
+    /// with `floating: true`. Cleared by `clear_floating` when the panel is
     /// dropped back into a `DockArea` (see `Window::take_floating_panel`).
     pub(crate) fn set_floating(&self) {
         self.floating.store(true, Ordering::Relaxed);

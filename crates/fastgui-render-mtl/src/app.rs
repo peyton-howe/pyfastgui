@@ -243,22 +243,6 @@ impl App {
         }
     }
 
-    fn remove_floating_by_window(&mut self, window_id: WindowId) {
-        if let Some(floater) = self.floating.remove(&window_id) {
-            self.floating_by_region.remove(&floater.region_id);
-            if self.dragging_from_floating == Some(floater.region_id) {
-                self.dragging_from_floating = None;
-                self.dragging_panel_title = None;
-                self.hover_region = None;
-            }
-            if self.dragging_floating_panel.is_some_and(|(id, _)| id == window_id) {
-                self.dragging_floating_panel = None;
-            }
-            if self.dragging_floating_resize.as_ref().is_some_and(|d| d.window_id == window_id) {
-                self.dragging_floating_resize = None;
-            }
-        }
-    }
 
     fn classify_float_resize_edge(width: f32, height: f32, x: f32, y: f32) -> Option<ResizeEdge> {
         if width <= 0.0 || height <= 0.0 {
@@ -298,6 +282,19 @@ impl App {
             return None;
         }
         Self::classify_float_resize_edge(floater.width as f32, floater.height as f32, x, y)
+    }
+
+    /// The close handler on a floater's own title bar, if its panel is closeable.
+    fn floating_close_callback(&self, window_id: WindowId) -> Option<fastgui_core::widget::PanelCloseCallback> {
+        let floater = self.floating.get(&window_id)?;
+        floater.widget_tree.walk().find_map(|id| match floater.widget_tree.kind(id) {
+            Some(WidgetKind::PanelTitleBar { panel_id, on_close: Some(callback), .. })
+                if *panel_id == floater.region_id =>
+            {
+                Some(callback.clone())
+            }
+            _ => None,
+        })
     }
 
     fn resize_edge_cursor(edge: ResizeEdge) -> winit::window::CursorIcon {
@@ -1562,8 +1559,15 @@ impl App {
         event: WindowEvent,
     ) {
         match event {
+            // Alt+F4 etc. Go through the panel's close handler, same as its ×, so Python drops
+            // it from `floating_panels` too — destroying just the OS window here would leave
+            // the panel listed as floating with nothing on screen to get it back. Panels
+            // without a close handler have no × either, so the close is ignored.
             WindowEvent::CloseRequested => {
-                self.remove_floating_by_window(window_id);
+                if let Some(callback) = self.floating_close_callback(window_id) {
+                    let region_id = self.floating[&window_id].region_id;
+                    callback(region_id);
+                }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(floater) = self.floating.get_mut(&window_id) {
