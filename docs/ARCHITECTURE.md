@@ -26,11 +26,18 @@ crates/
     src/surface.rs            SurfaceBackend trait + MainResizePolicy (Immediate vs Debounced)
 
   fastgui-render-vk/      The Vulkan GPU backend (Windows + Linux). Thin `run()` wrapper with
-                          Debounced main-window resize + CUDA surface create.
-    src/renderer.rs          VulkanRenderer (+ SurfaceBackend impl): swapchain, dynamic rendering
+                          Debounced main-window resize + CUDA surface create. Selected by
+                          `fastgui-py` via `cfg(not(target_os = "macos"))`.
+    src/renderer.rs          VulkanRenderer (+ SurfaceBackend impl): instance/device/swapchain
+                              setup, dynamic rendering (VK_KHR_dynamic_rendering — no render
+                              pass/framebuffer objects)
     src/app.rs                run() → fastgui_app::run::<VulkanRenderer>(…, Debounced)
-    src/cuda_texture.rs       CudaSharedTexture; re-exports CudaExportHandles from fastgui-app
-    shaders/                  viewport.vert/.frag source + precompiled .spv (checked in)
+    src/pipeline.rs           ViewportPipeline: fullscreen-triangle shaders + descriptor set
+    src/texture.rs            ViewportTexture: host-visible LINEAR CPU-upload texture
+    src/cuda_texture.rs       CudaSharedTexture: exportable image + timeline semaphore (CUDA
+                              interop, see below); re-exports CudaExportHandles from fastgui-app
+    shaders/                  viewport.vert/.frag source + precompiled .spv (checked in, so a
+                              plain build doesn't need the Vulkan SDK)
 
   fastgui-render-mtl/     The Metal GPU backend (macOS). Thin `run()` wrapper with Immediate
                           resize. No CUDA — Viewport.create_cuda_surface raises in Python.

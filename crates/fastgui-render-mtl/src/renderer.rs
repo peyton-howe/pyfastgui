@@ -316,5 +316,3 @@ impl fastgui_app::SurfaceBackend for MetalRenderer {
         MetalRenderer::render_frame(self, clear, draw_chrome, draws)
     }
 }
-
-

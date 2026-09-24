@@ -31,7 +31,7 @@ def camera_thread(viewport: fg.Viewport, stop: threading.Event) -> None:
 
 
 def main() -> None:
-    window = fg.Window(title="fast-gui — M6 docking", width=960, height=600)
+    window = fg.Window(title="fastgui — M6 docking", width=960, height=600)
 
     count = 0
     count_label = fg.Label("Count: 0", font_size=22.0)

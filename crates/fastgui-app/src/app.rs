@@ -170,6 +170,15 @@ impl<B: SurfaceBackend> App<B> {
                             floater.has_widget_content = true;
                             floater.window.request_redraw();
                         }
+                    } else if let Some(pending) =
+                        self.pending_floaters.iter_mut().find(|(id, ..)| *id == region_id)
+                    {
+                        // Window not created yet: run after its `build` instead of dropping it.
+                        let build = std::mem::replace(&mut pending.6, Box::new(|_| {}));
+                        pending.6 = Box::new(move |tree| {
+                            build(tree);
+                            mutation(tree);
+                        });
                     }
                 }
                 Command::AddFloatingPanel {
@@ -220,21 +229,36 @@ impl<B: SurfaceBackend> App<B> {
         }
     }
 
-    fn remove_floating_by_window(&mut self, window_id: WindowId) {
-        if let Some(floater) = self.floating.remove(&window_id) {
-            self.floating_by_region.remove(&floater.region_id);
-            if self.dragging_from_floating == Some(floater.region_id) {
-                self.dragging_from_floating = None;
-                self.dragging_panel_title = None;
-                self.hover_region = None;
-            }
-            if self.dragging_floating_panel.is_some_and(|(id, _)| id == window_id) {
-                self.dragging_floating_panel = None;
-            }
-            if self.dragging_floating_resize.as_ref().is_some_and(|d| d.window_id == window_id) {
-                self.dragging_floating_resize = None;
-            }
+    /// Resize edge under a floater's cursor, unless the cursor is on a title-bar × — the
+    /// resize strip along the top/right edges would otherwise swallow part of that button.
+    fn floating_resize_edge_at_cursor(floater: &FloatingWindow<B>) -> Option<ResizeEdge> {
+        let (x, y) = floater.cursor;
+        let on_close_button = floater.widget_tree.hit_test(x, y).is_some_and(|id| {
+            matches!(
+                floater.widget_tree.kind(id),
+                Some(WidgetKind::PanelTitleBar { on_close: Some(_), .. })
+            ) && floater
+                .widget_tree
+                .absolute_rect(id)
+                .is_some_and(|rect| fastgui_core::widget::close_button_rect(rect).contains(x, y))
+        });
+        if on_close_button {
+            return None;
         }
+        classify_float_resize_edge(floater.width as f32, floater.height as f32, x, y)
+    }
+
+    /// The close handler on a floater's own title bar, if its panel is closeable.
+    fn floating_close_callback(&self, window_id: WindowId) -> Option<fastgui_core::widget::PanelCloseCallback> {
+        let floater = self.floating.get(&window_id)?;
+        floater.widget_tree.walk().find_map(|id| match floater.widget_tree.kind(id) {
+            Some(WidgetKind::PanelTitleBar { panel_id, on_close: Some(callback), .. })
+                if *panel_id == floater.region_id =>
+            {
+                Some(callback.clone())
+            }
+            _ => None,
+        })
     }
 
     // Mirrors `Command::AddFloatingPanel` field-for-field.
@@ -447,8 +471,27 @@ impl<B: SurfaceBackend> App<B> {
             WidgetKind::Splitter { .. } => {
                 self.dragging_splitter = Some(id);
             }
-            WidgetKind::TabBar { panel_ids, content_ids, titles, .. } => {
+            WidgetKind::TabBar { panel_ids, content_ids, titles, on_close, .. } => {
                 if let Some(index) = self.tab_bar_clicked_index(id) {
+                    if let Some(rect) = self.widget_tree.absolute_rect(id) {
+                        let n = titles.len().max(1) as f32;
+                        let segment = fastgui_core::widget::Rect {
+                            x: rect.x + index as f32 * (rect.width / n),
+                            y: rect.y,
+                            width: rect.width / n,
+                            height: rect.height,
+                        };
+                        if on_close.get(index).is_some_and(|c| c.is_some())
+                            && fastgui_core::widget::close_button_rect(segment).contains(self.cursor.0, self.cursor.1)
+                        {
+                            if let Some(callback) = on_close[index].clone() {
+                                if let Some(&panel_id) = panel_ids.get(index) {
+                                    callback(panel_id);
+                                }
+                            }
+                            return;
+                        }
+                    }
                     if let Some(&panel_id) = panel_ids.get(index) {
                         let content_ids = content_ids.clone();
                         let title = titles.get(index).cloned().unwrap_or_default();
@@ -463,7 +506,17 @@ impl<B: SurfaceBackend> App<B> {
             }
             // Floating panels are real OS windows now — title-bar drag for those is handled on
             // the floater's own `window_event` path, not via `set_position` overlays here.
-            WidgetKind::PanelTitleBar { panel_id, floating, title, .. } => {
+            WidgetKind::PanelTitleBar { panel_id, floating, title, on_close, .. } => {
+                if let Some(rect) = self.widget_tree.absolute_rect(id) {
+                    if on_close.is_some()
+                        && fastgui_core::widget::close_button_rect(rect).contains(self.cursor.0, self.cursor.1)
+                    {
+                        if let Some(callback) = on_close.clone() {
+                            callback(*panel_id);
+                        }
+                        return;
+                    }
+                }
                 if !*floating {
                     let panel_id = *panel_id;
                     let title = title.clone();
@@ -482,10 +535,9 @@ impl<B: SurfaceBackend> App<B> {
         let Some(floater) = self.floating.get(&window_id) else { return };
         let cursor = floater.cursor;
         let region_id = floater.region_id;
-        // Edge/corner resize takes priority over title-bar move (top few points are resize).
-        if let Some(edge) =
-            classify_float_resize_edge(floater.width as f32, floater.height as f32, cursor.0, cursor.1)
-        {
+        // Edge/corner resize takes priority over title-bar move (top few points are resize),
+        // except on the title-bar ×.
+        if let Some(edge) = Self::floating_resize_edge_at_cursor(floater) {
             let scale = floater.scale_factor.max(0.01);
             let Ok(inner) = floater.window.inner_position() else { return };
             let Ok(outer) = floater.window.outer_position() else { return };
@@ -519,10 +571,41 @@ impl<B: SurfaceBackend> App<B> {
                     floater.dragging_splitter = Some(id);
                 }
             }
-            WidgetKind::TabBar { .. } => {
+            WidgetKind::TabBar { panel_ids, titles, on_close, .. } => {
+                if let Some(index) = Self::floating_tab_bar_clicked_index(floater, id) {
+                    if let Some(rect) = floater.widget_tree.absolute_rect(id) {
+                        let n = titles.len().max(1) as f32;
+                        let segment = fastgui_core::widget::Rect {
+                            x: rect.x + index as f32 * (rect.width / n),
+                            y: rect.y,
+                            width: rect.width / n,
+                            height: rect.height,
+                        };
+                        if on_close.get(index).is_some_and(|c| c.is_some())
+                            && fastgui_core::widget::close_button_rect(segment).contains(cursor.0, cursor.1)
+                        {
+                            if let Some(callback) = on_close[index].clone() {
+                                if let Some(&panel_id) = panel_ids.get(index) {
+                                    callback(panel_id);
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
                 self.handle_floating_tab_click(window_id, id);
             }
-            WidgetKind::PanelTitleBar { panel_id, floating, on_drop, .. } => {
+            WidgetKind::PanelTitleBar { panel_id, floating, on_drop, on_close, .. } => {
+                if let Some(rect) = floater.widget_tree.absolute_rect(id) {
+                    if on_close.is_some()
+                        && fastgui_core::widget::close_button_rect(rect).contains(cursor.0, cursor.1)
+                    {
+                        if let Some(callback) = on_close.clone() {
+                            callback(*panel_id);
+                        }
+                        return;
+                    }
+                }
                 let panel_id = *panel_id;
                 let floating = *floating;
                 let can_redock = on_drop.is_some();
@@ -1078,7 +1161,7 @@ impl<B: SurfaceBackend> App<B> {
     fn update_cursor_icon(&mut self) {
         let Some(window) = &self.window else { return };
         if self.dragging_panel_title.is_some() || self.dragging_floating_panel.is_some() {
-            window.set_cursor(winit::window::CursorIcon::Grabbing);
+            window.set_cursor(GRABBING_CURSOR);
             return;
         }
         let hovered = self
@@ -1090,7 +1173,7 @@ impl<B: SurfaceBackend> App<B> {
                 fastgui_core::widget::SplitDirection::Column => winit::window::CursorIcon::RowResize,
             }),
             Some(WidgetKind::PanelTitleBar { on_drop, floating, .. }) if on_drop.is_some() || *floating => {
-                Some(winit::window::CursorIcon::Grab)
+                Some(GRAB_CURSOR)
             }
             _ => None,
         };
@@ -1111,15 +1194,10 @@ impl<B: SurfaceBackend> App<B> {
             return;
         }
         if dragging {
-            floater.window.set_cursor(winit::window::CursorIcon::Grabbing);
+            floater.window.set_cursor(GRABBING_CURSOR);
             return;
         }
-        if let Some(edge) = classify_float_resize_edge(
-            floater.width as f32,
-            floater.height as f32,
-            floater.cursor.0,
-            floater.cursor.1,
-        ) {
+        if let Some(edge) = Self::floating_resize_edge_at_cursor(floater) {
             floater.window.set_cursor(resize_edge_cursor(edge));
             return;
         }
@@ -1132,7 +1210,7 @@ impl<B: SurfaceBackend> App<B> {
                 fastgui_core::widget::SplitDirection::Column => winit::window::CursorIcon::RowResize,
             }),
             Some(WidgetKind::PanelTitleBar { on_drop, floating, .. }) if on_drop.is_some() || *floating => {
-                Some(winit::window::CursorIcon::Grab)
+                Some(GRAB_CURSOR)
             }
             _ => None,
         };
@@ -1161,8 +1239,46 @@ impl<B: SurfaceBackend> App<B> {
         floater.height = logical.height.round().max(0.0) as u32;
     }
 
-    /// Drain queued commands and render one frame immediately (main + every floater).
+    /// Drain queued commands and render one frame immediately (main + every floater). Used by
+    /// drag/resize paths, where a floater drag also has to repaint the main window's drop
+    /// highlight. `RedrawRequested` uses `render_window` instead.
     fn render_now(&mut self, event_loop: &ActiveEventLoop) {
+        self.drain_commands(event_loop);
+        if !self.render_main(event_loop) {
+            return;
+        }
+        let floating_ids: Vec<WindowId> = self.floating.keys().copied().collect();
+        for window_id in floating_ids {
+            if !self.render_floater(event_loop, window_id) {
+                return;
+            }
+        }
+        if let Some(ghost) = &mut self.tear_ghost {
+            if let Err(err) = ghost.renderer.render_frame(TEAR_GHOST_CLEAR, true, &[]) {
+                self.error = Some(RunError::Renderer(err));
+                event_loop.exit();
+            }
+        }
+    }
+
+    /// Drain queued commands and render only `window_id` — what that window's own
+    /// `RedrawRequested` does. A wake asks every window to redraw, so rendering all of them
+    /// from each redraw would cost (floaters + 1)² frames per wake instead of one per window.
+    fn render_window(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId) {
+        self.drain_commands(event_loop);
+        if self.window.as_ref().is_some_and(|w| w.id() == window_id) {
+            self.render_main(event_loop);
+        } else {
+            self.render_floater(event_loop, window_id);
+        }
+    }
+
+    /// Render the main window. Returns `false` (after recording the error and exiting) on
+    /// failure.
+    fn render_main(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        // Debounced policy: catch the surface up to the latest size only once a resize has
+        // settled — see `RESIZE_DEBOUNCE`. Runs on every main-window frame so the first frame
+        // after the debounce window is always correctly sized.
         if matches!(self.resize_policy, MainResizePolicy::Debounced) {
             let settled = self.last_resize_event.elapsed() >= RESIZE_DEBOUNCE;
             if settled && self.last_applied_physical != (self.physical_width, self.physical_height) {
@@ -1170,18 +1286,17 @@ impl<B: SurfaceBackend> App<B> {
                     if let Err(err) = renderer.resize(self.physical_width, self.physical_height) {
                         self.error = Some(RunError::Renderer(err));
                         event_loop.exit();
-                        return;
+                        return false;
                     }
                 }
                 self.last_applied_physical = (self.physical_width, self.physical_height);
             }
         }
 
-        self.drain_commands(event_loop);
         if let Err(err) = self.upload_active_content() {
             self.error = Some(RunError::Renderer(err));
             event_loop.exit();
-            return;
+            return false;
         }
         let draws = self.viewport_draws();
         let draw_chrome = self.has_widget_content;
@@ -1190,33 +1305,30 @@ impl<B: SurfaceBackend> App<B> {
             if let Err(err) = renderer.render_frame(clear_color, draw_chrome, &draws) {
                 self.error = Some(RunError::Renderer(err));
                 event_loop.exit();
-                return;
+                return false;
             }
         }
+        true
+    }
 
-        let floating_ids: Vec<WindowId> = self.floating.keys().copied().collect();
-        for window_id in floating_ids {
-            let Some(floater) = self.floating.get_mut(&window_id) else { continue };
-            if let Err(err) = Self::upload_floating_content(floater) {
-                self.error = Some(RunError::Renderer(err));
-                event_loop.exit();
-                return;
-            }
-            let draws = Self::floating_viewport_draws(floater);
-            let draw_chrome = floater.has_widget_content;
-            if let Err(err) = floater.renderer.render_frame(clear_color, draw_chrome, &draws) {
-                self.error = Some(RunError::Renderer(err));
-                event_loop.exit();
-                return;
-            }
+    /// Render one floating window. Returns `false` (after recording the error and exiting) on
+    /// failure; a floater that's already gone is not a failure.
+    fn render_floater(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId) -> bool {
+        let clear_color = self.clear_color;
+        let Some(floater) = self.floating.get_mut(&window_id) else { return true };
+        if let Err(err) = Self::upload_floating_content(floater) {
+            self.error = Some(RunError::Renderer(err));
+            event_loop.exit();
+            return false;
         }
-
-        if let Some(ghost) = &mut self.tear_ghost {
-            if let Err(err) = ghost.renderer.render_frame(TEAR_GHOST_CLEAR, true, &[]) {
-                self.error = Some(RunError::Renderer(err));
-                event_loop.exit();
-            }
+        let draws = Self::floating_viewport_draws(floater);
+        let draw_chrome = floater.has_widget_content;
+        if let Err(err) = floater.renderer.render_frame(clear_color, draw_chrome, &draws) {
+            self.error = Some(RunError::Renderer(err));
+            event_loop.exit();
+            return false;
         }
+        true
     }
 
     fn schedule_control_flow(&self, event_loop: &ActiveEventLoop) {
@@ -1371,7 +1483,7 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                 }
             },
             WindowEvent::RedrawRequested => {
-                self.render_now(event_loop);
+                self.render_window(event_loop, window_id);
                 self.schedule_control_flow(event_loop);
             }
             _ => {}
@@ -1400,8 +1512,16 @@ impl<B: SurfaceBackend> App<B> {
         event: WindowEvent,
     ) {
         match event {
+            // Alt+F4 etc. Go through the panel's close handler, same as its ×, so Python drops
+            // it from `floating_panels` too — destroying just the OS window here would leave
+            // the panel listed as floating with nothing on screen to get it back. Every floater
+            // has one (`fastgui-py`'s `bind_panel_to_dock_handlers` falls back to the window's
+            // own `_take_floating_panel`), so the `None` case is only a safety net.
             WindowEvent::CloseRequested => {
-                self.remove_floating_by_window(window_id);
+                if let Some(callback) = self.floating_close_callback(window_id) {
+                    let region_id = self.floating[&window_id].region_id;
+                    callback(region_id);
+                }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(floater) = self.floating.get_mut(&window_id) {
@@ -1480,7 +1600,7 @@ impl<B: SurfaceBackend> App<B> {
                 }
             },
             WindowEvent::RedrawRequested => {
-                self.render_now(event_loop);
+                self.render_window(event_loop, window_id);
                 self.schedule_control_flow(event_loop);
             }
             _ => {}

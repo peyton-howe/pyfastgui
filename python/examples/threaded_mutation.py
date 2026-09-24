@@ -30,7 +30,7 @@ def color_cycler(window: fg.Window, thread_index: int, stop: threading.Event) ->
 
 
 def main() -> None:
-    window = fg.Window(title="fast-gui — M1 threaded mutation", width=800, height=600)
+    window = fg.Window(title="fastgui — M1 threaded mutation", width=800, height=600)
     stop = threading.Event()
     threads = [
         threading.Thread(target=color_cycler, args=(window, i, stop), daemon=True)

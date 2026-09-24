@@ -32,6 +32,7 @@ pub fn build_tear_ghost_tree(title: &str) -> WidgetTree {
             text_color: Color([0.92, 0.93, 0.95, 1.0]),
             background: Color([0.22, 0.30, 0.45, 1.0]),
             on_drop: None,
+            on_close: None,
             floating: true,
             container_id: None,
         },

@@ -17,11 +17,14 @@ pub enum Command {
         respond: OneshotSender<Result<CudaExportHandles, String>>,
     },
     MutateWidgetTree(Box<dyn FnOnce(&mut WidgetTree) + Send>),
+    /// Widget setter targeting a floating panel's own tree (ids are not unique across trees).
     MutateFloatingTree {
         region_id: u64,
         mutation: Box<dyn FnOnce(&mut WidgetTree) + Send>,
     },
-    /// `(x, y, width, height)` are **logical** points relative to the main window's inner origin.
+    /// Open `region_id` as a real OS window (not an overlay in the main tree). `build` attaches
+    /// the panel as that window's full content. `(x, y, width, height)` are **logical** points,
+    /// `(x, y)` relative to the main window's inner origin.
     AddFloatingPanel {
         region_id: u64,
         title: String,
@@ -53,6 +56,10 @@ impl EventWaker {
     }
 }
 
+/// Command sender that also wakes the render thread -- used by both backends.
+/// `floating_region` is `Some` for widgets attached inside a floating OS window so later
+/// mutators (`label.set_text`, …) hit that window's tree, not the main one (WidgetIds are
+/// per-tree and would otherwise collide).
 #[derive(Clone)]
 pub struct CommandDispatch {
     pub sender: CommandSender<Command>,

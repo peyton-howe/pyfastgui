@@ -953,5 +953,3 @@ impl fastgui_app::SurfaceBackend for VulkanRenderer {
             .map_err(|e| e.to_string())
     }
 }
-
-

@@ -2,7 +2,7 @@
 another panel's edges (splits that region) or its center (merges the two into a new `Tabs`
 group). Drop onto an existing `Tabs` header/center to add another tab, or drag a tab/panel
 out: a ghost preview follows the mouse; release outside the main window to tear it into a
-floating OS window, or onto a dock target to re-dock. Drop overlays preview dock targets.
+floating OS window, or onto a dock target to re-dock. Click × on a title bar or tab to close.
 """
 
 import fastgui as fg
@@ -16,7 +16,7 @@ def make_panel(title: str, body: str, color: tuple[float, float, float, float]) 
 
 
 def main() -> None:
-    window = fg.Window(title="fast-gui — M6 drag-to-rearrange", width=1000, height=620)
+    window = fg.Window(title="fastgui — M6 drag-to-rearrange", width=1000, height=620)
 
     grey = (0.75, 0.78, 0.82, 1.0)
     panel_a = make_panel("Viewport", "Drag my title bar onto another panel.", grey)

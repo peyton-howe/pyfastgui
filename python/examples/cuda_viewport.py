@@ -56,7 +56,7 @@ def cuda_thread(surface: fg.CudaSurface, stop: threading.Event) -> None:
 
 
 def main() -> None:
-    window = fg.Window(title="fast-gui — M3 CUDA viewport (unverified)", width=WIDTH, height=HEIGHT)
+    window = fg.Window(title="fastgui — M3 CUDA viewport (unverified)", width=WIDTH, height=HEIGHT)
     viewport = fg.Viewport()
     window.set_viewport(viewport)
 

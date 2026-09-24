@@ -1,14 +1,20 @@
-# fast-gui — Status & Roadmap
+# fastgui — Status & Roadmap
 
-Lightweight, GPU-native, no-GIL-safe Python GUI toolkit. This doc is a snapshot for picking
-work back up in a fresh session (or handing to a sub-agent) with no prior conversation
-context. Project root: `c:\sandbox\fast-gui` (Windows, not yet a git repo).
+Lightweight, GPU-native, no-GIL-safe Python GUI toolkit (`import fastgui`; repo `pyfastgui`).
+This doc is a snapshot for picking work back up in a fresh session (or handing to a sub-agent)
+with no prior conversation context. It keeps milestone history and in-progress reasoning;
+`README.md` and `docs/ARCHITECTURE.md` are the stable reference.
+
+**Repo status:** this tree is a git checkout (not the original unversioned Windows sandbox).
+Early sections below still describe the original Windows bring-up machine and paths
+(`c:\sandbox\fast-gui`, dual `.venv`/`env`) as historical context — treat them as "how it was
+built," not as the current clone layout.
 
 Read this whole file before starting M6 — especially **"How this project has been built"**
 near the bottom; the verification discipline described there caught real bugs that
 `cargo check` alone missed, twice.
 
-## Environment (Windows dev machine)
+## Environment (original Windows dev machine)
 
 - Rust via rustup (`stable-x86_64-pc-windows-msvc`). `cargo`/`rustc` are at
   `%USERPROFILE%\.cargo\bin`, not reliably on PATH in fresh shells — prepend it explicitly:
@@ -59,7 +65,6 @@ crates/
     src/readback.rs        Readback<T> (Mutex-cached state for sync getters)
     src/frame.rs            FrameSlot<T> (latest-wins mailbox), CpuFrame, PixelFormat
     src/widget.rs           WidgetTree (taffy-backed), WidgetKind, WidgetId, Color, hit_test
-  fastgui-render/        Renderer trait (backend-agnostic; fastgui-render-vk implements it)
   fastgui-render-vk/     Vulkan backend (Windows + Linux)
     src/renderer.rs         VulkanRenderer: instance/device/swapchain, dynamic rendering
     src/app.rs               winit ApplicationHandler: command draining, input, render loop
@@ -107,8 +112,6 @@ README.md, docs/ARCHITECTURE.md   added in 6C — read these instead of re-deriv
                            the place for milestone history and in-progress reasoning, those
                            are the stable reference
 ```
-
-No `.gitignore` and no git repo yet — worth setting up in M6 (see below).
 
 ## Resolved dependency versions (worth knowing before re-researching)
 
@@ -210,8 +213,8 @@ shader + sampling fragment shader, compiled from an embedded source string, same
 `viewport.vert`/`.frag` use in GLSL), `ViewportTexture` (`MTLTexture` + `replaceRegion` CPU
 upload), and its own `app.rs`/`command.rs`/`error.rs` mirroring the Vulkan backend's shapes
 closely enough that `fastgui-py` picks whichever backend applies via a tiny `cfg`-gated
-`backend` shim module (`crates/fastgui-py/src/backend.rs`) instead of the (largely unused)
-`fastgui_render::Renderer` trait.
+`backend` shim module (`crates/fastgui-py/src/backend.rs`). (A shared `Renderer` trait crate
+was later removed — nothing dispatched through it; the cfg switch is the real boundary.)
 
 **Binding choice: `objc2-metal`/`objc2-quartz-core`, not `metal-rs`.** Both were on the table;
 `objc2-metal` won because it was already resolved in `Cargo.lock` (pulled in transitively by
@@ -862,8 +865,8 @@ modulo the "confirm interactively when convenient" items above.
 **6A follow-up (tabs grow + floating re-dock).** Two of the originally scoped-out gaps are now
 implemented: dropping onto an existing `Tabs` center appends the dragged panel (new tab becomes
 active), and a `Window.add_floating_panel` panel whose window content is a `DockArea` can be
-dropped back onto a docked region or the window's outer edge. Floating-panel *resize*, and
-dragging a docked panel *out* into a new floater, are still out of scope. Headless coverage is
+dropped back onto a docked region or the window's outer edge. (Floating-panel resize and
+dock → float tear-off followed — see below.) Headless coverage is
 in `python/tests/test_dock_area.py`; the live drag gesture has the same "confirm interactively"
 caveat as the rest of 6A.
 
@@ -884,6 +887,9 @@ content (blank `Box`) so a later re-dock still works.
 threshold a mouse-transparent AlwaysOnTop ghost window (title bar + body chrome) follows the
 cursor; the real panel stays docked until release (Qt-style non-opaque / preview undock). Dock
 drop highlights still update on the main window.
+
+**6A follow-up (panel close).** Title-bar and per-tab × buttons close docked or floating panels
+(`DockArea._on_close` / floating take). Empty docks remain valid window content.
 
 **Shared app loop extract.** Dock/float/ghost input + the command queue live in `fastgui-app`
 (`App<B: SurfaceBackend>`). Metal/Vulkan `app.rs` are thin `run()` wrappers (~24 lines) with
@@ -950,13 +956,13 @@ Concrete and fully achievable/verifiable on this machine (at least the Windows l
   correct config for macOS/Linux (e.g. via `maturin-action`).
 - Locally verify: `maturin build --release` (not `develop`) produces an installable wheel that
   works without dev-mode symlinking, for both the abi3 and free-threaded configurations.
-- Add a `.gitignore` (`target/`, `.venv/`, `env/`, `*.pyd`, `__pycache__/`, etc.) — currently
-  missing entirely, and there's no git repo yet either. Whether to `git init` is worth
-  confirming with the user rather than assuming.
+- Confirm `.gitignore` covers `target/`, `.venv/`, `env/`, `*.pyd`/`.so`, `__pycache__/`, etc.
+  (a root `.gitignore` already exists in the git tree — extend it if wheel/build artifacts
+  grow).
 
 ### 6C. Docs — done
 
-- `README.md` at the project root: what fast-gui is and why (GPU-native, free-threaded-safe
+- `README.md` at the project root: what fastgui is and why (GPU-native, free-threaded-safe
   design), a runnable quickstart, install instructions (including the `maturin develop`
   target-venv gotcha from the ungroup follow-up above), an example table (one row per script
   under `python/examples/`, pulled from each script's own docstring rather than re-describing
