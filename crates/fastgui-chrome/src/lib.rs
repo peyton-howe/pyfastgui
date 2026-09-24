@@ -150,18 +150,28 @@ impl ChromeRenderer {
         buffer.set_text(&mut self.font_system, text, &Attrs::new(), Shaping::Advanced);
 
         let text_color = to_cosmic_color(color);
-        let (origin_x, origin_y) = (rect.x, rect.y);
+        // Snapped to whole pixels: glyph runs are blended straight into the buffer below, and
+        // a fractional origin would only smear each glyph pixel across its neighbours.
+        let (origin_x, origin_y) = (rect.x.round() as i32, rect.y.round() as i32);
+        let (pixmap_w, pixmap_h) = (pixmap.width() as i32, pixmap.height() as i32);
+        let data = pixmap.data_mut();
         buffer.draw(&mut self.font_system, &mut self.swash_cache, text_color, |x, y, w, h, color| {
             if color.a() == 0 {
                 return;
             }
-            let mut paint = Paint::default();
-            paint.set_color_rgba8(color.r(), color.g(), color.b(), color.a());
-            paint.anti_alias = true;
-            if let Some(px_rect) =
-                Rect::from_xywh(origin_x + x as f32, origin_y + y as f32, w as f32, h as f32)
-            {
-                pixmap.fill_rect(px_rect, &paint, Transform::identity(), None);
+            // Blended directly rather than through one `Pixmap::fill_rect` per glyph pixel run:
+            // cosmic-text calls this per pixel, and at 2× scale that was ~146k tiny-skia calls
+            // per frame — ~34ms of a ~38ms chrome rasterize (see ROADMAP's chrome perf note).
+            let x0 = (origin_x + x).max(0);
+            let y0 = (origin_y + y).max(0);
+            let x1 = (origin_x + x + w as i32).min(pixmap_w);
+            let y1 = (origin_y + y + h as i32).min(pixmap_h);
+            for py in y0..y1 {
+                let row = (py * pixmap_w) as usize * 4;
+                for px in x0..x1 {
+                    let i = row + px as usize * 4;
+                    blend_premultiplied(&mut data[i..i + 4], color.r(), color.g(), color.b(), color.a());
+                }
             }
         });
     }
@@ -290,6 +300,21 @@ fn fill_rect(pixmap: &mut Pixmap, rect: fastgui_core::widget::Rect, color: Color
     pixmap.fill_rect(sk_rect, &paint, Transform::identity(), None);
 }
 
+/// Source-over blend of one straight-alpha RGBA8 color onto one premultiplied RGBA8 pixel
+/// (tiny-skia's pixel format): `dst = src·a + dst·(1 − a)`.
+fn blend_premultiplied(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
+    if a == 255 {
+        dst.copy_from_slice(&[r, g, b, 255]);
+        return;
+    }
+    let mul = |x: u8, y: u8| ((u16::from(x) * u16::from(y) + 127) / 255) as u8;
+    let inv = 255 - a;
+    dst[0] = mul(r, a) + mul(dst[0], inv);
+    dst[1] = mul(g, a) + mul(dst[1], inv);
+    dst[2] = mul(b, a) + mul(dst[2], inv);
+    dst[3] = a + mul(dst[3], inv);
+}
+
 fn to_tiny_skia_color(color: Color) -> tiny_skia::Color {
     let [r, g, b, a] = color.0;
     tiny_skia::Color::from_rgba(r, g, b, a).unwrap_or(tiny_skia::Color::BLACK)
@@ -298,4 +323,65 @@ fn to_tiny_skia_color(color: Color) -> tiny_skia::Color {
 fn to_cosmic_color(color: Color) -> CosmicColor {
     let [r, g, b, a] = color.0;
     CosmicColor::rgba((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, (a * 255.0) as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The direct blend must draw what the old per-pixel `fill_rect` path did. At a whole-pixel
+    /// origin that path's anti-aliasing covers exactly one pixel per glyph pixel, so the two
+    /// should agree to within rounding.
+    #[test]
+    fn direct_glyph_blend_matches_per_pixel_fill_rect() {
+        let rect = fastgui_core::widget::Rect { x: 3.0, y: 2.0, width: 240.0, height: 30.0 };
+        let (text, font_size, color) = ("Hello, chrome × 123 (glyphs)", 16.0, Color([0.9, 0.8, 0.2, 1.0]));
+        let background = tiny_skia::Color::from_rgba8(25, 28, 33, 255);
+
+        let mut chrome = ChromeRenderer::new();
+        let mut direct = Pixmap::new(260, 40).unwrap();
+        direct.fill(background);
+        chrome.draw_text(&mut direct, rect, text, font_size, color);
+
+        let mut per_pixel = Pixmap::new(260, 40).unwrap();
+        per_pixel.fill(background);
+        let metrics = Metrics::new(font_size, font_size * 1.25);
+        let mut buffer = Buffer::new(&mut chrome.font_system, metrics);
+        buffer.set_size(&mut chrome.font_system, Some(rect.width), Some(rect.height));
+        buffer.set_text(&mut chrome.font_system, text, &Attrs::new(), Shaping::Advanced);
+        buffer.draw(&mut chrome.font_system, &mut chrome.swash_cache, to_cosmic_color(color), |x, y, w, h, c| {
+            if c.a() == 0 {
+                return;
+            }
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(c.r(), c.g(), c.b(), c.a());
+            paint.anti_alias = true;
+            if let Some(r) = Rect::from_xywh(rect.x + x as f32, rect.y + y as f32, w as f32, h as f32) {
+                per_pixel.fill_rect(r, &paint, Transform::identity(), None);
+            }
+        });
+
+        let drawn = direct.pixels().iter().filter(|p| (p.red(), p.green(), p.blue()) != (25, 28, 33)).count();
+        assert!(drawn > 200, "expected visible text, only {drawn} pixels changed");
+        let max_diff = direct
+            .data()
+            .iter()
+            .zip(per_pixel.data())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        assert!(max_diff <= 2, "direct blend differs from per-pixel fill_rect by up to {max_diff}");
+    }
+
+    #[test]
+    fn blend_premultiplied_endpoints() {
+        let mut px = [10, 20, 30, 255];
+        blend_premultiplied(&mut px, 200, 100, 50, 0);
+        assert_eq!(px, [10, 20, 30, 255], "zero alpha leaves the pixel alone");
+        blend_premultiplied(&mut px, 200, 100, 50, 255);
+        assert_eq!(px, [200, 100, 50, 255], "full alpha replaces it");
+        let mut px = [0, 0, 0, 255];
+        blend_premultiplied(&mut px, 255, 255, 255, 128);
+        assert_eq!(px, [128, 128, 128, 255], "half coverage of white over black");
+    }
 }
