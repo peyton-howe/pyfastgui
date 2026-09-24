@@ -395,7 +395,7 @@ impl Window {
             .as_ref()
             .map(|c| c.clone_ref(self_.py()))
         {
-            bind_panel_to_dock_rearrange(&panel_ref, content.bind(self_.py()));
+            bind_panel_to_dock_handlers(&panel_ref, content.bind(self_.py()));
         }
         let mut described = panel_ref.borrow().describe_window_content()?;
         described.force_fill();
@@ -487,12 +487,16 @@ impl Window {
     }
 }
 
-/// If `content` is a `DockArea` (exposes `_on_rearrange`), bind that handler onto `panel` so
-/// dragging the floating title bar can re-dock. Silently no-ops for any other content widget.
-fn bind_panel_to_dock_rearrange(panel: &Bound<'_, widgets::Panel>, content: &Bound<'_, PyAny>) {
+/// If `content` is a `DockArea`, bind rearrange + close handlers onto `panel`.
+fn bind_panel_to_dock_handlers(panel: &Bound<'_, widgets::Panel>, content: &Bound<'_, PyAny>) {
     if let Ok(handler) = content.getattr("_on_rearrange") {
         if handler.is_callable() {
             panel.borrow().set_rearrange_handler(handler.unbind());
+        }
+    }
+    if let Ok(handler) = content.getattr("_on_close") {
+        if handler.is_callable() {
+            panel.borrow().set_close_handler(handler.unbind());
         }
     }
 }
@@ -506,7 +510,7 @@ fn bind_floating_panels_to_content(window: &Bound<'_, Window>, content: &Bound<'
     };
     for panel in panels {
         if let Ok(bound) = panel.bind(py).cast::<widgets::Panel>() {
-            bind_panel_to_dock_rearrange(&bound, content);
+            bind_panel_to_dock_handlers(&bound, content);
         }
     }
 }

@@ -885,6 +885,9 @@ threshold a mouse-transparent AlwaysOnTop ghost window (title bar + body chrome)
 cursor; the real panel stays docked until release (Qt-style non-opaque / preview undock). Dock
 drop highlights still update on the main window.
 
+**6A follow-up (panel close).** Title-bar and per-tab × buttons close docked or floating panels
+(`DockArea._on_close` / floating take). Empty docks remain valid window content.
+
 ### 6A. Docking/panel system (full scope)
 
 Build bottom-up; each step is independently useful and testable, so verify as you go rather

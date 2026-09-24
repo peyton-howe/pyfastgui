@@ -30,7 +30,8 @@ class DockArea:
     (including outside the main window), drag an edge/corner to resize, and if the main window's
     content is a `DockArea`, drop it onto a dock region (or the window's outer edge) to re-dock.
     Tear a docked panel (or tab) *out* by dragging it: a ghost preview follows the mouse; release
-    outside the main window to float, or onto a dock target to re-dock.
+    outside the main window to float, or onto a dock target to re-dock. Click the × on a title
+    bar or tab segment to close that panel (floating or docked).
 
     >>> dock = DockArea()
     >>> dock.add_panel(Panel(title="Viewport", content=viewport_widget), region="center")
@@ -47,10 +48,12 @@ class DockArea:
             raise ValueError(f"region must be one of {_REGIONS}, got {region!r}")
         if isinstance(panel, Panel):
             panel.set_rearrange_handler(self._on_rearrange)
+            panel.set_close_handler(self._on_close)
         elif isinstance(panel, Tabs):
             for member in panel.panels:
                 if isinstance(member, Panel):
                     member.set_rearrange_handler(self._on_rearrange)
+                    member.set_close_handler(self._on_close)
         leaf = {"kind": "leaf", "widget": panel}
 
         if self._root is None:
@@ -166,6 +169,22 @@ class DockArea:
             getattr(self, "_fastgui_window")._take_floating_panel(dragged_id)
         self._root = new_root
         window = getattr(self, "_fastgui_window", None)
+        if window is not None:
+            window.set_content(self)
+
+    def _on_close(self, panel_id: int) -> None:
+        """Close a docked or floating panel (title-bar / tab ×). Floating panels are removed from
+        the window; docked panels are extracted from the tree (empty dock stays as content)."""
+        window = getattr(self, "_fastgui_window", None)
+        if window is not None and window._peek_floating_panel(panel_id) is not None:
+            window._take_floating_panel(panel_id)
+            return
+        if self._root is None:
+            return
+        remainder, extracted = _extract(self._root, panel_id)
+        if extracted is None:
+            return
+        self._root = remainder
         if window is not None:
             window.set_content(self)
 

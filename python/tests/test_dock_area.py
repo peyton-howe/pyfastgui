@@ -179,6 +179,38 @@ class DockAreaTreeTests(unittest.TestCase):
         self.assertEqual(dock._root["widget"].id, a.id)
         self.assertIsNotNone(window._peek_floating_panel(b.id))
 
+    def test_close_docked_panel(self):
+        a, b = _panel("A"), _panel("B")
+        dock = DockArea()
+        dock.add_panel(a, region="center")
+        dock.add_panel(b, region="right", size=0.3)
+        window = Window()
+        window.set_content(dock)
+        dock._on_close(b.id)
+        self.assertEqual(dock._root["kind"], "leaf")
+        self.assertEqual(dock._root["widget"].id, a.id)
+
+    def test_close_floating_panel(self):
+        a, b = _panel("A"), _panel("B")
+        dock = DockArea()
+        dock.add_panel(a, region="center")
+        window = Window()
+        window.set_content(dock)
+        window.add_floating_panel(b, 10.0, 10.0, 200.0, 100.0)
+        dock._on_close(b.id)
+        self.assertIsNone(window._peek_floating_panel(b.id))
+        self.assertEqual(dock._root["widget"].id, a.id)
+
+    def test_close_last_docked_leaves_empty(self):
+        a = _panel("A")
+        dock = DockArea()
+        dock.add_panel(a, region="center")
+        window = Window()
+        window.set_content(dock)
+        dock._on_close(a.id)
+        self.assertIsNone(dock._root)
+        self.assertIsNotNone(dock._fastgui_widget)
+
     def test_undock_to_floating(self):
         a, b = _panel("A"), _panel("B")
         dock = DockArea()

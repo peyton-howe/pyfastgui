@@ -138,8 +138,8 @@ class DockArea:
     """A split-tree of titled `Panel`s (or `Tabs` groups), built one `add_panel` call at a
     time, with drag-to-rearrange: drag a `Panel`'s title bar (or a tab's own header segment)
     onto another region to move it, onto an existing `Tabs` center to add a tab, or outside
-    the main window to tear it out into a floating OS window. Floating panels can be dropped
-    back into this dock."""
+    the main window to tear it out into a floating OS window. Click × on a title bar or tab
+    to close. Floating panels can be dropped back into this dock."""
 
     def __init__(self) -> None: ...
     def add_panel(self, panel: Panel | Tabs, region: str = "center", size: float = 0.25) -> None: ...

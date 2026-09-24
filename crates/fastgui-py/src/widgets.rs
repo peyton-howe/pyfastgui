@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use fastgui_core::taffy::prelude::*;
 use fastgui_core::taffy::style::LengthPercentage;
 use fastgui_core::widget::{
-    ChangeCallback, ClickCallback, Color, PanelDropCallback, SplitDirection, TabSelectCallback, WidgetId, WidgetKind,
-    WidgetTree,
+    ChangeCallback, ClickCallback, Color, PanelCloseCallback, PanelDropCallback, SplitDirection, TabSelectCallback,
+    WidgetId, WidgetKind, WidgetTree,
 };
 use crate::backend::{Command, CommandDispatch};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -18,6 +18,7 @@ type SenderCell = Arc<Mutex<Option<CommandDispatch>>>;
 /// `DockArea` claims it (`Panel::set_rearrange_handler`), so a standalone `Panel` not inside a
 /// `DockArea` just has a no-op drag (see `WidgetKind::PanelTitleBar`'s doc comment).
 type RearrangeHandlerCell = Arc<Mutex<Option<Py<PyAny>>>>;
+type CloseHandlerCell = Arc<Mutex<Option<Py<PyAny>>>>;
 
 /// Every `Panel`/`Tabs` gets a globally unique region id at construction time — the identity
 /// `WidgetKind::Container { region_id, .. }` and `WidgetKind::PanelTitleBar { panel_id, .. }`
@@ -89,6 +90,16 @@ fn wrap_panel_drop_callback(callback: Py<PyAny>) -> PanelDropCallback {
                 callback.call1(py, (dragged_region_id, target_region_id, zone_s))
             };
             if let Err(err) = result {
+                err.print(py);
+            }
+        });
+    })
+}
+
+fn wrap_panel_close_callback(callback: Py<PyAny>) -> PanelCloseCallback {
+    Arc::new(move |panel_id: u64| {
+        Python::attach(|py| {
+            if let Err(err) = callback.call1(py, (panel_id,)) {
                 err.print(py);
             }
         });
@@ -214,6 +225,7 @@ struct TabBarSpec {
     on_select: Option<TabSelectCallback>,
     panel_ids: Vec<u64>,
     on_drop: Vec<Option<PanelDropCallback>>,
+    on_close: Vec<Option<PanelCloseCallback>>,
 }
 
 pub(crate) fn described_viewport(viewport_id: u64, frames: fastgui_core::FrameSlot<fastgui_core::CpuFrame>) -> DescribedWidget {
@@ -404,6 +416,7 @@ pub(crate) fn attach(
             on_select: bar_spec.on_select,
             panel_ids: bar_spec.panel_ids,
             on_drop: bar_spec.on_drop,
+            on_close: bar_spec.on_close,
         };
         let bar_id = tree.new_node(bar_style.to_style(), bar_kind);
         tree.add_child(id, bar_id);
@@ -847,6 +860,7 @@ pub(crate) struct Panel {
     /// `attach`; `region_id` is assigned once, at construction, and stays stable across rebuilds).
     region_id: u64,
     rearrange_handler: RearrangeHandlerCell,
+    close_handler: CloseHandlerCell,
     /// Set by `Window.add_floating_panel` — makes `describe()` build this panel's title bar
     /// with `floating: true` (moves-on-drag instead of the rearrange/drop-zone machinery). A
     /// plain `AtomicBool`, not GIL-gated, since it's a single flag no Python callback ever
@@ -888,6 +902,7 @@ impl Panel {
             sender: Arc::new(Mutex::new(None)),
             region_id: next_region_id(),
             rearrange_handler: Arc::new(Mutex::new(None)),
+            close_handler: Arc::new(Mutex::new(None)),
             floating: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             title,
             content,
@@ -912,6 +927,10 @@ impl Panel {
     pub(crate) fn set_rearrange_handler(&self, handler: Py<PyAny>) {
         *self.rearrange_handler.lock().unwrap_or_else(|p| p.into_inner()) = Some(handler);
     }
+
+    pub(crate) fn set_close_handler(&self, handler: Py<PyAny>) {
+        *self.close_handler.lock().unwrap_or_else(|p| p.into_inner()) = Some(handler);
+    }
 }
 
 impl Panel {
@@ -933,6 +952,14 @@ impl Panel {
     pub(crate) fn drag_identity(&self, py: Python<'_>) -> (u64, Option<Py<PyAny>>) {
         let handler = self.rearrange_handler.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|cb| cb.clone_ref(py));
         (self.region_id, handler)
+    }
+
+    pub(crate) fn close_handler(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.close_handler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|cb| cb.clone_ref(py))
     }
 
     /// Called once by `Window.add_floating_panel` (`fastgui-py::lib`), before its first
@@ -974,6 +1001,12 @@ impl Panel {
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .map(|cb| Python::attach(|py| cb.clone_ref(py)));
+        let on_close = self
+            .close_handler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|cb| Python::attach(|py| cb.clone_ref(py)));
 
         let title_bar = DescribedWidget {
             style: StyleParams { direction: FlexDirection::Row, gap: 0.0, padding: 0.0, flex_grow: 0.0, width: None, height: Some(self.title_height), fill: false, align_items: None, absolute: None },
@@ -984,6 +1017,7 @@ impl Panel {
                 text_color: rgba(self.title_color),
                 background: rgba(self.title_background),
                 on_drop: on_drop.map(wrap_panel_drop_callback),
+                on_close: on_close.map(wrap_panel_close_callback),
                 floating: self.floating.load(Ordering::Relaxed),
                 // Backfilled to this title bar's actual parent by `attach`'s generic
                 // child-attaching branch — not known yet at describe-time.
@@ -1101,15 +1135,17 @@ impl Tabs {
 
 impl Tabs {
     fn describe(&self) -> PyResult<DescribedWidget> {
-        let (titles, panel_ids, on_drop, mut contents) = Python::attach(|py| -> PyResult<(
+        let (titles, panel_ids, on_drop, on_close, mut contents) = Python::attach(|py| -> PyResult<(
             Vec<String>,
             Vec<u64>,
             Vec<Option<PanelDropCallback>>,
+            Vec<Option<PanelCloseCallback>>,
             Vec<DescribedWidget>,
         )> {
             let mut titles = Vec::new();
             let mut panel_ids = Vec::new();
             let mut on_drop = Vec::new();
+            let mut on_close = Vec::new();
             let mut contents = Vec::new();
             for item in self.panels.bind(py).iter() {
                 let panel = item
@@ -1121,9 +1157,10 @@ impl Tabs {
                 titles.push(title);
                 panel_ids.push(region_id);
                 on_drop.push(handler.map(wrap_panel_drop_callback));
+                on_close.push(panel.close_handler(py).map(wrap_panel_close_callback));
                 contents.push(describe(content.bind(py))?);
             }
-            Ok((titles, panel_ids, on_drop, contents))
+            Ok((titles, panel_ids, on_drop, on_close, contents))
         })?;
         if titles.is_empty() {
             return Err(PyValueError::new_err("Tabs(...) needs at least one panel"));
@@ -1164,6 +1201,7 @@ impl Tabs {
                 on_select: on_select.map(wrap_callback_usize),
                 panel_ids,
                 on_drop,
+                on_close,
             }),
         })
     }

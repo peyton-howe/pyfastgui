@@ -30,6 +30,11 @@ pub type TabSelectCallback = Arc<dyn Fn(usize) + Send + Sync>;
 /// `Float` (tear a docked panel out into an OS window); `None` for ordinary dock rearrange.
 pub type PanelDropCallback =
     Arc<dyn Fn(u64, u64, DropZone, Option<(f32, f32, f32, f32)>) + Send + Sync>;
+/// Fired when the user clicks a panel/tab close control — argument is that panel's region id.
+pub type PanelCloseCallback = Arc<dyn Fn(u64) + Send + Sync>;
+
+/// Width/height of the × hit target in a title bar or tab segment (layout units).
+pub const CLOSE_BUTTON_SIZE: f32 = 22.0;
 
 /// Which axis a `Splitter` divides its two panes along — matches the parent `Box`'s own
 /// `flex_direction` (a `Splitter` is itself a row/column container; see
@@ -133,14 +138,9 @@ pub enum WidgetKind {
     /// content-wrapper nodes (same parent `Box`, one per tab, in title order); clicking a header
     /// segment sets `active` and flips the clicked wrapper's style to `Display::Flex` and every
     /// other wrapper's to `Display::None` — see `fastgui-render-vk::app`'s tab click handling.
-    /// `panel_ids`/`on_drop` (parallel to `titles`, one entry per tab) let a tab be dragged back
-    /// *out* of the group — the ungroup counterpart to dropping a `Panel` onto another's center
-    /// to merge them. Each tab's `panel_id` is its member `Panel`'s own stable region id (set
-    /// once, at `add_panel` time — unaffected by ever being merged into a `Tabs`), and `on_drop`
-    /// is that same `Panel`'s `rearrange_handler`, so dragging a tab out and dropping it reports
-    /// through the exact same `DockArea._on_rearrange` path a plain panel drag does (see
-    /// `fastgui-render-vk::app`'s `handle_panel_drop`, which reads whichever of `PanelTitleBar`'s
-    /// or this bar's callback applies to the id being dragged).
+    /// `panel_ids`/`on_drop`/`on_close` (parallel to `titles`, one entry per tab) let a tab be
+    /// dragged out or closed. Each tab's `panel_id` is its member `Panel`'s region id; `on_drop`
+    /// / `on_close` come from that panel's rearrange/close handlers.
     TabBar {
         titles: Vec<String>,
         active: usize,
@@ -152,6 +152,7 @@ pub enum WidgetKind {
         on_select: Option<TabSelectCallback>,
         panel_ids: Vec<u64>,
         on_drop: Vec<Option<PanelDropCallback>>,
+        on_close: Vec<Option<PanelCloseCallback>>,
     },
     /// A `Panel`'s title bar, self-contained like `TabBar` (own background+text, no child
     /// `Label`). `panel_id` matches its `Panel`'s outer `Container { region_id, .. }`, giving it
@@ -174,6 +175,8 @@ pub enum WidgetKind {
         text_color: Color,
         background: Color,
         on_drop: Option<PanelDropCallback>,
+        /// Click the title-bar × to close; `None` for panels that aren't closeable.
+        on_close: Option<PanelCloseCallback>,
         floating: bool,
         container_id: Option<WidgetId>,
     },
@@ -199,6 +202,17 @@ pub struct Rect {
 impl Rect {
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+    }
+}
+
+/// Close-button hit/draw rect on the right of a title bar or tab segment.
+pub fn close_button_rect(bar: Rect) -> Rect {
+    let size = CLOSE_BUTTON_SIZE.min(bar.height).min(bar.width.max(0.0) * 0.5);
+    Rect {
+        x: bar.x + bar.width - size,
+        y: bar.y + (bar.height - size) * 0.5,
+        width: size,
+        height: size,
     }
 }
 

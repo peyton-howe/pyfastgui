@@ -520,11 +520,30 @@ impl App {
             WidgetKind::Splitter { .. } => {
                 self.dragging_splitter = Some(id);
             }
-            WidgetKind::TabBar { panel_ids, content_ids, titles, .. } => {
+            WidgetKind::TabBar { panel_ids, content_ids, titles, on_close, .. } => {
                 // Selecting and drag-starting both fire on press (matches `PanelTitleBar`, which
                 // has no separate click-vs-drag threshold either — see `handle_panel_drop`'s doc
                 // comment: a "click" is just a drag that never lands on a valid drop target).
                 if let Some(index) = self.tab_bar_clicked_index(id) {
+                    if let Some(rect) = self.widget_tree.absolute_rect(id) {
+                        let n = titles.len().max(1) as f32;
+                        let segment = fastgui_core::widget::Rect {
+                            x: rect.x + index as f32 * (rect.width / n),
+                            y: rect.y,
+                            width: rect.width / n,
+                            height: rect.height,
+                        };
+                        if on_close.get(index).is_some_and(|c| c.is_some())
+                            && fastgui_core::widget::close_button_rect(segment).contains(self.cursor.0, self.cursor.1)
+                        {
+                            if let Some(callback) = on_close[index].clone() {
+                                if let Some(&panel_id) = panel_ids.get(index) {
+                                    callback(panel_id);
+                                }
+                            }
+                            return;
+                        }
+                    }
                     if let Some(&panel_id) = panel_ids.get(index) {
                         let content_ids = content_ids.clone();
                         let title = titles.get(index).cloned().unwrap_or_default();
@@ -539,7 +558,17 @@ impl App {
             }
             // Floating panels are real OS windows now — title-bar drag for those is handled on
             // the floater's own `window_event` path, not via `set_position` overlays here.
-            WidgetKind::PanelTitleBar { panel_id, floating, title, .. } => {
+            WidgetKind::PanelTitleBar { panel_id, floating, title, on_close, .. } => {
+                if let Some(rect) = self.widget_tree.absolute_rect(id) {
+                    if on_close.is_some()
+                        && fastgui_core::widget::close_button_rect(rect).contains(self.cursor.0, self.cursor.1)
+                    {
+                        if let Some(callback) = on_close.clone() {
+                            callback(*panel_id);
+                        }
+                        return;
+                    }
+                }
                 if !*floating {
                     let panel_id = *panel_id;
                     let title = title.clone();
@@ -593,10 +622,50 @@ impl App {
                     floater.dragging_splitter = Some(id);
                 }
             }
-            WidgetKind::TabBar { .. } => {
+            WidgetKind::TabBar { panel_ids, titles, on_close, .. } => {
+                if let Some(index) = Self::floating_tab_bar_clicked_index(
+                    self.floating.get(&window_id).expect("floater"),
+                    id,
+                ) {
+                    if let Some(floater) = self.floating.get(&window_id) {
+                        if let Some(rect) = floater.widget_tree.absolute_rect(id) {
+                            let n = titles.len().max(1) as f32;
+                            let segment = fastgui_core::widget::Rect {
+                                x: rect.x + index as f32 * (rect.width / n),
+                                y: rect.y,
+                                width: rect.width / n,
+                                height: rect.height,
+                            };
+                            if on_close.get(index).is_some_and(|c| c.is_some())
+                                && fastgui_core::widget::close_button_rect(segment)
+                                    .contains(floater.cursor.0, floater.cursor.1)
+                            {
+                                if let Some(callback) = on_close[index].clone() {
+                                    if let Some(&panel_id) = panel_ids.get(index) {
+                                        callback(panel_id);
+                                    }
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
                 self.handle_floating_tab_click(window_id, id);
             }
-            WidgetKind::PanelTitleBar { panel_id, floating, on_drop, .. } => {
+            WidgetKind::PanelTitleBar { panel_id, floating, on_drop, on_close, .. } => {
+                if let Some(floater) = self.floating.get(&window_id) {
+                    if let Some(rect) = floater.widget_tree.absolute_rect(id) {
+                        if on_close.is_some()
+                            && fastgui_core::widget::close_button_rect(rect)
+                                .contains(floater.cursor.0, floater.cursor.1)
+                        {
+                            if let Some(callback) = on_close.clone() {
+                                callback(*panel_id);
+                            }
+                            return;
+                        }
+                    }
+                }
                 let panel_id = *panel_id;
                 let floating = *floating;
                 let can_redock = on_drop.is_some();
@@ -810,6 +879,7 @@ impl App {
                 text_color: Color([0.92, 0.93, 0.95, 1.0]),
                 background: Color([0.22, 0.30, 0.45, 1.0]),
                 on_drop: None,
+                on_close: None,
                 floating: true,
                 container_id: None,
             },
