@@ -24,15 +24,3 @@ pub const TEAR_GHOST_CLEAR: [f32; 4] = [0.16, 0.20, 0.28, 1.0];
 
 /// Vulkan main-window swapchain recreate debounce (Metal uses immediate resize).
 pub const RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
-
-/// Title-bar hover/drag cursors. winit maps `Grab`/`Grabbing` to the 4-arrow move cursor on
-/// Windows (it has no hand cursor), which looks wrong for a title bar — native title bars and
-/// dock panels there keep the plain arrow while dragging.
-#[cfg(target_os = "windows")]
-pub const GRAB_CURSOR: winit::window::CursorIcon = winit::window::CursorIcon::Default;
-#[cfg(target_os = "windows")]
-pub const GRABBING_CURSOR: winit::window::CursorIcon = winit::window::CursorIcon::Default;
-#[cfg(not(target_os = "windows"))]
-pub const GRAB_CURSOR: winit::window::CursorIcon = winit::window::CursorIcon::Grab;
-#[cfg(not(target_os = "windows"))]
-pub const GRABBING_CURSOR: winit::window::CursorIcon = winit::window::CursorIcon::Grabbing;

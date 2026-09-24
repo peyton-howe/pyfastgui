@@ -1197,8 +1197,10 @@ impl<B: SurfaceBackend> App<B> {
 
     fn update_cursor_icon(&mut self) {
         let Some(window) = &self.window else { return };
+        // Title bars keep the plain arrow, hovered or dragged, like native title bars on every
+        // platform. Returning early keeps a panel drag from flickering to a splitter cursor.
         if self.dragging_panel_title.is_some() || self.dragging_floating_panel.is_some() {
-            window.set_cursor(GRABBING_CURSOR);
+            window.set_cursor(winit::window::CursorIcon::Default);
             return;
         }
         let hovered = self
@@ -1209,9 +1211,6 @@ impl<B: SurfaceBackend> App<B> {
                 fastgui_core::widget::SplitDirection::Row => winit::window::CursorIcon::ColResize,
                 fastgui_core::widget::SplitDirection::Column => winit::window::CursorIcon::RowResize,
             }),
-            Some(WidgetKind::PanelTitleBar { on_drop, floating, .. }) if on_drop.is_some() || *floating => {
-                Some(GRAB_CURSOR)
-            }
             _ => None,
         };
         window.set_cursor(icon.unwrap_or(winit::window::CursorIcon::Default));
@@ -1231,7 +1230,7 @@ impl<B: SurfaceBackend> App<B> {
             return;
         }
         if dragging {
-            floater.window.set_cursor(GRABBING_CURSOR);
+            floater.window.set_cursor(winit::window::CursorIcon::Default);
             return;
         }
         if let Some(edge) = Self::floating_resize_edge_at_cursor(floater) {
@@ -1246,9 +1245,6 @@ impl<B: SurfaceBackend> App<B> {
                 fastgui_core::widget::SplitDirection::Row => winit::window::CursorIcon::ColResize,
                 fastgui_core::widget::SplitDirection::Column => winit::window::CursorIcon::RowResize,
             }),
-            Some(WidgetKind::PanelTitleBar { on_drop, floating, .. }) if on_drop.is_some() || *floating => {
-                Some(GRAB_CURSOR)
-            }
             _ => None,
         };
         floater
