@@ -279,3 +279,40 @@ fn widget_rect_to_mtl(
         MTLScissorRect { x: x as usize, y: y as usize, width: w as usize, height: h as usize },
     ))
 }
+
+impl fastgui_app::SurfaceBackend for MetalRenderer {
+    type Error = Error;
+
+    fn new(
+        window: &winit::window::Window,
+        physical_width: u32,
+        physical_height: u32,
+    ) -> Result<Self, Self::Error> {
+        MetalRenderer::new(window, physical_width, physical_height)
+    }
+
+    fn resize(&mut self, physical_width: u32, physical_height: u32) -> Result<(), Self::Error> {
+        MetalRenderer::resize(self, physical_width, physical_height)
+    }
+
+    fn set_chrome_frame(&mut self, frame: CpuFrame) -> Result<(), Self::Error> {
+        MetalRenderer::set_chrome_frame(self, frame)
+    }
+
+    fn set_layer_frame(&mut self, viewport_id: u64, frame: CpuFrame) -> Result<(), Self::Error> {
+        MetalRenderer::set_layer_frame(self, viewport_id, frame)
+    }
+
+    fn retain_layers(&mut self, live_ids: &[u64]) {
+        MetalRenderer::retain_layers(self, live_ids)
+    }
+
+    fn render_frame(
+        &mut self,
+        clear: [f32; 4],
+        draw_chrome: bool,
+        draws: &[(u64, Rect)],
+    ) -> Result<(), Self::Error> {
+        MetalRenderer::render_frame(self, clear, draw_chrome, draws)
+    }
+}

@@ -425,7 +425,7 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            // Same deferred-resize strategy as `fastgui-render-vk::app`'s current `Resized`
+            // Same deferred-resize strategy as `fastgui-app`'s `MainResizePolicy::Debounced` `Resized`
             // handler: bookkeeping only, the actual recreation happens lazily inside the
             // self-perpetuating `RedrawRequested` loop below.
             WindowEvent::Resized(size) => {

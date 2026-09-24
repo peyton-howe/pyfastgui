@@ -130,11 +130,12 @@ its default is there.
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the crate layout and threading model in
 more depth. Short version: `fastgui-core` owns the cross-thread primitives (a command queue for
 fire-and-forget mutations, a latest-wins mailbox for frame data, a retained-mode widget tree
-over `taffy`) and is renderer-agnostic; `fastgui-render-vk` (Windows/Linux) and
-`fastgui-render-mtl` (macOS) own the window and event loop; `fastgui-chrome` rasterizes widget
-chrome into a texture the active backend uploads and displays like any other frame; `fastgui-py`
-is the PyO3 layer and picks the backend with `cfg(target_os = "macos")` (there is no shared
-`Renderer` trait dispatch — the cfg switch is the backend boundary).
+over `taffy`); `fastgui-app` owns the shared winit loop (dock/float/ghost input, multi-window
+lifecycle, command drain), generic over a `SurfaceBackend`; `fastgui-render-vk` (Windows/Linux)
+and `fastgui-render-mtl` (macOS) implement `SurfaceBackend` and provide thin `run()` wrappers;
+`fastgui-chrome` rasterizes widget chrome into a texture the active backend uploads and displays
+like any other frame; `fastgui-py` is the PyO3 layer and picks the backend with
+`cfg(target_os = "macos")`.
 
 ## Known limitations
 

@@ -5,6 +5,8 @@ use ash::{khr, vk, Device};
 
 use crate::error::VkRendererError as Error;
 
+pub use fastgui_app::CudaExportHandles;
+
 /// A GPU-resident RGBA8 image whose backing memory is exported (via a Windows NT handle) for
 /// import into CUDA, plus a timeline semaphore exported the same way so the render thread can
 /// wait for a CUDA kernel's writes to finish before sampling it — no CPU copy, no shared
@@ -25,21 +27,6 @@ pub struct CudaSharedTexture {
     pub semaphore: vk::Semaphore,
     pub current_layout: vk::ImageLayout,
     pub last_waited_value: u64,
-    pub target_value: Arc<AtomicU64>,
-}
-
-/// Everything `fastgui-interop-cuda` needs to import the Vulkan side of a `CudaSharedTexture`.
-/// Deliberately just raw handles/integers plus one plain `std` type — this crate has no CUDA
-/// dependency, and `fastgui-interop-cuda` has no Vulkan dependency; they only share these.
-pub struct CudaExportHandles {
-    pub memory_win32_handle: isize,
-    pub memory_size: u64,
-    pub semaphore_win32_handle: isize,
-    pub row_pitch: u64,
-    pub width: u32,
-    pub height: u32,
-    /// The render thread polls this every frame to know the highest timeline value a CUDA
-    /// producer has signalled; `CudaSurface.signal_ready()` (fastgui-py) is what bumps it.
     pub target_value: Arc<AtomicU64>,
 }
 

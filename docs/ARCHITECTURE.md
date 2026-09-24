@@ -17,34 +17,32 @@ crates/
     src/widget.rs             WidgetTree (wraps taffy::TaffyTree), WidgetKind (including
                               Viewport), WidgetId, Color, hit_test / find_region_at, DropZone
 
-  fastgui-render-vk/      The Vulkan backend (Windows + Linux). Owns the actual OS window and
-                          event loop — this is the crate with a `fn main`-shaped entry point,
-                          conceptually, even though it's a library. Selected by `fastgui-py`
-                          via `cfg(not(target_os = "macos"))` — there is no shared Renderer
-                          trait; the cfg dependency switch is the backend boundary.
-    src/renderer.rs          VulkanRenderer: instance/device/swapchain setup, dynamic rendering
-                              (VK_KHR_dynamic_rendering — no render pass/framebuffer objects)
-    src/app.rs                winit ApplicationHandler: drains the command queue, handles
-                              input (hit-testing, drag state machines), drives the render loop
-    src/command.rs            Command enum: SetClearColor, SetViewport, CreateCudaSurface,
-                              MutateWidgetTree(Box<dyn FnOnce(&mut WidgetTree) + Send>)
+  fastgui-app/            Shared winit ApplicationHandler: command queue, dock/float/ghost
+                          input, chrome dirty checks, multi-window lifecycle. Layout/hit-test
+                          are always logical points; backends convert to physical at the GPU
+                          boundary. Backends implement SurfaceBackend and call run().
+    src/app.rs                App<B: SurfaceBackend>, ApplicationHandler, floaters, tear ghost
+    src/command.rs            Command, EventWaker, CommandDispatch, RenderThreadHandles
+    src/surface.rs            SurfaceBackend trait + MainResizePolicy (Immediate vs Debounced)
+
+  fastgui-render-vk/      The Vulkan GPU backend (Windows + Linux). Thin `run()` wrapper with
+                          Debounced main-window resize + CUDA surface create. Selected by
+                          `fastgui-py` via `cfg(not(target_os = "macos"))`.
+    src/renderer.rs          VulkanRenderer (+ SurfaceBackend impl): instance/device/swapchain
+                              setup, dynamic rendering (VK_KHR_dynamic_rendering — no render
+                              pass/framebuffer objects)
+    src/app.rs                run() → fastgui_app::run::<VulkanRenderer>(…, Debounced)
     src/pipeline.rs           ViewportPipeline: fullscreen-triangle shaders + descriptor set
     src/texture.rs            ViewportTexture: host-visible LINEAR CPU-upload texture
     src/cuda_texture.rs       CudaSharedTexture: exportable image + timeline semaphore (CUDA
-                              interop, see below)
+                              interop, see below); re-exports CudaExportHandles from fastgui-app
     shaders/                  viewport.vert/.frag source + precompiled .spv (checked in, so a
                               plain build doesn't need the Vulkan SDK)
 
-  fastgui-render-mtl/     The Metal backend (macOS). Same role as fastgui-render-vk: owns the
-                          OS window and event loop. Selected automatically by fastgui-py on
-                          macOS. No CUDA interop path — Viewport.create_cuda_surface raises
-                          on this platform; CPU submit_frame is unchanged.
-    src/renderer.rs          MetalRenderer: system MTLDevice, CAMetalLayer on winit's NSView,
-                              chrome + per-Viewport MTLTexture upload via replaceRegion
-    src/app.rs                winit ApplicationHandler mirroring fastgui-render-vk::app
-                              (widget/drag/dock logic, layout in points, chrome at backing
-                              scale)
-    src/command.rs            Command enum: SetClearColor, MutateWidgetTree (no CreateCudaSurface)
+  fastgui-render-mtl/     The Metal GPU backend (macOS). Thin `run()` wrapper with Immediate
+                          resize. No CUDA — Viewport.create_cuda_surface raises in Python.
+    src/renderer.rs          MetalRenderer (+ SurfaceBackend impl): CAMetalLayer, replaceRegion
+    src/app.rs                run() → fastgui_app::run::<MetalRenderer>(…, Immediate)
     src/pipeline.rs           ViewportPipeline: MSL fullscreen-triangle + sampler
     src/texture.rs            ViewportTexture: StorageModeShared MTLTexture + replaceRegion
 
@@ -135,8 +133,7 @@ composing child `Label`/`Container` nodes. This sidesteps a real bug class hit e
 docking work: `align-items: stretch` combined with taffy's intrinsic text measurement squeezed
 and clipped title/tab text when it was built from composed children instead.
 
-Mouse input is dispatched by each backend's `app` (`fastgui-render-vk` or
-`fastgui-render-mtl`): hit-testing walks the tree for the
+Mouse input is dispatched by `fastgui-app` (shared by both backends): hit-testing walks the tree for the
 topmost widget under the cursor (`hit_test`) for normal clicks, or the topmost *drop region*
 (`find_region_at`, which only considers `Container` nodes carrying a `region_id` — dock regions
 never overlap, unlike arbitrary widgets, so this is a cheaper and more specific query) while a
@@ -178,9 +175,8 @@ Roughly, the checklist an existing widget's implementation demonstrates:
    otherwise it's just a layout container and composes existing children.
 3. Add a pyclass in `fastgui-py::widgets` with a `describe()` that builds a `DescribedWidget`,
    and wire any special attach-time cross-referencing into `attach()` if needed.
-4. Handle any new input behavior (click, drag) in both backends' `app` (`fastgui-render-vk`
-   and `fastgui-render-mtl`) `handle_mouse_press` / cursor-move / release dispatch — they
-   mirror each other.
+4. Handle any new input behavior (click, drag) in `fastgui-app`'s shared
+   `handle_mouse_press` / cursor-move / release dispatch (one place for both backends).
 5. Add the type stub in `python/fastgui/__init__.pyi`.
 6. Verify by actually running an example — see ROADMAP.md's "How this project has been built"
    for why this step isn't optional.

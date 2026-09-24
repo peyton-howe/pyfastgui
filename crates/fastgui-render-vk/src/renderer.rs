@@ -906,3 +906,50 @@ impl Drop for VulkanRenderer {
         }
     }
 }
+
+impl fastgui_app::SurfaceBackend for VulkanRenderer {
+    type Error = Error;
+
+    fn new(
+        window: &winit::window::Window,
+        physical_width: u32,
+        physical_height: u32,
+    ) -> Result<Self, Self::Error> {
+        VulkanRenderer::new(window, physical_width, physical_height)
+    }
+
+    fn resize(&mut self, physical_width: u32, physical_height: u32) -> Result<(), Self::Error> {
+        VulkanRenderer::resize(self, physical_width, physical_height)
+    }
+
+    fn set_chrome_frame(&mut self, frame: CpuFrame) -> Result<(), Self::Error> {
+        VulkanRenderer::set_chrome_frame(self, frame)
+    }
+
+    fn set_layer_frame(&mut self, viewport_id: u64, frame: CpuFrame) -> Result<(), Self::Error> {
+        VulkanRenderer::set_layer_frame(self, viewport_id, frame)
+    }
+
+    fn retain_layers(&mut self, live_ids: &[u64]) {
+        VulkanRenderer::retain_layers(self, live_ids)
+    }
+
+    fn render_frame(
+        &mut self,
+        clear: [f32; 4],
+        draw_chrome: bool,
+        draws: &[(u64, Rect)],
+    ) -> Result<(), Self::Error> {
+        VulkanRenderer::render_frame(self, clear, draw_chrome, draws)
+    }
+
+    fn create_cuda_surface(
+        &mut self,
+        viewport_id: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<fastgui_app::CudaExportHandles, String> {
+        VulkanRenderer::create_cuda_surface(self, viewport_id, width, height)
+            .map_err(|e| e.to_string())
+    }
+}

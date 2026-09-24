@@ -421,7 +421,7 @@ pub(crate) fn attach(
         let bar_id = tree.new_node(bar_style.to_style(), bar_kind);
         tree.add_child(id, bar_id);
         // Only the active tab's content is visible at attach time — everything but the click
-        // handler's own `set_display` toggling (`fastgui-render-vk::app::handle_tab_click`)
+        // handler's own `set_display` toggling (`fastgui-app::app::handle_tab_click`)
         // lives here, so both paths agree on what "active" means.
         let content_ids: Vec<WidgetId> = described
             .children
@@ -769,7 +769,7 @@ fn taffy_direction(direction: SplitDirection) -> FlexDirection {
 
 /// A draggable divider between `first` and `second`, splitting the space between them along
 /// `direction`. `ratio` is `first`'s initial share of the space (`0.0`..`1.0`); dragging the bar
-/// updates it live (see `fastgui-render-vk::app::update_dragged_splitter`). The foundation both
+/// updates it live (see `fastgui-app::app::update_dragged_splitter`). The foundation both
 /// a standalone split view and `DockArea` are built on (`python/fastgui/__init__.py`).
 #[pyclass]
 pub(crate) struct Splitter {
@@ -1077,7 +1077,7 @@ impl Panel {
 
 /// Multiple `Panel`s sharing one region: one combined header strip (each member's `title`, not
 /// its own title bar — see `Panel::title_and_content`) with only the active one's content
-/// visible. Click a header segment (`fastgui-render-vk::app::handle_tab_click`) to switch.
+/// visible. Click a header segment (`fastgui-app::app::handle_tab_click`) to switch.
 #[pyclass]
 pub(crate) struct Tabs {
     id: IdCell,
