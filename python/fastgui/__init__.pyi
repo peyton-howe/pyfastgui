@@ -154,7 +154,8 @@ class Window:
         sized `(width, height)`. Draggable anywhere on screen; resize via edge/corner drag; if
         this window's content is a `DockArea`, droppable back onto a docked region to re-dock
         (whether that `set_content` call came before or after this one). Survives later
-        `set_content` calls until re-docked or closed."""
+        `set_content` calls until re-docked or closed. Always closeable via its title-bar ×
+        (or the OS close shortcut, e.g. Alt+F4), whatever the window's content is."""
         ...
     @property
     def clear_color(self) -> tuple[float, float, float, float]: ...

@@ -1683,8 +1683,9 @@ impl App {
         match event {
             // Alt+F4 etc. Go through the panel's close handler, same as its ×, so Python drops
             // it from `floating_panels` too — destroying just the OS window here would leave
-            // the panel listed as floating with nothing on screen to get it back. Panels
-            // without a close handler have no × either, so the close is ignored.
+            // the panel listed as floating with nothing on screen to get it back. Every floater
+            // has one (`fastgui-py`'s `bind_panel_to_dock_handlers` falls back to the window's
+            // own `_take_floating_panel`), so the `None` case is only a safety net.
             WindowEvent::CloseRequested => {
                 if let Some(callback) = self.floating_close_callback(window_id) {
                     let region_id = self.floating[&window_id].region_id;
