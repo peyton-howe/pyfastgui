@@ -9,6 +9,7 @@ use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId, WindowLevel};
 
+use crate::cloak::set_cloaked;
 use crate::command::{Command, RenderThreadHandles};
 use crate::constants::*;
 use crate::coords::scale_rect;
@@ -1394,8 +1395,8 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::Wait);
 
-        // Hidden until the first frame, like floaters (see `add_floating_panel`): otherwise
-        // Windows shows the main window blank white while the backend is built.
+        // Hidden while the backend is built, like floaters (see `add_floating_panel`): otherwise
+        // Windows shows the main window blank white meanwhile.
         let attributes = Window::default_attributes()
             .with_title(self.title.clone())
             .with_inner_size(LogicalSize::new(f64::from(self.width), f64::from(self.height)))
@@ -1416,12 +1417,18 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
             Ok(renderer) => {
                 self.renderer = Some(renderer);
                 self.last_applied_physical = (self.physical_width, self.physical_height);
+                // Shown cloaked so the first frame can be presented before DWM composites the
+                // window at all — otherwise it still flashes white for a frame at startup.
+                set_cloaked(&window, true);
                 window.set_visible(true);
                 let window_id = window.id();
                 self.window = Some(window);
                 // Draws whatever `set_content` already queued. Pending floaters open after,
                 // so they appear above the main window.
                 self.render_window(event_loop, window_id);
+                if let Some(window) = &self.window {
+                    set_cloaked(window, false);
+                }
             }
             Err(err) => {
                 self.error = Some(RunError::Renderer(err));
