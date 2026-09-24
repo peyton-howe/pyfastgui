@@ -16,7 +16,7 @@ mod surface;
 pub use app::{run, RunError};
 pub use command::{Command, CommandDispatch, EventWaker, RenderThreadHandles};
 pub use constants::*;
-pub use coords::{logical_to_physical_rect, physical_to_logical, scale_rect, LayoutSize};
+pub use coords::scale_rect;
 pub use cuda_handles::CudaExportHandles;
 pub use ghost::build_tear_ghost_tree;
 pub use resize_edge::{classify_float_resize_edge, resize_edge_cursor, ResizeEdge};

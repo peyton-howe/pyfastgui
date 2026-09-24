@@ -897,6 +897,25 @@ drop highlights still update on the main window.
 the shared loop; physical conversion happens at the GPU boundary (also fixes Vulkan HiDPI
 float placement that previously passed physical rects to Python).
 
+**Windows window-creation fixes (found testing the extract).** Four things, all in `fastgui-app`,
+and each fixes a visible symptom — don't "simplify" them away:
+- A new floater gets a same-size `Resized` from Windows when first shown. Recreating the
+  swapchain for it hit the ~2s DWM stall (see `RESIZE_DEBOUNCE`) with the window blank white,
+  so floater `Resized` skips no-op sizes. The tear-off ghost also stays up (`tear_handoff`)
+  until the new floater presents its first frame, so there's no gap on release.
+- Every window (main, floaters, ghost) is created `with_visible(false)`, gets its backend built
+  (on Vulkan a whole instance + swapchain per window — slow), and only then is shown and drawn.
+  Visible-at-creation windows sat white for the whole backend build. The ghost is also
+  `with_active(false)` so showing it can't take focus (or the drag) from the main window.
+- Hiding still left one white frame on the main window at startup: DWM composites a window the
+  moment it's shown, before the first present lands. The main window is shown DWM-cloaked
+  (`cloak.rs`, `DWMWA_CLOAK` via `windows-sys`) and uncloaked after its first frame. No-op off
+  Windows; floaters/ghost didn't visibly need it. If a one-frame flash ever reappears, uncloak
+  after the second frame instead.
+- Title bars use the plain arrow cursor everywhere, matching native title bars. winit maps
+  `Grab`/`Grabbing` to the 4-arrow move cursor on Windows, and macOS/Linux use the hand only for
+  dragging content, not windows.
+
 ### 6A. Docking/panel system (full scope)
 
 Build bottom-up; each step is independently useful and testable, so verify as you go rather
