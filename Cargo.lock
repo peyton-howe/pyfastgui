@@ -401,6 +401,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastgui-app"
+version = "0.0.1"
+dependencies = [
+ "crossbeam-channel",
+ "fastgui-chrome",
+ "fastgui-core",
+ "thiserror 2.0.19",
+ "winit",
+]
+
+[[package]]
 name = "fastgui-chrome"
 version = "0.0.1"
 dependencies = [
@@ -437,20 +448,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "fastgui-render"
-version = "0.0.1"
-dependencies = [
- "raw-window-handle",
-]
-
-[[package]]
 name = "fastgui-render-mtl"
 version = "0.0.1"
 dependencies = [
  "crossbeam-channel",
+ "fastgui-app",
  "fastgui-chrome",
  "fastgui-core",
- "fastgui-render",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -468,9 +472,9 @@ dependencies = [
  "ash",
  "ash-window",
  "crossbeam-channel",
+ "fastgui-app",
  "fastgui-chrome",
  "fastgui-core",
- "fastgui-render",
  "raw-window-handle",
  "thiserror 2.0.19",
  "winit",

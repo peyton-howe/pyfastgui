@@ -280,22 +280,41 @@ fn widget_rect_to_mtl(
     ))
 }
 
-impl fastgui_render::Renderer for MetalRenderer {
+impl fastgui_app::SurfaceBackend for MetalRenderer {
     type Error = Error;
 
     fn new(
-        window: &(impl HasWindowHandle + HasDisplayHandle),
-        width: u32,
-        height: u32,
+        window: &winit::window::Window,
+        physical_width: u32,
+        physical_height: u32,
     ) -> Result<Self, Self::Error> {
-        MetalRenderer::new(window, width, height)
+        MetalRenderer::new(window, physical_width, physical_height)
     }
 
-    fn resize(&mut self, width: u32, height: u32) -> Result<(), Self::Error> {
-        MetalRenderer::resize(self, width, height)
+    fn resize(&mut self, physical_width: u32, physical_height: u32) -> Result<(), Self::Error> {
+        MetalRenderer::resize(self, physical_width, physical_height)
     }
 
-    fn render_frame(&mut self, color: [f32; 4]) -> Result<(), Self::Error> {
-        MetalRenderer::render_frame(self, color, false, &[])
+    fn set_chrome_frame(&mut self, frame: CpuFrame) -> Result<(), Self::Error> {
+        MetalRenderer::set_chrome_frame(self, frame)
+    }
+
+    fn set_layer_frame(&mut self, viewport_id: u64, frame: CpuFrame) -> Result<(), Self::Error> {
+        MetalRenderer::set_layer_frame(self, viewport_id, frame)
+    }
+
+    fn retain_layers(&mut self, live_ids: &[u64]) {
+        MetalRenderer::retain_layers(self, live_ids)
+    }
+
+    fn render_frame(
+        &mut self,
+        clear: [f32; 4],
+        draw_chrome: bool,
+        draws: &[(u64, Rect)],
+    ) -> Result<(), Self::Error> {
+        MetalRenderer::render_frame(self, clear, draw_chrome, draws)
     }
 }
+
+

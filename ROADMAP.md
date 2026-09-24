@@ -885,6 +885,12 @@ threshold a mouse-transparent AlwaysOnTop ghost window (title bar + body chrome)
 cursor; the real panel stays docked until release (Qt-style non-opaque / preview undock). Dock
 drop highlights still update on the main window.
 
+**Shared app loop extract.** Dock/float/ghost input + the command queue live in `fastgui-app`
+(`App<B: SurfaceBackend>`). Metal/Vulkan `app.rs` are thin `run()` wrappers (~24 lines) with
+`MainResizePolicy::{Immediate,Debounced}`. Layout/hit-test are logical points everywhere in
+the shared loop; physical conversion happens at the GPU boundary (also fixes Vulkan HiDPI
+float placement that previously passed physical rects to Python).
+
 ### 6A. Docking/panel system (full scope)
 
 Build bottom-up; each step is independently useful and testable, so verify as you go rather

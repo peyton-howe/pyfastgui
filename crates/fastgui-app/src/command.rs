@@ -1,22 +1,27 @@
 use std::sync::{Arc, Mutex};
 
 use fastgui_core::widget::WidgetTree;
-use fastgui_core::{CommandReceiver, CommandSender, Readback};
+use fastgui_core::{CommandReceiver, CommandSender, OneshotSender, Readback};
 use winit::event_loop::EventLoopProxy;
 
-/// Mutations a `Window` can receive from any Python thread, applied by the render thread once
-/// per frame. CPU viewport frames use `fastgui_core::FrameSlot` (latest-wins), not this queue.
+use crate::cuda_handles::CudaExportHandles;
+
+/// Mutations a `Window` can receive from any Python thread, applied by the render thread.
 pub enum Command {
     SetClearColor([f32; 4]),
+    /// Vulkan-only. macOS never sends this (Python stubs `create_cuda_surface` first).
+    CreateCudaSurface {
+        viewport_id: u64,
+        width: u32,
+        height: u32,
+        respond: OneshotSender<Result<CudaExportHandles, String>>,
+    },
     MutateWidgetTree(Box<dyn FnOnce(&mut WidgetTree) + Send>),
-    /// Widget setter targeting a floating panel's own tree (ids are not unique across trees).
     MutateFloatingTree {
         region_id: u64,
         mutation: Box<dyn FnOnce(&mut WidgetTree) + Send>,
     },
-    /// Open `region_id` as a real OS window (not an overlay in the main tree). `build` attaches
-    /// the panel as that window's full content. `(x, y)` is the offset from the main window's
-    /// inner origin, in the same units as `Window(width, height)`.
+    /// `(x, y, width, height)` are **logical** points relative to the main window's inner origin.
     AddFloatingPanel {
         region_id: u64,
         title: String,
@@ -31,8 +36,6 @@ pub enum Command {
     },
 }
 
-/// Wakes a `ControlFlow::Wait` event loop from any thread -- see
-/// `fastgui-render-vk::EventWaker`, which this mirrors exactly.
 #[derive(Clone, Default)]
 pub struct EventWaker {
     proxy: Arc<Mutex<Option<EventLoopProxy<()>>>>,
@@ -50,10 +53,6 @@ impl EventWaker {
     }
 }
 
-/// Command sender that also wakes the render thread -- see `fastgui-render-vk::CommandDispatch`.
-/// `floating_region` is `Some` for widgets attached inside a floating OS window so later
-/// mutators (`label.set_text`, …) hit that window's tree, not the main one (WidgetIds are
-/// per-tree and would otherwise collide).
 #[derive(Clone)]
 pub struct CommandDispatch {
     pub sender: CommandSender<Command>,
@@ -63,7 +62,11 @@ pub struct CommandDispatch {
 
 impl CommandDispatch {
     pub fn for_floating(&self, region_id: u64) -> Self {
-        Self { sender: self.sender.clone(), waker: self.waker.clone(), floating_region: Some(region_id) }
+        Self {
+            sender: self.sender.clone(),
+            waker: self.waker.clone(),
+            floating_region: Some(region_id),
+        }
     }
 
     pub fn send(&self, command: Command) -> Result<(), crossbeam_channel::SendError<Command>> {
@@ -73,8 +76,6 @@ impl CommandDispatch {
     }
 }
 
-/// Cross-thread handles the render thread needs to drain incoming commands and publish state
-/// back out for synchronous readback -- see `fastgui-render-vk::RenderThreadHandles`.
 pub struct RenderThreadHandles {
     pub commands: CommandReceiver<Command>,
     pub clear_color: Readback<[f32; 4]>,

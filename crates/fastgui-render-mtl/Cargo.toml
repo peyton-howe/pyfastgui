@@ -6,9 +6,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+fastgui-app = { path = "../fastgui-app" }
 fastgui-chrome = { path = "../fastgui-chrome" }
 fastgui-core = { path = "../fastgui-core" }
-fastgui-render = { path = "../fastgui-render" }
 crossbeam-channel = "0.5"
 raw-window-handle = "0.6"
 winit = "0.30"
