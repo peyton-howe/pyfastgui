@@ -395,7 +395,7 @@ impl Window {
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
             .map(|c| c.clone_ref(self_.py()));
-        bind_panel_to_dock_handlers(&panel_ref, content.as_ref().map(|c| c.bind(self_.py())));
+        bind_panel_to_dock_handlers(self_, &panel_ref, content.as_ref().map(|c| c.bind(self_.py())));
         let mut described = panel_ref.borrow().describe_window_content()?;
         described.force_fill();
 
@@ -486,19 +486,24 @@ impl Window {
     }
 }
 
-/// Point `panel`'s rearrange/close handlers at `content`'s when it's a `DockArea` (callable
-/// `_on_rearrange`/`_on_close`), and clear them otherwise, so a floater never re-docks into a
-/// dock the window no longer shows. Returns whether either handler changed.
-fn bind_panel_to_dock_handlers(panel: &Bound<'_, widgets::Panel>, content: Option<&Bound<'_, PyAny>>) -> bool {
-    let handler = |name: &str| {
-        content
-            .and_then(|c| c.getattr(name).ok())
+/// Point floating `panel`'s rearrange/close handlers at `content`'s when it's a `DockArea`
+/// (callable `_on_rearrange`/`_on_close`). Otherwise clear rearrange, so a floater never
+/// re-docks into a dock the window no longer shows, and fall back to `window`'s own
+/// `_take_floating_panel` for close, so every floater stays closeable (its × and Alt+F4).
+/// Returns whether either handler changed.
+fn bind_panel_to_dock_handlers(
+    window: &Bound<'_, Window>,
+    panel: &Bound<'_, widgets::Panel>,
+    content: Option<&Bound<'_, PyAny>>,
+) -> bool {
+    let callable = |obj: Option<&Bound<'_, PyAny>>, name: &str| {
+        obj.and_then(|o| o.getattr(name).ok())
             .filter(|h| h.is_callable())
             .map(Bound::unbind)
     };
-    panel
-        .borrow()
-        .replace_dock_handlers(panel.py(), handler("_on_rearrange"), handler("_on_close"))
+    let rearrange = callable(content, "_on_rearrange");
+    let close = callable(content, "_on_close").or_else(|| callable(Some(window.as_any()), "_take_floating_panel"));
+    panel.borrow().replace_dock_handlers(panel.py(), rearrange, close)
 }
 
 /// Rebind every floating panel to `content` (see `bind_panel_to_dock_handlers`), and rebuild
@@ -514,7 +519,7 @@ fn rebind_floating_panels(window: &Bound<'_, Window>, content: Option<&Bound<'_,
     };
     for panel in panels {
         let Ok(bound) = panel.bind(py).cast::<widgets::Panel>() else { continue };
-        if !bind_panel_to_dock_handlers(bound, content) {
+        if !bind_panel_to_dock_handlers(window, bound, content) {
             continue;
         }
         let region_id = bound.borrow().region_id();
