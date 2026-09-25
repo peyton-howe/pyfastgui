@@ -56,6 +56,10 @@ impl ChromeRenderer {
             let (Some(rect), Some(kind)) = (tree.absolute_rect(id), tree.kind(id)) else {
                 continue;
             };
+            // The × geometry comes from `close_button_rect` on the *logical* rect (then scaled),
+            // exactly like the hit test in `fastgui-app`, so drawn and clickable areas coincide
+            // at any DPI.
+            let logical_rect = rect;
             let rect = scale_rect(rect, scale);
             match kind {
                 WidgetKind::Container { background, .. } => {
@@ -86,7 +90,8 @@ impl ChromeRenderer {
                 } => {
                     self.draw_tab_bar(
                         &mut pixmap,
-                        rect,
+                        logical_rect,
+                        scale,
                         titles,
                         *active,
                         *font_size * scale,
@@ -105,7 +110,7 @@ impl ChromeRenderer {
                     ..
                 } => {
                     fill_rect(&mut pixmap, rect, *background);
-                    let close = fastgui_core::widget::close_button_rect(rect);
+                    let close = scale_rect(fastgui_core::widget::close_button_rect(logical_rect), scale);
                     let text_rect = if on_close.is_some() {
                         fastgui_core::widget::Rect {
                             width: (rect.width - close.width).max(0.0),
@@ -116,7 +121,7 @@ impl ChromeRenderer {
                     };
                     self.draw_text(&mut pixmap, text_rect, title, *font_size * scale, *text_color);
                     if on_close.is_some() {
-                        self.draw_text(&mut pixmap, close, "×", *font_size * scale, *text_color);
+                        self.draw_close_glyph(&mut pixmap, close, *font_size * scale, *text_color);
                     }
                 }
                 WidgetKind::Viewport { .. } => {
@@ -127,7 +132,9 @@ impl ChromeRenderer {
         }
 
         if let Some((region_rect, zone)) = drop_indicator {
-            fill_rect(&mut pixmap, scale_rect(drop_zone_rect(region_rect, zone), scale), DROP_INDICATOR_COLOR);
+            // Same rect the release will commit to (`DropZone::preview_rect`), drawn last so no
+            // widget covers it. `fastgui-app` also skips GPU viewport layers under it.
+            fill_rect(&mut pixmap, scale_rect(zone.preview_rect(region_rect), scale), DROP_INDICATOR_COLOR);
         }
 
         CpuFrame { width, height, format: PixelFormat::Rgba8, data: pixmap.data().to_vec() }
@@ -176,6 +183,22 @@ impl ChromeRenderer {
         });
     }
 
+    /// Draw "×" centred in `rect` (physical px). `draw_text` lays text out from the top-left,
+    /// which left the glyph in the top-left corner of its square, off-centre from the
+    /// area that actually closes. Uses the same rough advance/line-height ratios as layout's
+    /// `measure_text`, which is plenty for a single glyph.
+    fn draw_close_glyph(&mut self, pixmap: &mut Pixmap, rect: fastgui_core::widget::Rect, font_size: f32, color: Color) {
+        let glyph_width = font_size * 0.55;
+        let line_height = font_size * 1.25;
+        let inset = fastgui_core::widget::Rect {
+            x: rect.x + ((rect.width - glyph_width) * 0.5).max(0.0),
+            y: rect.y + ((rect.height - line_height) * 0.5).max(0.0),
+            width: rect.width.min(glyph_width * 2.0),
+            height: rect.height.max(line_height),
+        };
+        self.draw_text(pixmap, inset, "×", font_size, color);
+    }
+
     /// Bakes its own header segments (equal-width, one per title) directly rather than composing
     /// child `Label` nodes — see `WidgetKind::TabBar`'s doc comment for why. Passes each segment's
     /// *full* rect to `draw_text` (not a tightly text-measured sub-box), avoiding the clipping
@@ -184,7 +207,8 @@ impl ChromeRenderer {
     fn draw_tab_bar(
         &mut self,
         pixmap: &mut Pixmap,
-        rect: fastgui_core::widget::Rect,
+        logical_rect: fastgui_core::widget::Rect,
+        scale: f32,
         titles: &[String],
         active: usize,
         font_size: f32,
@@ -193,21 +217,24 @@ impl ChromeRenderer {
         inactive_color: Color,
         on_close: &[Option<fastgui_core::widget::PanelCloseCallback>],
     ) {
-        if titles.is_empty() || rect.width <= 0.0 {
+        if titles.is_empty() || logical_rect.width <= 0.0 {
             return;
         }
-        let segment_width = rect.width / titles.len() as f32;
+        // Segments are computed in logical units, like `fastgui-app`'s tab hit testing, then
+        // scaled for drawing.
+        let segment_width = logical_rect.width / titles.len() as f32;
         for (index, title) in titles.iter().enumerate() {
-            let segment_rect = fastgui_core::widget::Rect {
-                x: rect.x + index as f32 * segment_width,
-                y: rect.y,
+            let logical_segment = fastgui_core::widget::Rect {
+                x: logical_rect.x + index as f32 * segment_width,
+                y: logical_rect.y,
                 width: segment_width,
-                height: rect.height,
+                height: logical_rect.height,
             };
+            let segment_rect = scale_rect(logical_segment, scale);
+            let close = scale_rect(fastgui_core::widget::close_button_rect(logical_segment), scale);
             fill_rect(pixmap, segment_rect, if index == active { active_color } else { inactive_color });
             let closable = on_close.get(index).is_some_and(|c| c.is_some());
             let text_rect = if closable {
-                let close = fastgui_core::widget::close_button_rect(segment_rect);
                 fastgui_core::widget::Rect {
                     width: (segment_rect.width - close.width).max(0.0),
                     ..segment_rect
@@ -217,8 +244,7 @@ impl ChromeRenderer {
             };
             self.draw_text(pixmap, text_rect, title, font_size, text_color);
             if closable {
-                let close = fastgui_core::widget::close_button_rect(segment_rect);
-                self.draw_text(pixmap, close, "×", font_size, text_color);
+                self.draw_close_glyph(pixmap, close, font_size, text_color);
             }
         }
     }
@@ -263,21 +289,6 @@ fn draw_slider(
         paint.set_color_rgba8((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, (a * 255.0) as u8);
         paint.anti_alias = true;
         pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
-    }
-}
-
-/// The sub-area of `region` a drop indicator highlights for `zone` — half the region for an
-/// edge zone (matching `DropZone::classify`'s own halves, not just its outer margin, so the
-/// preview reads as "the target will end up this big", not just "you're near this edge"), the
-/// whole region for `Center` ("this becomes a tab").
-fn drop_zone_rect(region: fastgui_core::widget::Rect, zone: DropZone) -> fastgui_core::widget::Rect {
-    use fastgui_core::widget::Rect;
-    match zone {
-        DropZone::Center | DropZone::Float => region,
-        DropZone::Left => Rect { width: region.width / 2.0, ..region },
-        DropZone::Right => Rect { x: region.x + region.width / 2.0, width: region.width / 2.0, ..region },
-        DropZone::Top => Rect { height: region.height / 2.0, ..region },
-        DropZone::Bottom => Rect { y: region.y + region.height / 2.0, height: region.height / 2.0, ..region },
     }
 }
 

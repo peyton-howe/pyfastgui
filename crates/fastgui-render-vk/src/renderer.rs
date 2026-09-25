@@ -490,6 +490,14 @@ impl VulkanRenderer {
         width: u32,
         height: u32,
     ) -> Result<CudaExportHandles, Error> {
+        // TODO(linux): export via VK_KHR_external_memory_fd / VK_KHR_external_semaphore_fd
+        // (OPAQUE_FD, or dma-buf) and import with cuImportExternalMemory's
+        // CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD. Untestable without an NVIDIA GPU, so until
+        // then fail with a clear message rather than the win32-extension error below, which
+        // reads like a driver problem.
+        if cfg!(not(windows)) {
+            return Err(Error::CudaInteropNotImplemented);
+        }
         if self.cuda_interop.is_none() {
             return Err(Error::CudaInteropUnsupported);
         }

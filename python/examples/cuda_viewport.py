@@ -13,10 +13,18 @@ Requires: an NVIDIA GPU, the CUDA driver, and cupy (`pip install cupy-cuda12x` o
 matching your installed CUDA version) — none of which this repo depends on otherwise.
 """
 
+import sys
 import threading
 import time
 
-import cupy as cp
+try:
+    import cupy as cp
+except ImportError:
+    sys.exit(
+        "cuda_viewport.py needs cupy (and an NVIDIA GPU with the CUDA driver).\n"
+        "Install the build matching your CUDA version, e.g. `pip install cupy-cuda12x`,\n"
+        "or run live_camera_feed.py for the CPU submit_frame() path instead."
+    )
 
 import fastgui as fg
 
@@ -62,11 +70,16 @@ def main() -> None:
 
     # create_cuda_surface() needs the render thread running, so it must come after
     # set_viewport() but the actual call happens once run() has started pumping commands --
-    # do it from the same background thread that will drive the CUDA kernel.
+    # do it from the same background thread that will drive the CUDA kernel. (Called on this
+    # thread before run(), it raises RuntimeError after a short grace period.)
     stop = threading.Event()
 
     def start_cuda() -> None:
-        surface = viewport.create_cuda_surface(WIDTH, HEIGHT)
+        try:
+            surface = viewport.create_cuda_surface(WIDTH, HEIGHT)
+        except RuntimeError as err:
+            print(f"create_cuda_surface failed: {err}", file=sys.stderr)
+            return
         cuda_thread(surface, stop)
 
     thread = threading.Thread(target=start_cuda, daemon=True)

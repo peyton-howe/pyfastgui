@@ -26,6 +26,11 @@ pub enum VkRendererError {
          CUDA interop needs (VK_KHR_external_memory_win32, VK_KHR_external_semaphore_win32)"
     )]
     CudaInteropUnsupported,
+    #[error(
+        "CUDA interop is not implemented on Linux yet -- only the Windows (win32 handle) \
+         path exists. Use Viewport.submit_frame() (CPU copy) instead."
+    )]
+    CudaInteropNotImplemented,
     #[error("the render thread hasn't finished starting up yet")]
     RendererNotReady,
 }

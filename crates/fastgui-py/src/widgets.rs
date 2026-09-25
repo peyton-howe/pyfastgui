@@ -385,6 +385,10 @@ pub(crate) fn attach(
         let bar_id = tree.new_node(bar_style.to_style(), bar_kind);
         tree.add_child(id, bar_id);
         let second_id = attach(tree, id, second_described, sender);
+        // Both panes split the whole span by `ratio` (see `WidgetTree::set_split_pane`), not
+        // just whatever their content leaves over.
+        tree.set_split_pane(first_id);
+        tree.set_split_pane(second_id);
         tree.mutate_kind(bar_id, |kind| {
             if let WidgetKind::Splitter { second, .. } = kind {
                 *second = second_id;

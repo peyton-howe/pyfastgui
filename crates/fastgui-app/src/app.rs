@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use fastgui_chrome::ChromeRenderer;
-use fastgui_core::widget::{WidgetId, WidgetKind, WidgetTree};
+use fastgui_core::widget::{WidgetId, WidgetKind, WidgetTree, SPLITTER_HIT_SLOP};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -34,6 +34,10 @@ struct TearGhost<B: SurfaceBackend> {
     window: Window,
     renderer: B,
     grab_offset: (f32, f32),
+    /// Hidden while the cursor previews a dock drop: the panel-sized ghost sits right where
+    /// the highlight is drawn and would hide it. It only reappears (as the tear-out preview)
+    /// when releasing would float the panel.
+    visible: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -258,7 +262,7 @@ impl<B: SurfaceBackend> App<B> {
             ) && floater
                 .widget_tree
                 .absolute_rect(id)
-                .is_some_and(|rect| fastgui_core::widget::close_button_rect(rect).contains(x, y))
+                .is_some_and(|rect| fastgui_core::widget::close_hit_rect(rect).contains(x, y))
         });
         if on_close_button {
             return None;
@@ -450,11 +454,18 @@ impl<B: SurfaceBackend> App<B> {
         if !self.has_widget_content {
             return draws;
         }
+        // Viewport layers are composited by the GPU *after* chrome, so they'd hide the drop
+        // preview chrome draws. While a drop zone is previewed, leave out any viewport it
+        // overlaps (its chrome placeholder shows instead) so the highlight is visible.
+        let preview = self.hover_region.map(|(_, rect, zone)| zone.preview_rect(rect));
         for id in self.widget_tree.walk() {
             let Some(WidgetKind::Viewport { viewport_id, .. }) = self.widget_tree.kind(id) else {
                 continue;
             };
             let Some(rect) = self.widget_tree.absolute_rect(id) else { continue };
+            if preview.is_some_and(|p| p.intersects(&rect)) {
+                continue;
+            }
             if rect.width >= 1.0 && rect.height >= 1.0 {
                 draws.push((*viewport_id, scale_rect(rect, self.scale_factor as f32)));
             }
@@ -480,6 +491,13 @@ impl<B: SurfaceBackend> App<B> {
     }
 
     fn handle_mouse_press(&mut self) {
+        // A 6px bar beside a 28px title bar is a hard target: a press within
+        // `SPLITTER_HIT_SLOP` of a splitter grabs it before the title bar/content under the
+        // cursor gets a chance to start a panel drag.
+        if let Some(bar) = self.widget_tree.splitter_at(self.cursor.0, self.cursor.1, SPLITTER_HIT_SLOP) {
+            self.dragging_splitter = Some(bar);
+            return;
+        }
         let Some(id) = self.widget_tree.hit_test(self.cursor.0, self.cursor.1) else { return };
         let Some(kind) = self.widget_tree.kind(id) else { return };
         match kind {
@@ -506,7 +524,7 @@ impl<B: SurfaceBackend> App<B> {
                             height: rect.height,
                         };
                         if on_close.get(index).is_some_and(|c| c.is_some())
-                            && fastgui_core::widget::close_button_rect(segment).contains(self.cursor.0, self.cursor.1)
+                            && fastgui_core::widget::close_hit_rect(segment).contains(self.cursor.0, self.cursor.1)
                         {
                             if let Some(callback) = on_close[index].clone() {
                                 if let Some(&panel_id) = panel_ids.get(index) {
@@ -533,7 +551,7 @@ impl<B: SurfaceBackend> App<B> {
             WidgetKind::PanelTitleBar { panel_id, floating, title, on_close, .. } => {
                 if let Some(rect) = self.widget_tree.absolute_rect(id) {
                     if on_close.is_some()
-                        && fastgui_core::widget::close_button_rect(rect).contains(self.cursor.0, self.cursor.1)
+                        && fastgui_core::widget::close_hit_rect(rect).contains(self.cursor.0, self.cursor.1)
                     {
                         if let Some(callback) = on_close.clone() {
                             callback(*panel_id);
@@ -576,6 +594,12 @@ impl<B: SurfaceBackend> App<B> {
             });
             return;
         }
+        if let Some(bar) = floater.widget_tree.splitter_at(cursor.0, cursor.1, SPLITTER_HIT_SLOP) {
+            if let Some(floater) = self.floating.get_mut(&window_id) {
+                floater.dragging_splitter = Some(bar);
+            }
+            return;
+        }
         let Some(id) = floater.widget_tree.hit_test(cursor.0, cursor.1) else { return };
         let Some(kind) = floater.widget_tree.kind(id) else { return };
         match kind {
@@ -606,7 +630,7 @@ impl<B: SurfaceBackend> App<B> {
                             height: rect.height,
                         };
                         if on_close.get(index).is_some_and(|c| c.is_some())
-                            && fastgui_core::widget::close_button_rect(segment).contains(cursor.0, cursor.1)
+                            && fastgui_core::widget::close_hit_rect(segment).contains(cursor.0, cursor.1)
                         {
                             if let Some(callback) = on_close[index].clone() {
                                 if let Some(&panel_id) = panel_ids.get(index) {
@@ -622,7 +646,7 @@ impl<B: SurfaceBackend> App<B> {
             WidgetKind::PanelTitleBar { panel_id, floating, on_drop, on_close, .. } => {
                 if let Some(rect) = floater.widget_tree.absolute_rect(id) {
                     if on_close.is_some()
-                        && fastgui_core::widget::close_button_rect(rect).contains(cursor.0, cursor.1)
+                        && fastgui_core::widget::close_hit_rect(rect).contains(cursor.0, cursor.1)
                     {
                         if let Some(callback) = on_close.clone() {
                             callback(*panel_id);
@@ -733,6 +757,24 @@ impl<B: SurfaceBackend> App<B> {
             && self.cursor.0 <= width + OUTER_EDGE_MARGIN
             && self.cursor.1 <= height + OUTER_EDGE_MARGIN;
         if !over_main {
+            self.hover_region = None;
+            return;
+        }
+
+        // Nothing is a drop target until the drag has clearly started (same threshold as the
+        // ghost), and the panel's own region means "cancel", even inside the outer-edge band.
+        // The top `OUTER_EDGE_MARGIN` of the window lies entirely inside the top row's title
+        // bars, so otherwise a click that jittered a pixel, or a drag released back on its own
+        // title bar, committed a whole-window Top drop.
+        let moved_enough = self.dock_tear_press_cursor.is_none_or(|press| {
+            let (dx, dy) = (self.cursor.0 - press.0, self.cursor.1 - press.1);
+            dx * dx + dy * dy >= TEAR_GHOST_THRESHOLD * TEAR_GHOST_THRESHOLD
+        });
+        let over_self = self
+            .widget_tree
+            .find_region_at(self.cursor.0, self.cursor.1)
+            .is_some_and(|(region_id, _)| region_id == dragged_region_id);
+        if !moved_enough || over_self {
             self.hover_region = None;
             return;
         }
@@ -885,10 +927,15 @@ impl<B: SurfaceBackend> App<B> {
         );
         widget_tree.clear_dirty();
         renderer.set_chrome_frame(frame).map_err(RunError::Renderer)?;
-        window.set_visible(true);
-        renderer
-            .render_frame(TEAR_GHOST_CLEAR, true, &[])
-            .map_err(RunError::Renderer)?;
+        // Stays hidden if a dock drop is already previewed (see `TearGhost::visible`);
+        // `update_tear_ghost` shows it once the cursor leaves every drop zone.
+        let visible = self.hover_region.is_none();
+        if visible {
+            window.set_visible(true);
+            renderer
+                .render_frame(TEAR_GHOST_CLEAR, true, &[])
+                .map_err(RunError::Renderer)?;
+        }
 
         // Chrome is baked into the renderer once; the ghost only needs to follow the cursor.
         drop((widget_tree, chrome, logical, scale_factor));
@@ -896,6 +943,7 @@ impl<B: SurfaceBackend> App<B> {
             window,
             renderer,
             grab_offset: (gx, gy),
+            visible,
         });
         Ok(())
     }
@@ -922,7 +970,8 @@ impl<B: SurfaceBackend> App<B> {
             }
         }
         let Some(main) = &self.window else { return };
-        let Some(ghost) = &self.tear_ghost else { return };
+        let want_visible = self.hover_region.is_none();
+        let Some(ghost) = &mut self.tear_ghost else { return };
         let scale = main.scale_factor().max(0.01);
         let Ok(inner) = main.inner_position() else { return };
         let logical = inner.to_logical::<f64>(scale);
@@ -931,6 +980,13 @@ impl<B: SurfaceBackend> App<B> {
             logical.x + f64::from(self.cursor.0 - gx),
             logical.y + f64::from(self.cursor.1 - gy),
         ));
+        if ghost.visible != want_visible {
+            ghost.visible = want_visible;
+            ghost.window.set_visible(want_visible);
+            if want_visible {
+                ghost.window.request_redraw();
+            }
+        }
     }
 
     fn handle_panel_drop(&mut self) {
@@ -1205,6 +1261,7 @@ impl<B: SurfaceBackend> App<B> {
         }
         let hovered = self
             .dragging_splitter
+            .or_else(|| self.widget_tree.splitter_at(self.cursor.0, self.cursor.1, SPLITTER_HIT_SLOP))
             .or_else(|| self.widget_tree.hit_test(self.cursor.0, self.cursor.1));
         let icon = match hovered.and_then(|id| self.widget_tree.kind(id)) {
             Some(WidgetKind::Splitter { direction, .. }) => Some(match direction {
@@ -1286,7 +1343,7 @@ impl<B: SurfaceBackend> App<B> {
                 return;
             }
         }
-        if let Some(ghost) = &mut self.tear_ghost {
+        if let Some(ghost) = self.tear_ghost.as_mut().filter(|g| g.visible) {
             if let Err(err) = ghost.renderer.render_frame(TEAR_GHOST_CLEAR, true, &[]) {
                 self.error = Some(RunError::Renderer(err));
                 event_loop.exit();
@@ -1451,7 +1508,7 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                 self.handle_floating_window_event(event_loop, window_id, event);
             } else if self.tear_ghost.as_ref().is_some_and(|g| g.window.id() == window_id) {
                 if matches!(event, WindowEvent::RedrawRequested) {
-                    if let Some(ghost) = &mut self.tear_ghost {
+                    if let Some(ghost) = self.tear_ghost.as_mut().filter(|g| g.visible) {
                         if let Err(err) = ghost.renderer.render_frame(TEAR_GHOST_CLEAR, true, &[]) {
                             self.error = Some(RunError::Renderer(err));
                             event_loop.exit();

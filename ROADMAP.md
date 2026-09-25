@@ -931,6 +931,43 @@ would only save that last ~1.6ms, so it's not worth its complexity; next steps i
 shows up again are caching shaped `Buffer`s by (text, size, width), then measuring the
 full-texture GPU upload (unmeasured) before considering partial uploads.
 
+**Linux bring-up fixes (X11 + Mesa llvmpipe).** Found driving the dock demos with real
+(xdotool) input on Linux, but none of them are Linux-specific:
+- *Splitter panes ignored their ratio.* Panes had taffy's default `flex_basis: auto` and
+  automatic minimum size, so each pane took its content size first and `flex_grow` only split
+  the leftover. `dock_rearrange_demo`'s 0.7/0.3 top row laid out at ~0.52/0.48, and the
+  0.2 Log column at 0.17. `DropZone::classify` was right all along (preview and commit share
+  `hover_region`), but every "aim at the right 10% of Viewport" landed in the wrong panel or
+  zone. That was the "right edge tab-merges" / "center commits as Top" reports. Dragging a
+  splitter also barely moved it (~11px for a long drag). `WidgetTree::set_split_pane` now gives
+  both panes `flex_basis: 0` + `min_size: 0`, so the bar sits exactly at `ratio`. Content wider
+  than its pane overflows; it doesn't move the bar.
+- *Drop preview hidden.* The highlight is `DropZone::preview_rect` (now in `fastgui-core`,
+  unit-tested to contain every cursor point `classify` maps to that zone). Two things covered it:
+  the tear-off ghost (an opaque, panel-sized AlwaysOnTop window positioned right where an edge
+  highlight is), and GPU `Viewport` layers, which composite *after* chrome. The ghost is now
+  hidden while a dock zone is previewed (it's the "will float" preview, the highlight is the
+  "will dock" one), and viewports overlapping the preview rect are skipped for those frames.
+- *Hit targets.* Splitter bars take a press within `SPLITTER_HIT_SLOP` (5) of either side,
+  checked before `hit_test` so the bar beats the 28px title bar it borders (it stays 6px wide).
+  The × hit rect (`close_hit_rect`) is the drawn square + 6px to the left, full bar height,
+  capped at 40% of the bar/tab segment so a tab header always keeps most of its width. The
+  glyph is now centred in its square (it was drawn top-left), and chrome computes the square
+  from the logical rect then scales it, as the hit test does. It used to apply the logical
+  22px constant to the physical rect, which gave an 11pt square at 2×.
+- *Accidental whole-window Top drops.* The top `OUTER_EDGE_MARGIN` (24) of the window is
+  entirely inside the top row's 28px title bars, so a title-bar click that jittered a pixel, or
+  a drag released back on its own title bar, committed a ROOT Top rearrange. Now nothing is a
+  drop target until the drag passes `TEAR_GHOST_THRESHOLD`, and the dragged panel's own region
+  is a cancel, even in the outer-edge band.
+- `create_cuda_surface` before `run()` blocked forever on its oneshot (nothing drains the queue
+  yet). It now waits ≤2s for `run()` to bind the event loop (`EventWaker::is_bound`), then raises,
+  and the reply wait itself times out after 30s. On non-Windows Vulkan it raises
+  `CudaInteropNotImplemented` up front (TODO: OPAQUE_FD / dma-buf export).
+- `fastgui-render-mtl` is `#![cfg(target_os = "macos")]` with macOS-only deps, so
+  `cargo test --workspace` / `cargo clippy --workspace` run on Linux/Windows. It was verified
+  with `cargo check`/`clippy --target aarch64-apple-darwin` (not built or run on a Mac).
+
 ### 6A. Docking/panel system (full scope)
 
 Build bottom-up; each step is independently useful and testable, so verify as you go rather
@@ -981,12 +1018,13 @@ Concrete and fully achievable/verifiable on this machine (at least the Windows l
 
 - Configure `fastgui-py/Cargo.toml`'s `pyo3` dependency with an `abi3-pyXY` feature for the
   GIL-enabled build (one wheel covers all supported CPython minors via the stable ABI); the
-  free-threaded build stays non-abi3 per-minor-version (`cp313t`, `cp314t`, ...) since `abi3t`
+  free-threaded build stays non-abi3 per-minor-version (`cp314t`, ...; `cp313t` is out while
+  on PyO3 0.29, which refuses to build against 3.13t) since `abi3t`
   needs Python 3.15+ (check current 3.15 release status when doing this work — it was still
   in beta as of this project's early sessions).
 - Update `pyproject.toml`'s `[tool.maturin]` section accordingly.
 - Write `.github/workflows/wheels.yml` (or equivalent): build matrix over OS × {abi3
-  GIL-enabled, cp313t, cp314t}. Can only locally verify the Windows leg, but still write
+  GIL-enabled, cp314t}. Can only locally verify the Windows leg, but still write
   correct config for macOS/Linux (e.g. via `maturin-action`).
 - Locally verify: `maturin build --release` (not `develop`) produces an installable wheel that
   works without dev-mode symlinking, for both the abi3 and free-threaded configurations.

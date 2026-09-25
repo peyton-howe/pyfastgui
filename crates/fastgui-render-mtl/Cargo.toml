@@ -5,7 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-[dependencies]
+# Everything is macOS-only: `objc-sys` refuses to build without an Objective-C runtime, so
+# unconditional deps broke `cargo test --workspace` on Windows/Linux. Elsewhere this crate
+# compiles to an empty lib (see `#![cfg]` in src/lib.rs); `fastgui-py` only depends on it
+# under the same cfg.
+[target.'cfg(target_os = "macos")'.dependencies]
 fastgui-app = { path = "../fastgui-app" }
 fastgui-chrome = { path = "../fastgui-chrome" }
 fastgui-core = { path = "../fastgui-core" }
