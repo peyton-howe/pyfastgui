@@ -20,7 +20,9 @@ fastgui instead:
 
 - Renders everything — widget chrome and arbitrary GPU/CPU frame content (`Viewport`) — through
   a native GPU backend (Vulkan on Windows/Linux, Metal on macOS), with widget chrome rasterized
-  via `cosmic-text` + `tiny-skia` and uploaded as a single texture per frame.
+  via `cosmic-text` + `tiny-skia` into one retained texture. Only the parts that changed are
+  repainted and uploaded, and shaped text is cached, so moving one slider costs a few small
+  blits instead of a full-window redraw.
 - Treats every widget mutation (`label.set_text(...)`, `slider.set_value(...)`, dragging a
   panel) as a command sent across a channel to the render thread, rather than requiring the
   caller to be "on the UI thread" — the free-threaded Python build can call into fastgui from

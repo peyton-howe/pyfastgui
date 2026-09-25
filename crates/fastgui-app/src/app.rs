@@ -367,7 +367,9 @@ impl<B: SurfaceBackend> App<B> {
             || (self.last_raster_scale - self.scale_factor).abs() > 1e-6;
         let dragging_panel = self.dragging_panel_title.is_some();
         let chrome_dirty = self.widget_tree.is_dirty() || size_changed || dragging_panel;
-        if chrome_dirty {
+        // Only with a renderer to take the result: chrome keeps the frame it rasterized and
+        // later sends just what changed, so a frame nobody uploaded would be lost for good.
+        if let (true, Some(renderer)) = (chrome_dirty, &mut self.renderer) {
             self.widget_tree.compute_layout(self.width as f32, self.height as f32);
             let drop_indicator = self.hover_region.map(|(_, rect, zone)| (rect, zone));
             let frame = self.chrome.rasterize(
@@ -380,8 +382,8 @@ impl<B: SurfaceBackend> App<B> {
             self.widget_tree.clear_dirty();
             self.last_chrome_size = Some((self.width, self.height));
             self.last_raster_scale = self.scale_factor;
-            if let Some(renderer) = &mut self.renderer {
-                renderer.set_chrome_frame(frame)?;
+            if let Some(frame) = frame {
+                renderer.set_chrome_frame(&frame)?;
             }
         }
 
@@ -428,7 +430,9 @@ impl<B: SurfaceBackend> App<B> {
             floater.widget_tree.clear_dirty();
             floater.last_chrome_size = Some((floater.width, floater.height));
             floater.last_raster_scale = floater.scale_factor;
-            floater.renderer.set_chrome_frame(frame)?;
+            if let Some(frame) = frame {
+                floater.renderer.set_chrome_frame(&frame)?;
+            }
         }
 
         let mut live_ids = Vec::new();
@@ -918,15 +922,11 @@ impl<B: SurfaceBackend> App<B> {
         let mut widget_tree = build_tear_ghost_tree(&title);
         let mut chrome = ChromeRenderer::new();
         widget_tree.compute_layout(logical.width as f32, logical.height as f32);
-        let frame = chrome.rasterize(
-            &widget_tree,
-            physical.width,
-            physical.height,
-            None,
-            scale_factor as f32,
-        );
+        let frame = chrome
+            .rasterize(&widget_tree, physical.width, physical.height, None, scale_factor as f32)
+            .expect("a fresh ChromeRenderer always returns its first frame");
+        renderer.set_chrome_frame(&frame).map_err(RunError::Renderer)?;
         widget_tree.clear_dirty();
-        renderer.set_chrome_frame(frame).map_err(RunError::Renderer)?;
         // Stays hidden if a dock drop is already previewed (see `TearGhost::visible`);
         // `update_tear_ghost` shows it once the cursor leaves every drop zone.
         let visible = self.hover_region.is_none();

@@ -9,7 +9,7 @@ use ash::{
     vk, Device, Entry, Instance,
 };
 use fastgui_core::widget::Rect;
-use fastgui_core::CpuFrame;
+use fastgui_core::{ChromeFrame, CpuFrame, PixelRect};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::cuda_texture::{CudaExportHandles, CudaSharedTexture};
@@ -431,31 +431,39 @@ impl VulkanRenderer {
         self.recreate_swapchain(width, height)
     }
 
-    pub fn set_chrome_frame(&mut self, frame: CpuFrame) -> Result<(), Error> {
+    /// Copies only `frame.damage` when the existing texture already holds the previous frame
+    /// at this size; see `SurfaceBackend::set_chrome_frame`.
+    pub fn set_chrome_frame(&mut self, frame: &ChromeFrame<'_>) -> Result<(), Error> {
         let mut slot = self.chrome.take();
-        let result = self.upsert_cpu_layer_slot(&mut slot, frame);
+        let result = self.upsert_cpu_layer_slot(&mut slot, frame.width, frame.height, frame.data, frame.damage);
         self.chrome = slot;
         result
     }
 
     pub fn set_layer_frame(&mut self, viewport_id: u64, frame: CpuFrame) -> Result<(), Error> {
         let mut slot = self.layers.remove(&viewport_id);
-        let result = self.upsert_cpu_layer_slot(&mut slot, frame);
+        let result = self.upsert_cpu_layer_slot(&mut slot, frame.width, frame.height, &frame.data, None);
         if let Some(layer) = slot {
             self.layers.insert(viewport_id, layer);
         }
         result
     }
 
+    /// Write a tightly packed RGBA8 `width`x`height` frame into `slot`'s texture, (re)creating
+    /// it on a size change. `damage`, when given, limits the copy to those rects — only valid
+    /// when the texture already holds the previous frame, so it's ignored after a recreate.
     fn upsert_cpu_layer_slot(
         &mut self,
         slot: &mut Option<SampledLayer>,
-        frame: CpuFrame,
+        width: u32,
+        height: u32,
+        data: &[u8],
+        damage: Option<&[PixelRect]>,
     ) -> Result<(), Error> {
         unsafe {
             let need_recreate = match slot {
                 Some(SampledLayer { image: GpuImage::Cpu(texture), .. }) => {
-                    texture.width != frame.width || texture.height != frame.height
+                    texture.width != width || texture.height != height
                 }
                 Some(SampledLayer { image: GpuImage::Cuda(_), .. }) | None => true,
             };
@@ -465,15 +473,21 @@ impl VulkanRenderer {
                 if let Some(old) = slot.take() {
                     self.destroy_layer(old);
                 }
-                let texture =
-                    ViewportTexture::new(&self.device, &self.memory_properties, frame.width, frame.height)?;
+                let texture = ViewportTexture::new(&self.device, &self.memory_properties, width, height)?;
                 let descriptor_set = self.viewport_pipeline.alloc_set(&self.device)?;
                 self.viewport_pipeline.bind_texture(&self.device, descriptor_set, texture.view);
                 *slot = Some(SampledLayer { image: GpuImage::Cpu(texture), descriptor_set });
             }
 
             if let Some(SampledLayer { image: GpuImage::Cpu(texture), .. }) = slot {
-                texture.upload(&frame);
+                match damage {
+                    Some(rects) if !need_recreate => {
+                        for rect in rects {
+                            texture.upload_rect(data, *rect);
+                        }
+                    }
+                    _ => texture.upload(data),
+                }
             }
         }
         Ok(())
@@ -930,7 +944,7 @@ impl fastgui_app::SurfaceBackend for VulkanRenderer {
         VulkanRenderer::resize(self, physical_width, physical_height)
     }
 
-    fn set_chrome_frame(&mut self, frame: CpuFrame) -> Result<(), Self::Error> {
+    fn set_chrome_frame(&mut self, frame: &ChromeFrame<'_>) -> Result<(), Self::Error> {
         VulkanRenderer::set_chrome_frame(self, frame)
     }
 

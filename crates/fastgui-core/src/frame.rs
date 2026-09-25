@@ -16,6 +16,71 @@ pub struct CpuFrame {
     pub data: Vec<u8>,
 }
 
+/// An integer pixel rect (physical pixels, top-left origin) — a damaged region of a chrome frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PixelRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl PixelRect {
+    pub fn area(&self) -> u64 {
+        u64::from(self.width) * u64::from(self.height)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    pub fn right(&self) -> u32 {
+        self.x + self.width
+    }
+
+    pub fn bottom(&self) -> u32 {
+        self.y + self.height
+    }
+
+    /// Smallest rect containing both (an empty rect contributes nothing).
+    pub fn union(&self, other: &PixelRect) -> PixelRect {
+        if self.is_empty() {
+            return *other;
+        }
+        if other.is_empty() {
+            return *self;
+        }
+        let (x, y) = (self.x.min(other.x), self.y.min(other.y));
+        PixelRect {
+            x,
+            y,
+            width: self.right().max(other.right()) - x,
+            height: self.bottom().max(other.bottom()) - y,
+        }
+    }
+
+    pub fn intersects(&self, other: &PixelRect) -> bool {
+        !self.is_empty()
+            && !other.is_empty()
+            && self.x < other.right()
+            && other.x < self.right()
+            && self.y < other.bottom()
+            && other.y < self.bottom()
+    }
+}
+
+/// The chrome (widget UI) image for one window, borrowed from `fastgui-chrome`'s retained
+/// buffer. `data` is always the *whole* tightly packed RGBA8 frame; `damage` says which parts
+/// changed since the previous `ChromeFrame` so a backend whose texture already holds that
+/// previous frame can upload just those rects. `None` means everything changed — and a backend
+/// that has no texture of this size yet must upload all of `data` regardless.
+pub struct ChromeFrame<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub data: &'a [u8],
+    pub damage: Option<&'a [PixelRect]>,
+}
+
 /// A single "latest frame wins" mailbox: a fast producer thread submits frames without ever
 /// blocking on (or queueing behind) the render thread's cadence, and the render thread picks
 /// up whatever is newest — dropping any frame that arrived and was overwritten before it got

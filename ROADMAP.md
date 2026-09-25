@@ -931,6 +931,87 @@ would only save that last ~1.6ms, so it's not worth its complexity; next steps i
 shows up again are caching shaped `Buffer`s by (text, size, width), then measuring the
 full-texture GPU upload (unmeasured) before considering partial uploads.
 
+**Incremental chrome (text cache + dirty rects + partial upload).** The follow-ups named in
+the chrome perf note above, done together because each alone left the others as the floor:
+- *Shaped text cache.* Each string is shaped and rasterized once into a premultiplied RGBA run
+  keyed by (text, size, box, color), then blitted. Runs unused for 120 rasterizes are evicted.
+  This is the CPU form of a glyph atlas. A GPU atlas would mean rewriting chrome as a GPU UI in
+  both backends; with repaints limited to damage it isn't needed.
+- *Dirty rects.* `rasterize` diffs a per-widget display list against the previous frame and
+  repaints only changed items' old+new bounds into a retained pixmap. The key sequence changing
+  (tree rebuild/rearrange), a resize, or damage over 50% of the window falls back to a full
+  repaint. Returns `None` when nothing changed, so a panel drag that doesn't move the drop
+  highlight costs no upload.
+- *Partial upload.* `SurfaceBackend::set_chrome_frame(&ChromeFrame)` carries the damage rects;
+  Metal `replaceRegion`s each rect, Vulkan copies just those rows into the mapped linear image.
+- Byte-exactness matters (a patch that differs from a full repaint leaves a visible seam), and
+  a first attempt was off by one AA pixel on the slider thumb: tiny-skia path points round
+  differently when translated into a patch's coordinates. Paths are now pre-rasterized sprites
+  and rects are shifted edge-wise by whole pixels. `incremental_repaint_matches_full_repaint`
+  checks exact equality at 1×/1.5×/2× over slider moves, text reflow, color changes,
+  drop-indicator show/move/hide, and display toggles.
+
+Measured with `cargo run --release -p fastgui-chrome --example chrome_bench` (6 panels,
+81 text items, Apple Silicon):
+
+| per frame | before 1× | after 1× | before 2× | after 2× |
+|---|---|---|---|---|
+| slider drag (slider + readout label) | 3.49 ms, 4000 KiB upload | 0.08 ms, 37 KiB | 5.21 ms, 16000 KiB | 0.09 ms, 133 KiB |
+| resize (full repaint, text warm) | 3.60 ms | 0.80 ms | 5.41 ms | 1.94 ms |
+
+Live on Metal (macOS, 1280×800, 81 labels, one label `set_text` at 120 Hz from a thread):
+rasterize averaged 5.71 ms → 0.28 ms per frame and process CPU fell from ~38% to ~7%; each
+update uploaded ~5 KB instead of 4 MB (traced, then removed). What's left per frame in that case
+is shaping the one string that actually changed. A continuous drag-resize still reshapes every
+label per frame (widths change); caching by content independent of box width is the next step
+if that shows up. Not screenshot-verified on macOS (no screen-recording permission in that
+session); pixel correctness rests on the unit test, and Vulkan's partial upload is compiled but
+not run.
+
+**2,000-cell table (does chrome need a GPU text path?).** `chrome_bench` also runs a 50×40
+table of flex-width `Label`s (11pt, short numbers). Per frame, rasterize only (layout is
+separate: ~0.04 ms when sizes don't change, ~0.9 ms when the window width does):
+
+| per frame | 1× (1600×1000) | 2× (3200×2000) |
+|---|---|---|
+| first frame (cold: 2,000 shapes) | 21.7 ms, 6.1 MB upload | 32.5 ms, 24.4 MB |
+| 1 cell gets a new value | 0.24 ms, 1 KiB | 0.24 ms, 4 KiB |
+| 50 cells get new values | 0.95 ms, 159 KiB | 1.34 ms, 623 KiB |
+| scroll (every cell moves 1pt) | 1.82 ms, full upload | 6.01 ms, full upload |
+| resize, 1pt per frame | 2.65 ms, full upload | 7.28 ms, full upload |
+
+What it says:
+- Edits scale with what changed, not with table size: shaping costs ~10–11 µs per changed
+  short string, and the fixed per-frame cost of diffing 2,000 items is ~0.2 ms. No GPU text
+  needed for live-updating cells.
+- Resize barely reshapes: taffy rounds layout to whole pixels, so a 1pt resize changes only
+  ~75 cells' rounded widths; the rest hit the text cache.
+- **Scroll and resize are full repaints and full uploads** — 6–7 ms of raster at 2× plus a 25 MB
+  copy to the texture (backend copy not measured). This, and the one-time ~30 ms first frame,
+  are where a GPU chrome path (or glyph atlas) would win. The cheaper fix for scroll, to build
+  into the (not yet existing) scroll container: shift the retained pixmap and texture by the
+  scroll delta and repaint only the newly exposed strip, as Qt/browsers do. The first-frame
+  hitch shrinks with virtualization (only shape visible rows).
+- Bug found by this bench: every cell moving gave ~4,000 damage rects, and the pairwise merge
+  (restarts after each merge) cost more than the repaint — scroll was 3.8 ms at 1× before
+  `MERGE_PAIRWISE_LIMIT` (256) made large sets take their bounding rect directly.
+
+**Checking other machines.** `scripts/chrome-timing.sh` (macOS/Linux) and
+`scripts/chrome-timing.ps1` (Windows) build and run `chrome_bench`, record the CPU model, and save
+`chrome-timing-<host>-<date>.txt` (gitignored). It needs only Rust — no GPU, display or Vulkan SDK.
+Each case gets a verdict against the frame budget: `ok` under 4.2 ms, `tight at 120 Hz` up to
+8.3 ms, `BOTTLENECK` beyond half a 60 Hz frame (the other half is left for GPU submit/present and
+Python). The `copy` column is the CPU side of the texture upload (a memcpy of the damage, which is
+what Vulkan's mapped-memory path does); GPU-side sync isn't included. On the M4 Pro, with that
+included, the one case over the line is the 2,000-cell table's drag-resize at 2× (9.2 ms); 2×
+scroll and warm resize are "tight at 120 Hz" (6.8 / 8.1 ms). The `.ps1` hasn't been run yet (written
+on a Mac without PowerShell).
+
+**Local macOS dev gotcha:** `.venv/lib/python3.14/site-packages/fastgui` is a symlink to this
+repo's `python/fastgui`, which shadows maturin's editable `.pth`. The repo's `.so` always
+wins, so to load a different build (e.g. an old commit in a worktree) put its `python/` dir on
+`PYTHONPATH`.
+
 **Linux bring-up fixes (X11 + Mesa llvmpipe).** Found driving the dock demos with real
 (xdotool) input on Linux, but none of them are Linux-specific:
 - *Splitter panes ignored their ratio.* Panes had taffy's default `flex_basis: auto` and

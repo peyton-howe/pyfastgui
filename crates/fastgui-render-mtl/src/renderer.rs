@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use fastgui_core::widget::Rect;
-use fastgui_core::CpuFrame;
+use fastgui_core::{ChromeFrame, CpuFrame};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::ClassType;
@@ -117,10 +117,30 @@ impl MetalRenderer {
         Ok(())
     }
 
-    pub fn set_chrome_frame(&mut self, frame: CpuFrame) -> Result<(), Error> {
-        let existing = self.chrome.take();
-        let layer = self.upsert_cpu_layer(existing, frame)?;
-        self.chrome = Some(layer);
+    /// Copies only `frame.damage` when the existing texture already holds the previous frame
+    /// at this size; see `SurfaceBackend::set_chrome_frame`.
+    pub fn set_chrome_frame(&mut self, frame: &ChromeFrame<'_>) -> Result<(), Error> {
+        match (&self.chrome, frame.damage) {
+            (Some(SampledLayer { texture }), Some(damage))
+                if texture.width == frame.width && texture.height == frame.height =>
+            {
+                for rect in damage {
+                    texture.upload_rect(frame.data, *rect);
+                }
+            }
+            _ => {
+                let texture = match self.chrome.take() {
+                    Some(SampledLayer { texture })
+                        if texture.width == frame.width && texture.height == frame.height =>
+                    {
+                        texture
+                    }
+                    _ => ViewportTexture::new(&self.device, frame.width, frame.height)?,
+                };
+                texture.upload(frame.data);
+                self.chrome = Some(SampledLayer { texture });
+            }
+        }
         Ok(())
     }
 
@@ -295,7 +315,7 @@ impl fastgui_app::SurfaceBackend for MetalRenderer {
         MetalRenderer::resize(self, physical_width, physical_height)
     }
 
-    fn set_chrome_frame(&mut self, frame: CpuFrame) -> Result<(), Self::Error> {
+    fn set_chrome_frame(&mut self, frame: &ChromeFrame<'_>) -> Result<(), Self::Error> {
         MetalRenderer::set_chrome_frame(self, frame)
     }
 

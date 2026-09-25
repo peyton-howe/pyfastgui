@@ -46,12 +46,15 @@ crates/
     src/pipeline.rs           ViewportPipeline: MSL fullscreen-triangle + sampler
     src/texture.rs            ViewportTexture: StorageModeShared MTLTexture + replaceRegion
 
-  fastgui-chrome/         Widget rasterizer: walks a WidgetTree and draws it into one RGBA8
-                          buffer via cosmic-text (text shaping) + tiny-skia (2D rasterization).
-                          Layout units are multiplied by a scale factor so HiDPI backends can
-                          keep layout in points while the pixmap matches backing pixels. The
-                          buffer is uploaded through the same CPU-texture path Viewport frames
-                          use — chrome is, from the renderer's perspective, just another frame.
+  fastgui-chrome/         Widget rasterizer: walks a WidgetTree and draws it into one retained
+                          RGBA8 buffer via cosmic-text (text shaping) + tiny-skia (2D
+                          rasterization). Layout units are multiplied by a scale factor so
+                          HiDPI backends can keep layout in points while the pixmap matches
+                          backing pixels. Each frame's draw ops are diffed against the last
+                          frame's, so only changed rects are repainted and reported as damage;
+                          text is shaped once into cached runs. The buffer is uploaded through
+                          the same CPU-texture path Viewport frames use (damage rects only).
+    examples/chrome_bench.rs  Layout/rasterize timings + upload bytes: dock tree, 2,000-cell table
 
   fastgui-interop-cuda/   Raw CUDA driver API FFI (struct layouts transcribed from NVIDIA's own
                           cuda-python bindings generator), dynamically loading nvcuda.dll via
@@ -145,7 +148,7 @@ target_id, zone`) via a callback, and decides how to restructure its own tree fr
 
 ## Rendering pipeline
 
-Each frame clears the surface, then optionally draws widget chrome (a full-window CPU raster
+Each frame clears the surface, then optionally draws widget chrome (a window-sized CPU raster
 from `fastgui-chrome`) and then any in-tree `Viewport` widgets on top, each sampled into its
 layout rect via a fullscreen-triangle pipeline (no vertex buffer). `Window.set_viewport` is just
 `set_content` of a filling `Viewport` widget. Color surfaces are `_UNORM` / `BGRA8Unorm`, not
@@ -157,6 +160,16 @@ IDs come from `gl_VertexIndex`, and a smaller viewport/scissor places the triang
 widget's rect. On Metal the same picture is a `CAMetalLayer` drawable, `MTLTexture` +
 `replaceRegion` for CPU bytes, and MSL `vertex_id`. Layout and hit-testing stay in points;
 chrome rasterizes at the window's backing scale so Retina chrome matches the Python window size.
+
+Chrome is incremental. `ChromeRenderer::rasterize` builds a display list (one item of draw ops
+per widget, in paint order), diffs it against the previous frame's, and repaints only the
+changed items' old and new bounds into its retained buffer, clipped to those rects. It returns
+a `ChromeFrame` whose `damage` lists them (or `None` after a full repaint: first frame, resize,
+tree rebuild, or damage over half the window), and returns nothing at all when no pixel
+changed. `SurfaceBackend::set_chrome_frame` then copies only the damage rects into the existing
+texture. A patch must match a full repaint to the byte (a unit test checks this at 1×/1.5×/2×).
+So ops are only ever shifted by whole pixels: rects are stored as edges, and anything built from
+a path (the slider thumb) is pre-rasterized into a sprite and blitted, like text runs.
 
 CUDA interop (`fastgui-interop-cuda`, `CudaSharedTexture`) is the one path that bypasses the CPU
 upload entirely: a device-local image is exported via `VK_KHR_external_memory_win32` and
@@ -171,8 +184,9 @@ README's known limitations.
 Roughly, the checklist an existing widget's implementation demonstrates:
 
 1. Add a `WidgetKind` variant in `fastgui-core::widget` (plus any callback type alias it needs).
-2. Handle it in `fastgui-chrome`'s rasterizer if it draws itself (self-contained widgets) —
-   otherwise it's just a layout container and composes existing children.
+2. Handle it in `fastgui-chrome`'s `build_items` if it draws itself (self-contained widgets),
+   emitting `Op`s (fills, cached text, sprites) rather than drawing directly — otherwise it's
+   just a layout container and composes existing children.
 3. Add a pyclass in `fastgui-py::widgets` with a `describe()` that builds a `DescribedWidget`,
    and wire any special attach-time cross-referencing into `attach()` if needed.
 4. Handle any new input behavior (click, drag) in `fastgui-app`'s shared

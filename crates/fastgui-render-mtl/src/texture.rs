@@ -8,6 +8,8 @@ use objc2_metal::{
     MTLTextureDescriptor, MTLTextureUsage,
 };
 
+use fastgui_core::PixelRect;
+
 use crate::error::MtlRendererError as Error;
 
 /// CPU-writable RGBA8 texture sampled each frame. `StorageModeShared` is the right default on
@@ -44,16 +46,28 @@ impl ViewportTexture {
     /// `width * height * 4` bytes, row-major, no padding -- same contract as
     /// `fastgui_core::CpuFrame`.
     pub fn upload(&self, data: &[u8]) {
+        self.upload_rect(data, PixelRect { x: 0, y: 0, width: self.width, height: self.height });
+    }
+
+    /// Copy just `rect` of `data` (a whole tightly packed `width`x`height` frame, same contract
+    /// as `upload`) into the same rect of the texture. `rect` is clipped to the texture.
+    pub fn upload_rect(&self, data: &[u8], rect: PixelRect) {
         debug_assert_eq!(data.len(), self.width as usize * self.height as usize * 4);
+        let x1 = rect.right().min(self.width);
+        let y1 = rect.bottom().min(self.height);
+        if rect.x >= x1 || rect.y >= y1 {
+            return;
+        }
         let region = MTLRegion {
-            origin: MTLOrigin { x: 0, y: 0, z: 0 },
-            size: MTLSize { width: self.width as usize, height: self.height as usize, depth: 1 },
+            origin: MTLOrigin { x: rect.x as usize, y: rect.y as usize, z: 0 },
+            size: MTLSize { width: (x1 - rect.x) as usize, height: (y1 - rect.y) as usize, depth: 1 },
         };
         let bytes_per_row = self.width as usize * 4;
-        // SAFETY: `data` is a valid, non-null, `bytes_per_row * height`-byte region for the
-        // duration of this call -- `replaceRegion` copies out of it synchronously and retains no
-        // reference to it afterward.
-        let ptr = NonNull::new(data.as_ptr() as *mut c_void).expect("frame data is never null");
+        let offset = rect.y as usize * bytes_per_row + rect.x as usize * 4;
+        // SAFETY: `data` holds the whole frame, so from `offset` it covers `region`'s rows at
+        // `bytes_per_row` stride for the duration of this call -- `replaceRegion` copies out of it
+        // synchronously and retains no reference to it afterward.
+        let ptr = NonNull::new(data[offset..].as_ptr() as *mut c_void).expect("frame data is never null");
         unsafe {
             self.texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
                 region,

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use fastgui_core::widget::Rect;
-use fastgui_core::CpuFrame;
+use fastgui_core::{ChromeFrame, CpuFrame};
 use winit::window::Window;
 
 use crate::constants::RESIZE_DEBOUNCE;
@@ -32,7 +32,10 @@ pub trait SurfaceBackend: Sized {
 
     fn resize(&mut self, physical_width: u32, physical_height: u32) -> Result<(), Self::Error>;
 
-    fn set_chrome_frame(&mut self, frame: CpuFrame) -> Result<(), Self::Error>;
+    /// Update the chrome texture. When the texture already holds the previous frame at this
+    /// size, only `frame.damage` needs copying; otherwise (or when `damage` is `None`) upload
+    /// all of `frame.data`.
+    fn set_chrome_frame(&mut self, frame: &ChromeFrame<'_>) -> Result<(), Self::Error>;
 
     fn set_layer_frame(&mut self, viewport_id: u64, frame: CpuFrame) -> Result<(), Self::Error>;
 
