@@ -364,3 +364,20 @@ fn gpu_atlas_repacks_under_text_churn() {
     }
     assert!(repacks > 0, "400 distinct runs should overflow a {}² atlas at least once", atlas_side(&atlas));
 }
+
+/// A tree with no text still gets a real atlas, so backends never create a 0×0 texture.
+#[test]
+fn gpu_atlas_is_never_zero_sized() {
+    let mut tree = WidgetTree::new();
+    let panel = tree.new_node(
+        Style { flex_grow: 1.0, ..Default::default() },
+        WidgetKind::Container { background: Color([0.16, 0.17, 0.2, 1.0]), region_id: None },
+    );
+    let root = tree.root();
+    tree.add_child(root, panel);
+    tree.compute_layout(320.0, 200.0);
+    let mut gpu = ChromeRenderer::new();
+    let frame = gpu.build_quads(&tree, 320, 200, None, 1.0).expect("first frame");
+    assert!(frame.atlas_size > 0, "text-free first frame produced a {0}×{0} atlas", frame.atlas_size);
+    assert!(frame.atlas_uploads.is_empty());
+}

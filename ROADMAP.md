@@ -1043,8 +1043,16 @@ full-window pixmap; build for those cases drops from ~10–17 ms to under ~2 ms 
 frames still hitch once (mostly atlas fill): Linux dock 6.8 / 9.2 ms and table 23.7 / 37.3 ms at
 1× / 2× (table 2× was 65 ms before). That hitch is still a virtualization/cold-cache problem.
 
-Verified drawing: Metal + MoltenVK offscreen readback and live stress on macOS. **Native Linux
-Vulkan (widgets_demo + `vk_chrome_stress` with validation) still to confirm** — bench-only so far.
+Verified drawing: Metal + MoltenVK offscreen readback and live stress on macOS; native Linux
+Vulkan (Mesa llvmpipe) with validation — `vulkan_quads_match_cpu_painter`, every example,
+`vk_chrome_stress` (~32 s, zero errors), and 61 docking checks. GPU↔CPU match to ≤1/channel
+outside the slider knob's AA rim.
+- *Debounced resize scramble (Vulkan).* Mid-resize, `build_quads` uses the new size while the
+  swapchain is still old; `quad.frag` now remaps `gl_FragCoord` by viewport/target so coverage
+  and atlas fetches stay in quad space (stretched-but-readable, like the CPU texture).
+- *0×0 atlas.* A text-free tree never overflowed the empty atlas, so backends got a zero-extent
+  image (8 validation errors on `live_camera_feed`). `build_quads` now resets to `ATLAS_MIN_SIZE`
+  (512) first; `gpu_atlas_is_never_zero_sized` covers it.
 
 **Local macOS dev gotcha:** `.venv/lib/python3.14/site-packages/fastgui` is a symlink to this
 repo's `python/fastgui`, which shadows maturin's editable `.pth`. The repo's `.so` always

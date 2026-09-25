@@ -176,6 +176,12 @@ impl super::ChromeRenderer {
 
         gpu.uploads.clear();
         let mut repacked = false;
+        // A frame with no text never overflows the empty atlas, so without this the first frame
+        // of a text-free tree (e.g. a lone Viewport) would hand the backend a 0×0 atlas: a
+        // zero-extent VkImage / MTLTexture.
+        if gpu.atlas.size == 0 {
+            gpu.atlas.reset(ATLAS_MIN_SIZE);
+        }
         if !gpu.place_sprites(&self.items) {
             // Full: repack only what this frame draws, at the current size first, then bigger.
             repacked = true;

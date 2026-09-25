@@ -28,9 +28,9 @@ impl QuadPipeline {
         set_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, Error> {
         let push_ranges = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(8)];
+            .size(16)];
         let set_layouts = [set_layout];
         let pipeline_layout = device.create_pipeline_layout(
             &vk::PipelineLayoutCreateInfo::default()
@@ -311,9 +311,16 @@ impl QuadChrome {
         );
         device.cmd_set_scissor(cmd, 0, &[vk::Rect2D { offset: vk::Offset2D::default(), extent }]);
         device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline_layout, 0, &[*set], &[]);
-        let size = [self.size.0 as f32, self.size.1 as f32];
-        let push: [u8; 8] = std::mem::transmute(size);
-        device.cmd_push_constants(cmd, pipeline.pipeline_layout, vk::ShaderStageFlags::VERTEX, 0, &push);
+        // Quad pixel space, then the target's: they differ while a debounced resize is pending.
+        let size = [self.size.0 as f32, self.size.1 as f32, extent.width as f32, extent.height as f32];
+        let push: [u8; 16] = std::mem::transmute(size);
+        device.cmd_push_constants(
+            cmd,
+            pipeline.pipeline_layout,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            0,
+            &push,
+        );
         device.cmd_bind_vertex_buffers(cmd, 0, &[buffer.buffer], &[0]);
         device.cmd_draw(cmd, 4, self.quads.len() as u32, 0, 0);
     }

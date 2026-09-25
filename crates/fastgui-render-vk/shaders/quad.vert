@@ -10,6 +10,7 @@ layout(location = 3) in uint in_kind;    // 0 solid, 1 circle, 2 sprite
 
 layout(push_constant) uniform Push {
     vec2 viewport;  // size of the quads' pixel space
+    vec2 target;    // size of the render target (used by the fragment shader)
 } push;
 
 layout(location = 0) flat out vec4 rect;
