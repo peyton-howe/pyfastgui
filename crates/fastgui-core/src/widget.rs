@@ -33,8 +33,20 @@ pub type PanelDropCallback =
 /// Fired when the user clicks a panel/tab close control — argument is that panel's region id.
 pub type PanelCloseCallback = Arc<dyn Fn(u64) + Send + Sync>;
 
-/// Width/height of the × hit target in a title bar or tab segment (layout units).
+/// Width/height of the drawn × square in a title bar or tab segment (layout units).
 pub const CLOSE_BUTTON_SIZE: f32 = 22.0;
+
+/// Extra width the × *hit* target gets to the left of its drawn square — see
+/// `close_hit_rect`. Modest on purpose: it must never eat much of a tab header segment.
+pub const CLOSE_HIT_SLOP: f32 = 6.0;
+
+/// Largest fraction of a title bar / tab segment's width the × may take (drawn or hit), so a
+/// narrow tab header always keeps most of its width for "switch to / drag this tab".
+const CLOSE_MAX_WIDTH_FRACTION: f32 = 0.4;
+
+/// How far (layout units, each side, across the bar) a press still grabs a `Splitter` bar —
+/// see `WidgetTree::splitter_at`. The bar keeps its drawn thickness; only the hit area grows.
+pub const SPLITTER_HIT_SLOP: f32 = 5.0;
 
 /// Which axis a `Splitter` divides its two panes along — matches the parent `Box`'s own
 /// `flex_direction` (a `Splitter` is itself a row/column container; see
@@ -60,10 +72,13 @@ pub enum DropZone {
 }
 
 impl DropZone {
-    /// Classify a point against `rect` for drag-and-drop purposes: the middle 50% (by area, via
-    /// independent per-axis margins) is `Center`, the outer 25% margin on whichever axis the
-    /// point is furthest out on picks an edge. Shared by hover-preview and drop-commit so they
-    /// always agree on the same zone for the same cursor position.
+    /// Classify a point against `rect` for drag-and-drop purposes: the middle 50% of each axis
+    /// (a centered box half the width and half the height) is `Center`; anywhere in the outer
+    /// 25% band picks whichever edge the point is nearest to (as a fraction of that axis, so a
+    /// wide, short panel still has usable top/bottom bands). `rect` is the target region's own
+    /// absolute rect (title bar included) in the same logical units as the cursor — never the
+    /// whole window. Shared by hover-preview and drop-commit so they always agree on the same
+    /// zone for the same cursor position; `preview_rect` is the matching highlight.
     pub fn classify(rect: Rect, x: f32, y: f32) -> Self {
         if rect.width <= 0.0 || rect.height <= 0.0 {
             return DropZone::Center;
@@ -95,6 +110,21 @@ impl DropZone {
             zone = DropZone::Bottom;
         }
         zone
+    }
+
+    /// The sub-area of `region` the drop preview highlights for this zone, which is where the
+    /// dragged panel will end up if released now. For an edge zone that's the half of `region`
+    /// the split gives it. For `Center` it's the whole region ("becomes a tab"). Every point
+    /// `classify` maps to an edge zone lies inside that zone's preview rect, so the highlight
+    /// always sits under the cursor.
+    pub fn preview_rect(self, region: Rect) -> Rect {
+        match self {
+            DropZone::Center | DropZone::Float => region,
+            DropZone::Left => Rect { width: region.width / 2.0, ..region },
+            DropZone::Right => Rect { x: region.x + region.width / 2.0, width: region.width / 2.0, ..region },
+            DropZone::Top => Rect { height: region.height / 2.0, ..region },
+            DropZone::Bottom => Rect { y: region.y + region.height / 2.0, height: region.height / 2.0, ..region },
+        }
     }
 }
 
@@ -203,17 +233,37 @@ impl Rect {
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
     }
+
+    /// Whether two rects share any area (touching edges don't count).
+    pub fn intersects(&self, other: &Rect) -> bool {
+        self.x < other.x + other.width
+            && other.x < self.x + self.width
+            && self.y < other.y + other.height
+            && other.y < self.y + self.height
+    }
 }
 
-/// Close-button hit/draw rect on the right of a title bar or tab segment.
+/// Drawn × square on the right of a title bar or tab segment, in the same units as `bar`
+/// (callers pass *logical* rects and scale the result, so drawing and hit-testing agree at any
+/// DPI).
 pub fn close_button_rect(bar: Rect) -> Rect {
-    let size = CLOSE_BUTTON_SIZE.min(bar.height).min(bar.width.max(0.0) * 0.5);
+    let size = CLOSE_BUTTON_SIZE.min(bar.height).min(bar.width.max(0.0) * CLOSE_MAX_WIDTH_FRACTION);
     Rect {
         x: bar.x + bar.width - size,
         y: bar.y + (bar.height - size) * 0.5,
         width: size,
         height: size,
     }
+}
+
+/// Click target for the ×: the drawn square widened by `CLOSE_HIT_SLOP` to the left and
+/// stretched to the bar's full height, so a click that's a few px off the glyph still closes.
+/// Always contains `close_button_rect(bar)`, and never takes more than
+/// `CLOSE_MAX_WIDTH_FRACTION` of the bar's width, so the rest of a tab header still selects it.
+pub fn close_hit_rect(bar: Rect) -> Rect {
+    let drawn = close_button_rect(bar);
+    let width = (drawn.width + CLOSE_HIT_SLOP).min(bar.width.max(0.0) * CLOSE_MAX_WIDTH_FRACTION).max(drawn.width);
+    Rect { x: bar.x + bar.width - width, y: bar.y, width, height: bar.height }
 }
 
 /// The retained-mode widget tree: taffy owns layout (parent/child structure + style), this
@@ -298,6 +348,24 @@ impl WidgetTree {
     pub fn set_flex_grow(&mut self, id: WidgetId, flex_grow: f32) {
         let Some(mut style) = self.taffy.style(id).ok().cloned() else { return };
         style.flex_grow = flex_grow;
+        let _ = self.taffy.set_style(id, style);
+        self.mark_dirty();
+    }
+
+    /// Make `id` one of a `Splitter`'s two panes, so the panes' `flex_grow` values
+    /// (`ratio * GROW_SCALE` / `(1 - ratio) * GROW_SCALE`) divide the *whole* span in exactly
+    /// that ratio. Needs `flex_basis: 0` and a zero minimum size (CSS's `flex: N 1 0` +
+    /// `min-width: 0`). With taffy's defaults (`flex_basis: auto`, automatic minimum size) each
+    /// pane first takes its content size and only the leftover is split, and a pane never goes
+    /// below its content's min-content width. So a 0.7/0.3 split with a wide label in the
+    /// second pane laid out at about 0.52/0.48, and dragging the bar barely moved it. Drop-zone
+    /// aiming, splitter dragging, and the documented `DockArea` sizes all assumed the ratio held.
+    /// The splitter drag's 5% floor keeps a pane from vanishing. Content wider than its pane
+    /// overflows (drawn over by the later sibling) rather than moving the bar.
+    pub fn set_split_pane(&mut self, id: WidgetId) {
+        let Some(mut style) = self.taffy.style(id).ok().cloned() else { return };
+        style.flex_basis = Dimension::length(0.0);
+        style.min_size = Size { width: Dimension::length(0.0), height: Dimension::length(0.0) };
         let _ = self.taffy.set_style(id, style);
         self.mark_dirty();
     }
@@ -396,6 +464,36 @@ impl WidgetTree {
     /// hit-testing. Depth-first-last-child-wins matches normal painter's-algorithm z-order.
     pub fn hit_test(&self, x: f32, y: f32) -> Option<WidgetId> {
         self.walk().filter(|&id| self.absolute_rect(id).is_some_and(|r| r.contains(x, y))).last()
+    }
+
+    /// The `Splitter` bar whose rect, widened by `slop` on both sides across the bar (x for a
+    /// `Row` splitter's vertical bar, y for a `Column` splitter's horizontal bar), contains
+    /// `(x, y)`. Press handling checks this *before* `hit_test`, so a thin bar wins over the
+    /// panel title bar or content it borders. If two bars are in range the nearest wins.
+    pub fn splitter_at(&self, x: f32, y: f32, slop: f32) -> Option<WidgetId> {
+        let mut best: Option<(f32, WidgetId)> = None;
+        for id in self.walk() {
+            let Some(WidgetKind::Splitter { direction, .. }) = self.kind(id) else { continue };
+            let Some(rect) = self.absolute_rect(id) else { continue };
+            if rect.width <= 0.0 || rect.height <= 0.0 {
+                continue;
+            }
+            let grown = match direction {
+                SplitDirection::Row => Rect { x: rect.x - slop, width: rect.width + 2.0 * slop, ..rect },
+                SplitDirection::Column => Rect { y: rect.y - slop, height: rect.height + 2.0 * slop, ..rect },
+            };
+            if !grown.contains(x, y) {
+                continue;
+            }
+            let distance = match direction {
+                SplitDirection::Row => (x - (rect.x + rect.width / 2.0)).abs(),
+                SplitDirection::Column => (y - (rect.y + rect.height / 2.0)).abs(),
+            };
+            if best.is_none_or(|(d, _)| distance < d) {
+                best = Some((distance, id));
+            }
+        }
+        best.map(|(_, id)| id)
     }
 
     /// Find the `DockArea` region (a `Container { region_id: Some(_), .. }` — a `Panel`'s or
@@ -499,6 +597,165 @@ mod tests {
         assert_eq!(DropZone::classify(rect, 90.0, 50.0), DropZone::Right);
         assert_eq!(DropZone::classify(rect, 50.0, 10.0), DropZone::Top);
         assert_eq!(DropZone::classify(rect, 50.0, 90.0), DropZone::Bottom);
+    }
+
+    /// A region deliberately away from the origin (like a right-hand panel below a title row),
+    /// so any mix-up between region-local and window coordinates shows up.
+    const OFFSET: Rect = Rect { x: 612.0, y: 30.0, width: 388.0, height: 421.0 };
+
+    #[test]
+    fn drop_zone_offset_rect_each_zone() {
+        let r = OFFSET;
+        let at = |fx: f32, fy: f32| DropZone::classify(r, r.x + fx * r.width, r.y + fy * r.height);
+        assert_eq!(at(0.5, 0.5), DropZone::Center);
+        assert_eq!(at(0.05, 0.5), DropZone::Left);
+        assert_eq!(at(0.20, 0.5), DropZone::Left);
+        assert_eq!(at(0.95, 0.5), DropZone::Right);
+        assert_eq!(at(0.80, 0.5), DropZone::Right);
+        assert_eq!(at(0.5, 0.05), DropZone::Top);
+        assert_eq!(at(0.5, 0.95), DropZone::Bottom);
+        // Window-space coordinates that would be an edge of a rect at the origin are just the
+        // middle of this one's band structure — never classified against the window.
+        assert_eq!(DropZone::classify(r, 806.0, 240.0), DropZone::Center);
+    }
+
+    #[test]
+    fn drop_zone_center_covers_middle_half_of_each_axis() {
+        let r = OFFSET;
+        for fx in [0.26, 0.4, 0.5, 0.6, 0.74] {
+            for fy in [0.26, 0.4, 0.5, 0.6, 0.74] {
+                let zone = DropZone::classify(r, r.x + fx * r.width, r.y + fy * r.height);
+                assert_eq!(zone, DropZone::Center, "fx={fx} fy={fy}");
+            }
+        }
+    }
+
+    #[test]
+    fn drop_zone_band_picks_nearest_edge() {
+        let r = OFFSET;
+        let at = |fx: f32, fy: f32| DropZone::classify(r, r.x + fx * r.width, r.y + fy * r.height);
+        // In the top-right corner band: nearer the right edge than the top edge.
+        assert_eq!(at(0.95, 0.15), DropZone::Right);
+        // Nearer the top.
+        assert_eq!(at(0.85, 0.05), DropZone::Top);
+        assert_eq!(at(0.10, 0.90), DropZone::Left);
+        assert_eq!(at(0.20, 0.97), DropZone::Bottom);
+    }
+
+    #[test]
+    fn drop_zone_preview_rect_contains_cursor_and_is_the_committed_half() {
+        let r = OFFSET;
+        let mut fx = 0.0;
+        while fx < 1.0 {
+            let mut fy = 0.0;
+            while fy < 1.0 {
+                let (x, y) = (r.x + fx * r.width, r.y + fy * r.height);
+                let zone = DropZone::classify(r, x, y);
+                let preview = zone.preview_rect(r);
+                assert!(preview.contains(x, y), "{zone:?} preview misses cursor at fx={fx} fy={fy}");
+                fy += 0.03;
+            }
+            fx += 0.03;
+        }
+        let right = DropZone::Right.preview_rect(r);
+        assert_eq!((right.x, right.y, right.width, right.height), (806.0, 30.0, 194.0, 421.0));
+        let bottom = DropZone::Bottom.preview_rect(r);
+        assert_eq!((bottom.x, bottom.y, bottom.width, bottom.height), (612.0, 240.5, 388.0, 210.5));
+        let center = DropZone::Center.preview_rect(r);
+        assert_eq!((center.x, center.width), (r.x, r.width));
+    }
+
+    #[test]
+    fn close_hit_rect_covers_glyph_but_not_header() {
+        let bar = Rect { x: 178.0, y: 427.0, width: 822.0, height: 28.0 };
+        let drawn = close_button_rect(bar);
+        let hit = close_hit_rect(bar);
+        assert_eq!((drawn.x, drawn.width), (1000.0 - 22.0, 22.0));
+        assert!(hit.x <= drawn.x && hit.x + hit.width >= drawn.x + drawn.width);
+        assert!(hit.y <= drawn.y && hit.y + hit.height >= drawn.y + drawn.height);
+        assert!(hit.contains(1000.0 - 26.0, 428.0), "a few px left of the glyph, top row");
+        // A narrow tab segment: the × never takes more than 40% of it.
+        let segment = Rect { x: 0.0, y: 0.0, width: 60.0, height: 28.0 };
+        let hit = close_hit_rect(segment);
+        assert!(hit.width <= 24.0 + f32::EPSILON);
+        assert!(!hit.contains(30.0, 14.0), "segment middle must still select the tab");
+        assert!(close_hit_rect(segment).contains(close_button_rect(segment).x, 14.0));
+    }
+
+    fn split_row_tree(ratio: f32, split_panes: bool) -> (WidgetTree, WidgetId, WidgetId, WidgetId) {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let row = tree.new_node(
+            Style { flex_direction: FlexDirection::Row, flex_grow: 1.0, ..Default::default() },
+            WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+        );
+        let pane = |tree: &mut WidgetTree, grow: f32, text: &str| {
+            let id = tree.new_node(
+                Style { flex_direction: FlexDirection::Column, flex_grow: grow, ..Default::default() },
+                WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+            );
+            let label = tree.new_node(
+                Style::default(),
+                WidgetKind::Label { text: text.into(), font_size: 14.0, color: Color::TRANSPARENT },
+            );
+            tree.add_child(id, label);
+            id
+        };
+        let first = pane(&mut tree, ratio * 1000.0, "");
+        let bar = tree.new_node(
+            Style { size: Size { width: Dimension::length(6.0), height: Dimension::auto() }, ..Default::default() },
+            WidgetKind::Splitter {
+                direction: SplitDirection::Row,
+                ratio,
+                bar_color: Color::TRANSPARENT,
+                first,
+                second: first,
+            },
+        );
+        let second = pane(&mut tree, (1.0 - ratio) * 1000.0, "A fairly long label in the second pane");
+        tree.mutate_kind(bar, |k| {
+            if let WidgetKind::Splitter { second: s, .. } = k {
+                *s = second;
+            }
+        });
+        tree.add_child(root, row);
+        tree.add_child(row, first);
+        tree.add_child(row, bar);
+        tree.add_child(row, second);
+        if split_panes {
+            tree.set_split_pane(first);
+            tree.set_split_pane(second);
+        }
+        tree.compute_layout(1006.0, 400.0);
+        (tree, first, bar, second)
+    }
+
+    #[test]
+    fn split_pane_honours_ratio_despite_content() {
+        let (tree, first, _, second) = split_row_tree(0.7, true);
+        let a = tree.absolute_rect(first).unwrap().width;
+        let b = tree.absolute_rect(second).unwrap().width;
+        assert!((a - 700.0).abs() < 0.5 && (b - 300.0).abs() < 0.5, "got {a} / {b}");
+        // Second pane (100) narrower than its label's min-content width (~290): ratio still wins.
+        let (tree, first, _, second) = split_row_tree(0.9, true);
+        let a = tree.absolute_rect(first).unwrap().width;
+        let b = tree.absolute_rect(second).unwrap().width;
+        assert!((a - 900.0).abs() < 0.5 && (b - 100.0).abs() < 0.5, "got {a} / {b}");
+        // Regression guard for the bug itself: without `set_split_pane` content skews it.
+        let (tree, first, _, _) = split_row_tree(0.7, false);
+        assert!(tree.absolute_rect(first).unwrap().width < 690.0);
+    }
+
+    #[test]
+    fn splitter_at_uses_slop_across_bar_only() {
+        let (tree, _, bar, _) = split_row_tree(0.5, true);
+        let r = tree.absolute_rect(bar).unwrap();
+        let mid_y = r.y + r.height / 2.0;
+        assert_eq!(tree.splitter_at(r.x + 3.0, mid_y, SPLITTER_HIT_SLOP), Some(bar));
+        assert_eq!(tree.splitter_at(r.x - 4.0, mid_y, SPLITTER_HIT_SLOP), Some(bar));
+        assert_eq!(tree.splitter_at(r.x + r.width + 4.0, mid_y, SPLITTER_HIT_SLOP), Some(bar));
+        assert_eq!(tree.splitter_at(r.x - 6.0, mid_y, SPLITTER_HIT_SLOP), None);
+        assert_eq!(tree.splitter_at(r.x + 3.0, r.y - 1.0, SPLITTER_HIT_SLOP), None);
     }
 
     #[test]

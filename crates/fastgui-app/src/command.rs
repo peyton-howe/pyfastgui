@@ -49,6 +49,14 @@ impl EventWaker {
         *self.proxy.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(proxy);
     }
 
+    /// Whether `run()` has created the render thread's event loop (and so something will
+    /// drain the command queue). A synchronous request/response command sent before this has
+    /// nothing to answer it until `run()` starts, and the caller is usually the same thread
+    /// that would call `run()`, so it must fail fast instead of blocking.
+    pub fn is_bound(&self) -> bool {
+        self.proxy.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some()
+    }
+
     pub fn wake(&self) {
         if let Some(proxy) = self.proxy.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() {
             let _ = proxy.send_event(());

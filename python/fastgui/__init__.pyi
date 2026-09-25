@@ -21,7 +21,12 @@ class Viewport:
         """Submit a (H, W, 3|4) uint8 frame. Copies into an owned buffer today; a packed-RGBA
         high-FPS path will want fewer copies later."""
         ...
-    def create_cuda_surface(self, width: int, height: int) -> CudaSurface: ...
+    def create_cuda_surface(self, width: int, height: int) -> CudaSurface:
+        """Unverified, Windows-only zero-copy CUDA surface. Call after set_viewport(), once
+        window.run() has started (from a callback or another thread). Raises RuntimeError
+        instead of blocking if run() hasn't started within ~2s, and on macOS/Linux
+        (not supported / not implemented yet)."""
+        ...
 
 class Label:
     def __init__(self, text: str, font_size: float = 16.0, color: RGBA = (1.0, 1.0, 1.0, 1.0)) -> None: ...

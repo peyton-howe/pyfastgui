@@ -99,7 +99,10 @@ impl Viewport {
 
     /// Allocate a `width`x`height` RGBA8 texture that a CUDA kernel can write into directly
     /// (zero-copy — the same GPU memory Vulkan samples from), and return a `CudaSurface`
-    /// exposing its raw device pointer. Must be called after `window.set_viewport(viewport)`.
+    /// exposing its raw device pointer. Must be called after `window.set_viewport(viewport)`,
+    /// once `window.run()` has started (from a callback or another thread). Called before
+    /// `run()`, it raises `RuntimeError` after a ~2s grace period rather than blocking forever.
+    /// On Linux it raises `RuntimeError` (interop not implemented there yet).
     ///
     /// **Unverified**: written against the CUDA driver API and Vulkan external-memory specs,
     /// but never run against a real CUDA-capable GPU during development. See
@@ -119,6 +122,30 @@ impl Viewport {
                 )
             })?;
 
+        // The render thread only exists once `window.run()` has started, and `run()` blocks, so
+        // a call before it used to wait forever, usually on the very thread that was about to
+        // call `run()`. A background thread started just before `run()` (as in
+        // `examples/cuda_viewport.py`) is fine, so give startup a short grace period, then
+        // fail instead of hanging.
+        const STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+        let started = py.detach(|| {
+            let deadline = std::time::Instant::now() + STARTUP_GRACE;
+            while !dispatch.waker.is_bound() {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            true
+        });
+        if !started {
+            return Err(PyRuntimeError::new_err(
+                "the render thread isn't running yet: viewport.create_cuda_surface() needs a \
+                 running window. window.run() starts the render thread and blocks, so call this \
+                 from a widget callback or another thread once run() is going",
+            ));
+        }
+
         let (respond, response) = oneshot_channel();
         dispatch
             .send(Command::CreateCudaSurface {
@@ -129,9 +156,21 @@ impl Viewport {
             })
             .map_err(|_| PyRuntimeError::new_err("window has already closed"))?;
 
+        // Backstop for a render thread that's alive but never gets to the command (e.g. it's
+        // shutting down): creating the surface takes milliseconds, so this is generous.
+        const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         let handles = py
-            .detach(|| response.recv())
-            .map_err(|_| PyRuntimeError::new_err("window closed before creating the CUDA surface"))?
+            .detach(|| response.recv_timeout(RESPONSE_TIMEOUT))
+            .map_err(|err| {
+                if err.is_timeout() {
+                    PyRuntimeError::new_err(format!(
+                        "timed out after {}s waiting for the render thread to create the CUDA surface",
+                        RESPONSE_TIMEOUT.as_secs()
+                    ))
+                } else {
+                    PyRuntimeError::new_err("window closed before creating the CUDA surface")
+                }
+            })?
             .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
 
         py.detach(|| {

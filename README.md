@@ -9,8 +9,8 @@ safely drive the UI at once.
 
 > **Status:** pre-alpha, actively developed, not yet published as a package. See
 > [ROADMAP.md](ROADMAP.md) for the full milestone-by-milestone history and current work.
-> Windows (Vulkan) and macOS (Metal) are the platforms exercised so far — see
-> [Known limitations](#known-limitations).
+> Windows (Vulkan) and macOS (Metal) are the platforms exercised so far; Linux (Vulkan) has
+> been tested on X11 with Mesa llvmpipe — see [Known limitations](#known-limitations).
 
 ## Why
 
@@ -75,9 +75,13 @@ pip install maturin numpy
 maturin develop --release
 ```
 
+Requires CPython 3.10+. For the **free-threaded** build you need **CPython 3.14t**: the pinned
+PyO3 (0.29) refuses to build against a 3.13t interpreter, so a `python3.13t` venv fails at
+`maturin develop`. Regular (GIL) 3.13 is fine.
+
 You'll also need the platform toolchain fastgui itself builds against:
 
-- Rust (stable, via [rustup](https://rustup.rs/)) — `rust-toolchain.toml` pins the channel/target.
+- Rust (stable, via [rustup](https://rustup.rs/)) — `rust-toolchain.toml` pins the channel.
 - On Windows: MSVC Build Tools, and the [Vulkan SDK](https://vulkan.lunarg.com/) (needed to
   recompile `crates/fastgui-render-vk/shaders/*.spv` if you touch the shaders; prebuilt `.spv`
   files are checked in so a plain build doesn't need the SDK).
@@ -146,14 +150,22 @@ like any other frame; `fastgui-py` is the PyO3 layer and picks the backend with
   `Viewport.create_cuda_surface` raises `RuntimeError`. Treat the CUDA API as unverified until
   someone runs it on NVIDIA hardware.
 - **Linux is less exercised than Windows and macOS.** It uses the same Vulkan backend as
-  Windows, but day-to-day bring-up has been on those two platforms.
+  Windows. It has been tested on X11 (Xvfb + xfwm4) with Mesa llvmpipe (software Vulkan):
+  every example, the docking/tab/splitter/floating interactions, and a free-threaded 3.14t
+  build, all with zero validation errors. It hasn't been tested on Wayland or with a hardware
+  GPU driver, and CUDA interop isn't implemented on Linux yet (`create_cuda_surface` raises
+  `RuntimeError`).
+- **Free-threaded Python means 3.14t.** PyO3 0.29 doesn't build for 3.13t (see
+  [Install](#install)).
 - **No text wrapping, scrolling, or keyboard input/focus handling** for any widget yet.
 - **`DockArea` / floating**: floating panels are real OS windows (move, resize, tear out by
   dragging a docked panel outside the main window, re-dock by dropping onto the dock).
 - **`Viewport.submit_frame` always copies** the numpy/buffer into an owned `Vec<u8>` before
   upload. Expected for the CPU path; a packed-RGBA camera feed will want a fewer-copy path later.
-- **Automated tests are still thin.** `cargo test -p fastgui-core` covers `FrameSlot`, `DropZone`,
-  and `WidgetTree` layout/hit-test; `python -m unittest tests.test_dock_area` (from `python/`)
+- **Automated tests are still thin.** `cargo test --workspace` (works on every platform; the
+  Metal crate compiles to empty off macOS) covers `FrameSlot`, `DropZone` classification and
+  preview rects, splitter ratio layout and hit slop, the × hit rect, and `WidgetTree`
+  layout/hit-test; `python -m unittest tests.test_dock_area` (from `python/`)
   covers `DockArea` tree surgery. There is no GPU/window integration suite yet.
 - **`.venv`/`env` are local, machine-specific dev environments**, not checked in — a fresh
   clone needs its own `python -m venv` plus the Rust and platform GPU toolchain described in

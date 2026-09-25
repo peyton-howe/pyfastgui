@@ -1,3 +1,5 @@
 [toolchain]
 channel = "stable"
-targets = ["x86_64-pc-windows-msvc"]
+# No `targets` list: rustup always installs the host target, which is all a local build needs
+# (x86_64-pc-windows-msvc on Windows, the matching -linux-gnu / -apple-darwin elsewhere).
+# Pinning only the Windows target made rustup fetch a Windows std on Linux/macOS hosts.

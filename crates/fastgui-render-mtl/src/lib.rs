@@ -1,4 +1,8 @@
 //! Metal rendering backend (macOS) for fastgui.
+//!
+//! Empty on every other target (its dependencies are macOS-only too — see Cargo.toml), so a
+//! plain `cargo test --workspace` / `cargo clippy --workspace` works on Windows and Linux.
+#![cfg(target_os = "macos")]
 
 mod app;
 mod error;
