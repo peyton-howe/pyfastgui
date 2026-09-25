@@ -1020,17 +1020,31 @@ Metal and Vulkan each got a quad pipeline; the shared app defaults to this path,
 - Stress: `cargo run -p fastgui-render-vk --example vk_chrome_stress` (MoltenVK on macOS needs
   `DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib`).
 
-Measured on M4 Pro (`chrome_bench gpu` vs earlier CPU numbers for the 2,000-cell table):
+Cross-machine `chrome_bench` (CPU-side layout + build + upload only; GPU draw of the quads is
+not included). GPU path clears every prior CPU bottleneck on all three:
 
-| per frame (table) | CPU 2× | GPU 2× |
+| machine | slowest GPU case (table 2×) | that case on CPU |
 |---|---|---|
-| scroll | ~6–9 ms, ~25 MB upload | 0.32 ms, 128 KiB |
-| resize warm | ~8 ms, full upload | 1.28 ms, 132 KiB |
-| resize drag | ~9 ms, full upload | 2.28 ms, 787 KiB |
-| 1 cell ticks | ~0.24 ms | 0.32 ms |
+| macOS M4 Pro | resize drag 2.28 ms (14% of 60 Hz) | ~9.7 ms bottleneck |
+| Windows | resize drag 2.35 ms; resize warm 1.50 ms | (CPU path still slow on full-view moves) |
+| Linux (Grok bot) | resize drag 3.8 ms (23% of 60 Hz) | resize warm 29.9 ms / 24.4 MiB |
 
-Scroll/resize are no longer bottlenecks on this machine. First-frame hitch (~30 ms shaping 2,000
-strings) is unchanged — still a virtualization/cold-cache problem, not a compositing one.
+Linux 2× detail (GPU vs CPU, same machine so the comparison is clean):
+
+| case | CPU 2× | GPU 2× |
+|---|---|---|
+| table resize warm | 29.9 ms, 24.4 MiB | 2.8 ms, 132 KiB |
+| table resize drag | 19.7 ms | 3.8 ms |
+| table scroll | 12.0 ms, 24.4 MiB | 1.05 ms, 128 KiB |
+| dock resize | 10.8 ms | 0.64 ms |
+
+Scrolling/resizing upload ~128–300 KiB of instance/atlas data on the GPU path instead of a
+full-window pixmap; build for those cases drops from ~10–17 ms to under ~2 ms on Linux. First
+frames still hitch once (mostly atlas fill): Linux dock 6.8 / 9.2 ms and table 23.7 / 37.3 ms at
+1× / 2× (table 2× was 65 ms before). That hitch is still a virtualization/cold-cache problem.
+
+Verified drawing: Metal + MoltenVK offscreen readback and live stress on macOS. **Native Linux
+Vulkan (widgets_demo + `vk_chrome_stress` with validation) still to confirm** — bench-only so far.
 
 **Local macOS dev gotcha:** `.venv/lib/python3.14/site-packages/fastgui` is a symlink to this
 repo's `python/fastgui`, which shadows maturin's editable `.pth`. The repo's `.so` always
