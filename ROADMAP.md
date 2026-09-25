@@ -935,8 +935,8 @@ full-texture GPU upload (unmeasured) before considering partial uploads.
 the chrome perf note above, done together because each alone left the others as the floor:
 - *Shaped text cache.* Each string is shaped and rasterized once into a premultiplied RGBA run
   keyed by (text, size, box, color), then blitted. Runs unused for 120 rasterizes are evicted.
-  This is the CPU form of a glyph atlas. A GPU atlas would mean rewriting chrome as a GPU UI in
-  both backends; with repaints limited to damage it isn't needed.
+  The GPU path (below) packs these same runs into a real atlas; the CPU path blits them into the
+  retained pixmap.
 - *Dirty rects.* `rasterize` diffs a per-widget display list against the previous frame and
   repaints only changed items' old+new bounds into a retained pixmap. The key sequence changing
   (tree rebuild/rearrange), a resize, or damage over 50% of the window falls back to a full
@@ -986,12 +986,10 @@ What it says:
   needed for live-updating cells.
 - Resize barely reshapes: taffy rounds layout to whole pixels, so a 1pt resize changes only
   ~75 cells' rounded widths; the rest hit the text cache.
-- **Scroll and resize are full repaints and full uploads** — 6–7 ms of raster at 2× plus a 25 MB
-  copy to the texture (backend copy not measured). This, and the one-time ~30 ms first frame,
-  are where a GPU chrome path (or glyph atlas) would win. The cheaper fix for scroll, to build
-  into the (not yet existing) scroll container: shift the retained pixmap and texture by the
-  scroll delta and repaint only the newly exposed strip, as Qt/browsers do. The first-frame
-  hitch shrinks with virtualization (only shape visible rows).
+- **Scroll and resize were full repaints and full uploads on the CPU path** — 6–7 ms of raster at
+  2× plus a 25 MB copy. That drove the GPU compositing path below. The first-frame hitch (~30 ms
+  shaping 2,000 strings) is unchanged either way; virtualization (only shape visible rows) is
+  still the fix for that. A scroll container can still shift retained pixels on the CPU fallback.
 - Bug found by this bench: every cell moving gave ~4,000 damage rects, and the pairwise merge
   (restarts after each merge) cost more than the repaint — scroll was 3.8 ms at 1× before
   `MERGE_PAIRWISE_LIMIT` (256) made large sets take their bounding rect directly.
@@ -1001,11 +999,38 @@ What it says:
 `chrome-timing-<host>-<date>.txt` (gitignored). It needs only Rust — no GPU, display or Vulkan SDK.
 Each case gets a verdict against the frame budget: `ok` under 4.2 ms, `tight at 120 Hz` up to
 8.3 ms, `BOTTLENECK` beyond half a 60 Hz frame (the other half is left for GPU submit/present and
-Python). The `copy` column is the CPU side of the texture upload (a memcpy of the damage, which is
-what Vulkan's mapped-memory path does); GPU-side sync isn't included. On the M4 Pro, with that
-included, the one case over the line is the 2,000-cell table's drag-resize at 2× (9.2 ms); 2×
-scroll and warm resize are "tight at 120 Hz" (6.8 / 8.1 ms). The `.ps1` hasn't been run yet (written
-on a Mac without PowerShell).
+Python). Pass `cpu` or `gpu` to time one path (default is both). The `copy` column is the CPU side
+of writing where the GPU reads (texture damage, or quads + atlas uploads); GPU-side sync isn't
+included. On the M4 Pro with the CPU path, the one case over the line was the 2,000-cell table's
+drag-resize at 2× (9.2 ms); 2× scroll and warm resize were "tight at 120 Hz" (6.8 / 8.1 ms). The
+`.ps1` hasn't been run yet (written on a Mac without PowerShell).
+
+**GPU chrome compositing (display-list quads + glyph atlas).** The real fix for full-view moves:
+keep shaping/rasterizing text on the CPU (cached), pack those runs into a shelf-packed atlas, and
+each frame send the display list as instanced quads (solid rects, analytic circles, atlas sprites).
+Metal and Vulkan each got a quad pipeline; the shared app defaults to this path, with
+`FASTGUI_CHROME=cpu` as the retained-pixmap fallback and pixel reference.
+- Scrolling/resizing re-sends ~100–800 KiB of instance + atlas data instead of a 25 MB window.
+- CPU cost barely depends on screen size (build_quads + small copies); GPU draw of a few thousand
+  quads is negligible.
+- Correctness: `gpu_quads_match_cpu_painter` (CPU emulate of the shaders), plus offscreen GPU
+  readback tests on Metal and Vulkan (`metal_quads_match_cpu_painter`,
+  `vulkan_quads_match_cpu_painter`). Circles are close but not byte-identical to tiny-skia path AA;
+  text sprites match 1:1.
+- Stress: `cargo run -p fastgui-render-vk --example vk_chrome_stress` (MoltenVK on macOS needs
+  `DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib`).
+
+Measured on M4 Pro (`chrome_bench gpu` vs earlier CPU numbers for the 2,000-cell table):
+
+| per frame (table) | CPU 2× | GPU 2× |
+|---|---|---|
+| scroll | ~6–9 ms, ~25 MB upload | 0.32 ms, 128 KiB |
+| resize warm | ~8 ms, full upload | 1.28 ms, 132 KiB |
+| resize drag | ~9 ms, full upload | 2.28 ms, 787 KiB |
+| 1 cell ticks | ~0.24 ms | 0.32 ms |
+
+Scroll/resize are no longer bottlenecks on this machine. First-frame hitch (~30 ms shaping 2,000
+strings) is unchanged — still a virtualization/cold-cache problem, not a compositing one.
 
 **Local macOS dev gotcha:** `.venv/lib/python3.14/site-packages/fastgui` is a symlink to this
 repo's `python/fastgui`, which shadows maturin's editable `.pth`. The repo's `.so` always

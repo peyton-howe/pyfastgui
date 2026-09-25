@@ -18,6 +18,8 @@ pub enum MtlRendererError {
     PipelineState(String),
     #[error("failed to allocate a Metal texture")]
     NoTexture,
+    #[error("failed to allocate a Metal buffer")]
+    NoBuffer,
     #[error("failed to create a Metal sampler state")]
     NoSampler,
     #[error("failed to create a Metal command buffer")]

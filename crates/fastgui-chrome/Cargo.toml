@@ -9,3 +9,7 @@ publish.workspace = true
 fastgui-core = { path = "../fastgui-core" }
 cosmic-text = "0.14"
 tiny-skia = "0.11"
+
+[features]
+# `testing::check_gpu_backend`, the shared scenario backend GPU tests draw and compare.
+testing = []

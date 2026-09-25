@@ -19,10 +19,10 @@ CPU-bound abstraction that doesn't take advantage of the GPU already sitting in 
 fastgui instead:
 
 - Renders everything — widget chrome and arbitrary GPU/CPU frame content (`Viewport`) — through
-  a native GPU backend (Vulkan on Windows/Linux, Metal on macOS), with widget chrome rasterized
-  via `cosmic-text` + `tiny-skia` into one retained texture. Only the parts that changed are
-  repainted and uploaded, and shaped text is cached, so moving one slider costs a few small
-  blits instead of a full-window redraw.
+  a native GPU backend (Vulkan on Windows/Linux, Metal on macOS). Widget chrome is a display
+  list of quads over a glyph atlas (text still shaped once on the CPU and cached); scrolling or
+  resizing re-sends vertex data instead of a window-sized pixmap. Set `FASTGUI_CHROME=cpu` to
+  fall back to the retained-pixmap path.
 - Treats every widget mutation (`label.set_text(...)`, `slider.set_value(...)`, dragging a
   panel) as a command sent across a channel to the render thread, rather than requiring the
   caller to be "on the UI thread" — the free-threaded Python build can call into fastgui from
@@ -139,8 +139,8 @@ fire-and-forget mutations, a latest-wins mailbox for frame data, a retained-mode
 over `taffy`); `fastgui-app` owns the shared winit loop (dock/float/ghost input, multi-window
 lifecycle, command drain), generic over a `SurfaceBackend`; `fastgui-render-vk` (Windows/Linux)
 and `fastgui-render-mtl` (macOS) implement `SurfaceBackend` and provide thin `run()` wrappers;
-`fastgui-chrome` rasterizes widget chrome into a texture the active backend uploads and displays
-like any other frame; `fastgui-py` is the PyO3 layer and picks the backend with
+`fastgui-chrome` builds the chrome display list (GPU quads + atlas by default, or a retained
+CPU pixmap with `FASTGUI_CHROME=cpu`); `fastgui-py` is the PyO3 layer and picks the backend with
 `cfg(target_os = "macos")`.
 
 ## Known limitations

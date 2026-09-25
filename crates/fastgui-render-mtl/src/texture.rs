@@ -49,6 +49,25 @@ impl ViewportTexture {
         self.upload_rect(data, PixelRect { x: 0, y: 0, width: self.width, height: self.height });
     }
 
+    /// Write tightly packed RGBA8 `pixels` (`rect.width * 4` bytes per row) into `rect`, e.g. a
+    /// sprite into the chrome atlas. A rect not fully inside the texture is ignored.
+    pub fn write_region(&self, rect: PixelRect, pixels: &[u8]) {
+        debug_assert_eq!(pixels.len(), rect.area() as usize * 4);
+        if rect.is_empty() || rect.right() > self.width || rect.bottom() > self.height {
+            return;
+        }
+        let region = MTLRegion {
+            origin: MTLOrigin { x: rect.x as usize, y: rect.y as usize, z: 0 },
+            size: MTLSize { width: rect.width as usize, height: rect.height as usize, depth: 1 },
+        };
+        // SAFETY: `pixels` covers `region` at `rect.width * 4` stride for the duration of this
+        // call; `replaceRegion` copies synchronously and keeps no reference.
+        let ptr = NonNull::new(pixels.as_ptr() as *mut c_void).expect("slice pointers are never null");
+        unsafe {
+            self.texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(region, 0, ptr, rect.width as usize * 4);
+        }
+    }
+
     /// Copy just `rect` of `data` (a whole tightly packed `width`x`height` frame, same contract
     /// as `upload`) into the same rect of the texture. `rect` is clipped to the texture.
     pub fn upload_rect(&self, data: &[u8], rect: PixelRect) {

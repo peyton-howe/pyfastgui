@@ -1,26 +1,105 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
+use std::ptr::NonNull;
 
 use fastgui_core::widget::Rect;
-use fastgui_core::{ChromeFrame, CpuFrame};
+use fastgui_core::{ChromeFrame, ChromeQuads, CpuFrame};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::ClassType;
 use objc2_app_kit::NSView;
 use objc2_foundation::CGSize;
 use objc2_metal::{
-    MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
-    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLScissorRect, MTLStoreAction, MTLViewport,
+    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLResourceOptions, MTLScissorRect, MTLStoreAction,
+    MTLViewport,
 };
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
 
 use crate::error::MtlRendererError as Error;
-use crate::pipeline::ViewportPipeline;
+use crate::pipeline::{QuadPipeline, ViewportPipeline};
 use crate::texture::ViewportTexture;
 
 struct SampledLayer {
     texture: ViewportTexture,
+}
+
+/// Chrome as GPU draw data (`set_chrome_quads`): the instance buffer and the atlas it samples.
+pub(crate) struct QuadChrome {
+    /// `None` when there are no quads.
+    instances: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    count: usize,
+    atlas: ViewportTexture,
+    /// Physical size the quads were built for (their coordinate space).
+    width: u32,
+    height: u32,
+}
+
+impl QuadChrome {
+    /// Apply `frame` on top of `previous` (reusing its atlas when the size matches, so earlier
+    /// uploads stay valid).
+    pub(crate) fn update(
+        device: &ProtocolObject<dyn MTLDevice>,
+        previous: Option<QuadChrome>,
+        frame: &ChromeQuads<'_>,
+    ) -> Result<Self, Error> {
+        let atlas = match previous {
+            Some(chrome) if chrome.atlas.width == frame.atlas_size => chrome.atlas,
+            _ => ViewportTexture::new(device, frame.atlas_size, frame.atlas_size)?,
+        };
+        for upload in &frame.atlas_uploads {
+            atlas.write_region(upload.rect, upload.pixels);
+        }
+        let instances = if frame.quads.is_empty() {
+            None
+        } else {
+            let bytes = std::mem::size_of_val(frame.quads);
+            // SAFETY: `frame.quads` is `bytes` long and only read during this call (the buffer is
+            // a copy). `ChromeQuad` is `#[repr(C)]`, matching the shader's `Quad` layout.
+            let ptr = NonNull::new(frame.quads.as_ptr() as *mut c_void).expect("slice pointers are never null");
+            let buffer = unsafe {
+                device.newBufferWithBytes_length_options(ptr, bytes, MTLResourceOptions::MTLResourceStorageModeShared)
+            };
+            Some(buffer.ok_or(Error::NoBuffer)?)
+        };
+        Ok(Self { instances, count: frame.quads.len(), atlas, width: frame.width, height: frame.height })
+    }
+
+    /// One instanced draw of every quad (a 4-vertex strip per instance) into a `target_width` x
+    /// `target_height` attachment, in the quads' own pixel space.
+    pub(crate) fn encode(
+        &self,
+        encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+        pipeline: &QuadPipeline,
+        target_width: u32,
+        target_height: u32,
+    ) {
+        let Some(instances) = &self.instances else { return };
+        encoder.setRenderPipelineState(pipeline.state());
+        encoder.setViewport(MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: target_width as f64,
+            height: target_height as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        encoder.setScissorRect(MTLScissorRect { x: 0, y: 0, width: target_width as usize, height: target_height as usize });
+        let size = [self.width as f32, self.height as f32];
+        unsafe {
+            encoder.setVertexBuffer_offset_atIndex(Some(instances), 0, 0);
+            encoder.setVertexBytes_length_atIndex(NonNull::from(&size).cast(), std::mem::size_of_val(&size), 1);
+            encoder.setFragmentTexture_atIndex(Some(&self.atlas.texture), 0);
+            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                MTLPrimitiveType::TriangleStrip,
+                0,
+                4,
+                self.count,
+            );
+        }
+    }
 }
 
 /// Clears the layer to a solid color every frame and, once a viewport source has content, draws
@@ -33,7 +112,12 @@ pub struct MetalRenderer {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipeline: ViewportPipeline,
+    quad_pipeline: QuadPipeline,
+    /// CPU-rasterized chrome (`set_chrome_frame`); cleared when quads are set, and vice versa.
     chrome: Option<SampledLayer>,
+    quad_chrome: Option<QuadChrome>,
+    /// The last submitted frame, waited on before a repacked atlas is overwritten.
+    last_commands: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     /// GPU textures for in-tree `Viewport` widgets, keyed by the stable `viewport_id`.
     layers: HashMap<u64, SampledLayer>,
     width: u32,
@@ -81,6 +165,7 @@ impl MetalRenderer {
         }
 
         let pipeline = ViewportPipeline::new(&device, MTLPixelFormat::BGRA8Unorm)?;
+        let quad_pipeline = QuadPipeline::new(&device, MTLPixelFormat::BGRA8Unorm)?;
 
         let mut renderer = Self {
             view,
@@ -88,7 +173,10 @@ impl MetalRenderer {
             device,
             queue,
             pipeline,
+            quad_pipeline,
             chrome: None,
+            quad_chrome: None,
+            last_commands: None,
             layers: HashMap::new(),
             width,
             height,
@@ -117,9 +205,23 @@ impl MetalRenderer {
         Ok(())
     }
 
+    /// Take the chrome as quads + atlas uploads (see `fastgui_chrome::ChromeRenderer::build_quads`).
+    pub fn set_chrome_quads(&mut self, frame: &ChromeQuads<'_>) -> Result<(), Error> {
+        self.chrome = None;
+        if frame.atlas_repacked {
+            // Slots are being reused: let the frame that may still sample the old layout finish.
+            if let Some(commands) = &self.last_commands {
+                unsafe { commands.waitUntilCompleted() };
+            }
+        }
+        self.quad_chrome = Some(QuadChrome::update(&self.device, self.quad_chrome.take(), frame)?);
+        Ok(())
+    }
+
     /// Copies only `frame.damage` when the existing texture already holds the previous frame
     /// at this size; see `SurfaceBackend::set_chrome_frame`.
     pub fn set_chrome_frame(&mut self, frame: &ChromeFrame<'_>) -> Result<(), Error> {
+        self.quad_chrome = None;
         match (&self.chrome, frame.damage) {
             (Some(SampledLayer { texture }), Some(damage))
                 if texture.width == frame.width && texture.height == frame.height =>
@@ -208,14 +310,12 @@ impl MetalRenderer {
             .renderCommandEncoderWithDescriptor(&pass)
             .ok_or(Error::NoEncoder)?;
 
-        let bind_pipeline = (draw_chrome && self.chrome.is_some())
-            || viewports.iter().any(|(id, _)| self.layers.contains_key(id));
-        if bind_pipeline {
-            encoder.setRenderPipelineState(self.pipeline.state());
-        }
-
         if draw_chrome {
+            if let Some(chrome) = &self.quad_chrome {
+                chrome.encode(&encoder, &self.quad_pipeline, self.width, self.height);
+            }
             if let Some(chrome) = &self.chrome {
+                encoder.setRenderPipelineState(self.pipeline.state());
                 self.draw_sampled(
                     &encoder,
                     chrome,
@@ -236,6 +336,9 @@ impl MetalRenderer {
                 );
             }
         }
+        if viewports.iter().any(|(id, _)| self.layers.contains_key(id)) {
+            encoder.setRenderPipelineState(self.pipeline.state());
+        }
         for (viewport_id, rect) in viewports {
             let Some(layer) = self.layers.get(viewport_id) else { continue };
             let Some((viewport, scissor)) = widget_rect_to_mtl(*rect, self.width, self.height)
@@ -248,6 +351,7 @@ impl MetalRenderer {
         encoder.endEncoding();
         command_buffer.presentDrawable(ProtocolObject::from_ref(&*drawable));
         command_buffer.commit();
+        self.last_commands = Some(command_buffer);
         Ok(())
     }
 
@@ -317,6 +421,10 @@ impl fastgui_app::SurfaceBackend for MetalRenderer {
 
     fn set_chrome_frame(&mut self, frame: &ChromeFrame<'_>) -> Result<(), Self::Error> {
         MetalRenderer::set_chrome_frame(self, frame)
+    }
+
+    fn set_chrome_quads(&mut self, frame: &ChromeQuads<'_>) -> Result<(), Self::Error> {
+        MetalRenderer::set_chrome_quads(self, frame)
     }
 
     fn set_layer_frame(&mut self, viewport_id: u64, frame: CpuFrame) -> Result<(), Self::Error> {

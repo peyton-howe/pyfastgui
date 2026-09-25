@@ -1,24 +1,28 @@
-//! Widget chrome rasterizer: `cosmic-text` for shaping/layout, `tiny-skia` for CPU
-//! rasterization into a retained window-sized RGBA8 buffer, which the backends upload through
-//! the same CPU-texture path `Viewport.submit_frame` uses.
+//! Widget chrome: a display list of solid rects, circles, and cached text-run sprites.
 //!
-//! Three things keep a mostly-static UI cheap to redraw:
-//! - **Display list + diff.** Each `rasterize` turns the tree into a flat list of draw ops per
-//!   widget and compares it with the previous frame's list. Only the pixel bounds of widgets
-//!   whose ops changed (old and new position) are repainted, and only those rects are reported
-//!   as `ChromeFrame::damage` so the backend uploads just them.
-//! - **Text run cache.** A string is shaped and rasterized once into a small premultiplied
-//!   RGBA run, keyed by (text, size, box, color); after that, drawing it is a blit. Unchanged
-//!   labels are never reshaped, and outside the damaged rects not even blitted.
-//! - **Retained frame.** The buffer persists between frames, so repainting a damaged rect
-//!   redraws only the widgets overlapping it, clipped to it.
+//! Two draw paths share that list:
+//! - **GPU (default in the app).** `build_quads` packs text-run sprites into a glyph atlas and
+//!   emits instanced quads. Metal and Vulkan composite them; scrolling/resizing re-sends a few
+//!   hundred KB of vertex data instead of a window-sized pixmap. Text is still shaped and
+//!   rasterized on the CPU once per string (the text-run cache).
+//! - **CPU (fallback, `FASTGUI_CHROME=cpu`).** `rasterize` paints into a retained window-sized
+//!   RGBA8 buffer with dirty-rect diffs and partial upload — also the pixel reference the GPU
+//!   path is compared against in tests.
 //!
-//! Glyphs stay on the CPU deliberately rather than in a GPU atlas: with the two points above,
-//! a small change costs a few blits plus a small upload, without a second UI rendering path
-//! in each backend.
+//! Shared pieces that keep both paths cheap:
+//! - **Display list + diff.** Each frame builds per-widget ops and compares with the previous
+//!   list. The CPU path repaints only changed bounds; the GPU path re-emits quads when ops
+//!   change (and skips the frame when nothing did).
+//! - **Text run cache.** A string is shaped and rasterized once into a premultiplied RGBA run,
+//!   keyed by (text, size, box, color). Unchanged labels are never reshaped.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+
+mod gpu;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 use cosmic_text::{Attrs, Buffer, Color as CosmicColor, FontSystem, Metrics, Shaping, SwashCache};
 use fastgui_core::widget::{Color, DropZone, WidgetKind, WidgetTree};
@@ -65,6 +69,8 @@ pub struct ChromeRenderer {
     items: Vec<Item>,
     /// Backing storage for the last returned `ChromeFrame::damage`.
     damage: Vec<PixelRect>,
+    /// State of the GPU path (`build_quads`); the CPU path (`rasterize`) doesn't touch it.
+    gpu: gpu::GpuState,
 }
 
 impl ChromeRenderer {
@@ -76,14 +82,18 @@ impl ChromeRenderer {
             frame: None,
             items: Vec::new(),
             damage: Vec::new(),
+            gpu: gpu::GpuState::default(),
         }
     }
 
     /// Forget the retained frame, so the next `rasterize` repaints everything and reports it as
-    /// fully damaged (a full upload). Call when the backend's chrome texture was lost.
+    /// fully damaged (a full upload), and the next `build_quads` re-sends every quad and
+    /// re-uploads a fresh atlas. Call when the backend's chrome texture or atlas was lost.
     pub fn invalidate(&mut self) {
         self.frame = None;
         self.items.clear();
+        self.gpu.force = true;
+        self.gpu.atlas = gpu::Atlas::default();
     }
 
     /// Rasterize `tree` (whose layout must already be up to date — call
@@ -330,9 +340,9 @@ impl Default for ChromeRenderer {
 /// differently at different magnitudes, so it's rasterized once into a `Sprite` and blitted.
 enum Op {
     Fill { left: f32, top: f32, right: f32, bottom: f32, color: Color },
-    /// `sprite` is the circle pre-rasterized at its whole-pixel position; the parameters are
-    /// only compared.
-    Circle { cx: f32, cy: f32, radius: f32, color: Color, sprite: Arc<Sprite> },
+    /// `sprite` is the circle rasterized at its whole-pixel position, made on first CPU paint
+    /// (the GPU path draws the circle analytically instead); only the parameters are compared.
+    Circle { cx: f32, cy: f32, radius: f32, color: Color, sprite: OnceLock<Sprite> },
     /// `(x, y)` is the text box's snapped origin; the run's own offset is relative to it.
     Text { run: Arc<Sprite>, x: i32, y: i32 },
 }
@@ -370,7 +380,8 @@ impl Op {
         };
         match self {
             Op::Fill { left, top, right, bottom, .. } => pixel_bounds(*left, *top, *right, *bottom, window),
-            Op::Circle { sprite, .. } => sprite_bounds(sprite, 0, 0),
+            // Same extent `Sprite::circle` covers.
+            Op::Circle { cx, cy, radius, .. } => pixel_bounds(cx - radius, cy - radius, cx + radius, cy + radius, window),
             Op::Text { run, x, y } => sprite_bounds(run, *x, *y),
         }
     }
@@ -464,7 +475,10 @@ fn paint(target: &mut Pixmap, items: &[Item], clip: PixelRect) {
                     let (l, t) = ((left - dx).max(-1.0), (top - dy).max(-1.0));
                     fill_rect(target, l, t, right - dx, bottom - dy, *color);
                 }
-                Op::Circle { sprite, .. } => blit_sprite(target, sprite, sprite.x - ox, sprite.y - oy),
+                Op::Circle { cx, cy, radius, color, sprite } => {
+                    let sprite = sprite.get_or_init(|| Sprite::circle(*cx, *cy, *radius, *color));
+                    blit_sprite(target, sprite, sprite.x - ox, sprite.y - oy);
+                }
                 Op::Text { run, x, y } => blit_sprite(target, run, x + run.x - ox, y + run.y - oy),
             }
         }
@@ -486,6 +500,9 @@ fn copy_patch(frame: &mut Pixmap, patch: &Pixmap, rect: PixelRect) {
 /// origin (the run covers exactly the glyphs' ink); for a circle, the window origin.
 #[derive(Default)]
 struct Sprite {
+    /// Unique per sprite (0 only for empty ones), so the GPU atlas can track which sprites it
+    /// already holds without keeping them alive.
+    id: u64,
     x: i32,
     y: i32,
     width: u32,
@@ -502,7 +519,7 @@ impl Sprite {
         let (width, height) = ((x1 - x0).max(1) as u32, (y1 - y0).max(1) as u32);
         let Some(mut pixmap) = Pixmap::new(width, height) else { return Self::default() };
         fill_circle(&mut pixmap, cx - x0 as f32, cy - y0 as f32, radius, color);
-        Self { x: x0, y: y0, width, height, pixels: pixmap.take() }
+        Self { id: next_sprite_id(), x: x0, y: y0, width, height, pixels: pixmap.take() }
     }
 
     fn shape(
@@ -541,7 +558,7 @@ impl Sprite {
                 }
             }
         }
-        Self { x: x0, y: y0, width, height, pixels }
+        Self { id: next_sprite_id(), x: x0, y: y0, width, height, pixels }
     }
 }
 
@@ -620,8 +637,7 @@ fn push_slider(
 
     let fraction = if max > min { ((value - min) / (max - min)).clamp(0.0, 1.0) } else { 0.0 };
     let (cx, cy, radius) = (rect.x + fraction * rect.width, rect.y + rect.height / 2.0, SLIDER_THUMB_RADIUS * scale);
-    let sprite = Arc::new(Sprite::circle(cx, cy, radius, thumb_color));
-    ops.push(Op::Circle { cx, cy, radius, color: thumb_color, sprite });
+    ops.push(Op::Circle { cx, cy, radius, color: thumb_color, sprite: OnceLock::new() });
 }
 
 fn push_fill(ops: &mut Vec<Op>, rect: WidgetRect, color: Color) {
@@ -698,6 +714,11 @@ fn blit_sprite(pixmap: &mut Pixmap, run: &Sprite, x: i32, y: i32) {
             }
         }
     }
+}
+
+fn next_sprite_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 fn mul_u8(x: u8, y: u8) -> u8 {

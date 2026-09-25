@@ -81,6 +81,50 @@ pub struct ChromeFrame<'a> {
     pub damage: Option<&'a [PixelRect]>,
 }
 
+/// `ChromeQuad::kind`: a solid rect. `rect` is its exact (fractional) edges; the shader gives
+/// edge pixels their covered fraction, the same box-filter coverage tiny-skia's CPU fill uses.
+pub const QUAD_SOLID: u32 = 0;
+/// `ChromeQuad::kind`: a filled circle, `params = [cx, cy, radius, _]`; `rect` is its bounds.
+pub const QUAD_CIRCLE: u32 = 1;
+/// `ChromeQuad::kind`: premultiplied RGBA pixels from the chrome atlas, copied 1:1. `rect` is
+/// the whole-pixel destination and `params = [atlas_x, atlas_y, _, _]` its source origin.
+pub const QUAD_SPRITE: u32 = 2;
+
+/// One instance of the chrome's instanced quad draw, in physical pixels, top-left origin.
+/// `#[repr(C)]` and 64 bytes: backends upload the slice as-is as instance data.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ChromeQuad {
+    /// `[left, top, right, bottom]`.
+    pub rect: [f32; 4],
+    /// Straight (not premultiplied) RGBA; unused for sprites.
+    pub color: [f32; 4],
+    pub params: [f32; 4],
+    pub kind: u32,
+    pub _pad: [u32; 3],
+}
+
+/// Pixels to write into the chrome atlas texture before drawing: `pixels` is premultiplied
+/// RGBA8, tightly packed (`rect.width * 4` bytes per row).
+pub struct AtlasUpload<'a> {
+    pub rect: PixelRect,
+    pub pixels: &'a [u8],
+}
+
+/// The chrome as GPU draw data: quads in paint order over one `atlas_size`² RGBA8 atlas.
+/// When `atlas_size` differs from the backend's current atlas (first frame, growth), the backend
+/// makes a fresh atlas; `atlas_uploads` then covers every sprite `quads` uses.
+pub struct ChromeQuads<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub quads: &'a [ChromeQuad],
+    pub atlas_size: u32,
+    /// The atlas was repacked from scratch, so uploads may overwrite slots that quads already
+    /// in flight on the GPU still sample: wait for the GPU before writing them.
+    pub atlas_repacked: bool,
+    pub atlas_uploads: Vec<AtlasUpload<'a>>,
+}
+
 /// A single "latest frame wins" mailbox: a fast producer thread submits frames without ever
 /// blocking on (or queueing behind) the render thread's cadence, and the render thread picks
 /// up whatever is newest — dropping any frame that arrived and was overwritten before it got

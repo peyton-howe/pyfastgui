@@ -15,3 +15,6 @@ ash-window = "0.13"
 raw-window-handle = "0.6"
 winit = "0.30"
 thiserror = "2"
+
+[dev-dependencies]
+fastgui-chrome = { path = "../fastgui-chrome", features = ["testing"] }

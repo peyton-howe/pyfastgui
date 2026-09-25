@@ -6,11 +6,18 @@
 //! / `scripts/chrome-timing.ps1`, which also record the CPU and save the output). CPU-only: no
 //! GPU, window, or Vulkan SDK needed, so it runs on any machine with a Rust toolchain.
 //!
-//! Per frame: `layout` is `WidgetTree::compute_layout` (taffy), `raster` is
-//! `ChromeRenderer::rasterize`, `copy` is the CPU cost of writing the frame's damage into a
-//! texture-sized buffer — what the Vulkan backend's mapped-memory upload does, and a close
-//! stand-in for Metal's `replaceRegion` on shared storage (GPU-side sync is not included).
-//! `upload` is the bytes copied. `total` is compared with 60 Hz / 120 Hz frame budgets.
+//! Every scenario runs down both chrome paths (pass `cpu` or `gpu` to run just one):
+//! - `cpu`: `ChromeRenderer::rasterize` paints pixels (damage only) that are uploaded as a texture
+//!   (`FASTGUI_CHROME=cpu` in the app).
+//! - `gpu`: `ChromeRenderer::build_quads` emits quads + new glyph-atlas sprites that the GPU
+//!   composites (the app's default).
+//!
+//! Per frame: `layout` is `WidgetTree::compute_layout` (taffy); `build` is `rasterize` or
+//! `build_quads`; `copy` is the CPU cost of writing the result where the GPU reads it (texture
+//! damage, or quads + atlas uploads) — what the Vulkan backend's mapped-memory writes do, and a
+//! close stand-in for Metal's shared-storage writes. GPU execution time is not included (a few
+//! thousand quads is negligible GPU work). `upload` is the bytes copied. `total` is compared
+//! with 60 Hz / 120 Hz frame budgets.
 //!
 //! Dock scene:
 //! - `slider drag`: one slider value + its readout label change per frame — the common
@@ -33,7 +40,7 @@ use std::time::Instant;
 use fastgui_chrome::ChromeRenderer;
 use fastgui_core::taffy::prelude::*;
 use fastgui_core::widget::{Color, WidgetId, WidgetKind, WidgetTree};
-use fastgui_core::{ChromeFrame, PixelRect};
+use fastgui_core::{ChromeFrame, ChromeQuad, ChromeQuads, PixelRect};
 
 const PANELS: usize = 6;
 const LABELS_PER_PANEL: usize = 12;
@@ -213,32 +220,83 @@ struct Sample {
     bytes: u64,
 }
 
-/// A window's chrome state: the renderer plus a stand-in for its GPU texture.
-struct Target {
-    chrome: ChromeRenderer,
-    texture: Vec<u8>,
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Cpu,
+    Gpu,
 }
 
-impl Target {
-    fn new() -> Self {
-        Self { chrome: ChromeRenderer::new(), texture: Vec::new() }
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Cpu => "cpu",
+            Mode::Gpu => "gpu",
+        }
     }
 }
 
-/// One frame the way `fastgui-app` does it: layout at `logical` size, rasterize at `scale`,
-/// then copy what changed into the texture.
+/// A window's chrome state: the renderer plus stand-ins for what the GPU reads.
+struct Target {
+    mode: Mode,
+    chrome: ChromeRenderer,
+    /// CPU path: the chrome texture.
+    texture: Vec<u8>,
+    /// GPU path: the instance buffer and the glyph atlas.
+    instances: Vec<ChromeQuad>,
+    atlas: Vec<u8>,
+}
+
+impl Target {
+    fn new(mode: Mode) -> Self {
+        Self { mode, chrome: ChromeRenderer::new(), texture: Vec::new(), instances: Vec::new(), atlas: Vec::new() }
+    }
+}
+
+/// Write quads and new atlas sprites where the GPU would read them. Returns bytes copied.
+fn copy_quads(frame: Option<ChromeQuads<'_>>, instances: &mut Vec<ChromeQuad>, atlas: &mut Vec<u8>) -> u64 {
+    let Some(frame) = frame else { return 0 };
+    instances.clear();
+    instances.extend_from_slice(frame.quads);
+    let side = frame.atlas_size as usize;
+    if atlas.len() != side * side * 4 {
+        *atlas = vec![0; side * side * 4];
+    }
+    let mut bytes = std::mem::size_of_val(frame.quads) as u64;
+    for upload in &frame.atlas_uploads {
+        let row = upload.rect.width as usize * 4;
+        for (dy, src) in upload.pixels.chunks_exact(row).enumerate() {
+            let start = (upload.rect.y as usize + dy) * side * 4 + upload.rect.x as usize * 4;
+            atlas[start..start + row].copy_from_slice(src);
+        }
+        bytes += upload.pixels.len() as u64;
+    }
+    black_box(&atlas);
+    bytes
+}
+
+/// One frame the way `fastgui-app` does it: layout at `logical` size, build the chrome at
+/// `scale` down the target's path, then copy what changed to where the GPU reads it.
 fn frame(tree: &mut WidgetTree, target: &mut Target, logical: (f32, f32), scale: f32) -> Sample {
     let start = Instant::now();
     tree.compute_layout(logical.0, logical.1);
     let laid_out = Instant::now();
     let (pw, ph) = ((logical.0 * scale) as u32, (logical.1 * scale) as u32);
-    let frame = black_box(target.chrome.rasterize(tree, pw, ph, None, scale));
-    let rastered = Instant::now();
-    let bytes = copy_to_texture(frame, &mut target.texture);
+    let (built, bytes) = match target.mode {
+        Mode::Cpu => {
+            let frame = black_box(target.chrome.rasterize(tree, pw, ph, None, scale));
+            let built = Instant::now();
+            (built, copy_to_texture(frame, &mut target.texture))
+        }
+        Mode::Gpu => {
+            let frame = black_box(target.chrome.build_quads(tree, pw, ph, None, scale));
+            let built = Instant::now();
+            (built, copy_quads(frame, &mut target.instances, &mut target.atlas))
+        }
+    };
     Sample {
         layout: (laid_out - start).as_secs_f64() * 1e3,
-        raster: (rastered - laid_out).as_secs_f64() * 1e3,
-        copy: rastered.elapsed().as_secs_f64() * 1e3,
+        raster: (built - laid_out).as_secs_f64() * 1e3,
+        copy: built.elapsed().as_secs_f64() * 1e3,
         bytes,
     }
 }
@@ -249,7 +307,7 @@ const BUDGET_120HZ_MS: f64 = 1000.0 / 120.0;
 fn print_header() {
     println!(
         "  {:<14} {:>9} {:>9} {:>9} {:>9} {:>11}  {:>6}  verdict",
-        "", "layout ms", "raster ms", "copy ms", "total ms", "upload KiB", "%60Hz"
+        "", "layout ms", "build ms", "copy ms", "total ms", "upload KiB", "%60Hz"
     );
 }
 
@@ -301,94 +359,116 @@ fn time(label: &str, frames: usize, worst: &mut Vec<(String, f64)>, mut run: imp
     print_sample(label, &avg, false, worst);
 }
 
-fn main() {
+fn run_dock(mode: Mode, scale: f32, worst: &mut Vec<(String, f64)>) {
+    let size = (1280.0f32, 800.0f32);
     println!(
-        "fastgui chrome_bench — {} {}, {} threads available (chrome renders on one), {} build",
+        "\ndock scene, {} path, scale {scale}× ({}×{} px)",
+        mode.name(),
+        (size.0 * scale) as u32,
+        (size.1 * scale) as u32
+    );
+    print_header();
+    let Demo { mut tree, slider, readout } = build();
+    let mut target = Target::new(mode);
+    print_sample("first frame", &frame(&mut tree, &mut target, size, scale), true, worst);
+    time("slider drag", 200, worst, |i| {
+        let value = (i % 100) as f32 / 100.0;
+        tree.mutate_kind(slider, |kind| {
+            if let WidgetKind::Slider { value: v, .. } = kind {
+                *v = value;
+            }
+        });
+        set_label(&mut tree, readout, format!("Step: {value:.2}"));
+        frame(&mut tree, &mut target, size, scale)
+    });
+    time("resize", 50, worst, |i| frame(&mut tree, &mut target, (size.0 - (i % 2) as f32, size.1), scale));
+    tag_scale(worst, "dock", scale);
+}
+
+fn run_table(mode: Mode, scale: f32, worst: &mut Vec<(String, f64)>) {
+    let size = (1600.0f32, 1000.0f32);
+    println!(
+        "\ntable scene ({} cells), {} path, scale {scale}× ({}×{} px)",
+        TABLE_ROWS * TABLE_COLS,
+        mode.name(),
+        (size.0 * scale) as u32,
+        (size.1 * scale) as u32
+    );
+    print_header();
+    let Table { mut tree, spacer, cells } = build_table();
+    let mut target = Target::new(mode);
+    print_sample("first frame", &frame(&mut tree, &mut target, size, scale), true, worst);
+    let mut tick = 0u64;
+    time("1 cell ticks", 100, worst, |_| {
+        tick += 1;
+        set_label(&mut tree, cells[TABLE_COLS + 3], format!("{:.2}", tick as f64 * 0.37));
+        frame(&mut tree, &mut target, size, scale)
+    });
+    time("50 cells tick", 100, worst, |_| {
+        tick += 1;
+        for (k, &cell) in cells.iter().step_by(TABLE_COLS).enumerate() {
+            set_label(&mut tree, cell, format!("{:.2}", (tick * 50 + k as u64) as f64 * 0.37));
+        }
+        frame(&mut tree, &mut target, size, scale)
+    });
+    time("scroll", 50, worst, |i| {
+        tree.set_style(
+            spacer,
+            Style {
+                size: Size { width: Dimension::auto(), height: length((i % 20) as f32) },
+                flex_shrink: 0.0,
+                ..Default::default()
+            },
+        );
+        frame(&mut tree, &mut target, size, scale)
+    });
+    time("resize warm", 50, worst, |i| frame(&mut tree, &mut target, (size.0 - (i % 2) as f32, size.1), scale));
+    time("resize drag", 50, worst, |i| frame(&mut tree, &mut target, (size.0 - 2.0 - i as f32, size.1), scale));
+    tag_scale(worst, "table", scale);
+}
+
+fn main() {
+    let modes = match std::env::args().nth(1).as_deref() {
+        Some("cpu") => vec![Mode::Cpu],
+        Some("gpu") => vec![Mode::Gpu],
+        _ => vec![Mode::Cpu, Mode::Gpu],
+    };
+    println!(
+        "fastgui chrome_bench — {} {}, {} threads available (chrome builds on one), {} build",
         std::env::consts::OS,
         std::env::consts::ARCH,
         std::thread::available_parallelism().map_or(0, |n| n.get()),
         if cfg!(debug_assertions) { "DEBUG (numbers meaningless — use --release)" } else { "release" },
     );
-    println!("verdicts: ok < 4.2 ms < tight at 120 Hz < 8.3 ms < BOTTLENECK (half a 60 Hz frame)\n");
-    let mut worst = Vec::new();
+    println!("verdicts: ok < 4.2 ms < tight at 120 Hz < 8.3 ms < BOTTLENECK (half a 60 Hz frame)");
 
-    for scale in [1.0f32, 2.0] {
-        let size = (1280.0f32, 800.0f32);
-        println!("dock scene, scale {scale}× ({}×{} px)", (size.0 * scale) as u32, (size.1 * scale) as u32);
-        print_header();
-        let Demo { mut tree, slider, readout } = build();
-        let mut target = Target::new();
-        print_sample("first frame", &frame(&mut tree, &mut target, size, scale), true, &mut worst);
-        time("slider drag", 200, &mut worst, |i| {
-            let value = (i % 100) as f32 / 100.0;
-            tree.mutate_kind(slider, |kind| {
-                if let WidgetKind::Slider { value: v, .. } = kind {
-                    *v = value;
-                }
-            });
-            set_label(&mut tree, readout, format!("Step: {value:.2}"));
-            frame(&mut tree, &mut target, size, scale)
-        });
-        time("resize", 50, &mut worst, |i| frame(&mut tree, &mut target, (size.0 - (i % 2) as f32, size.1), scale));
-        tag_scale(&mut worst, "dock", scale);
+    let mut results = Vec::new();
+    for &mode in &modes {
+        let mut worst = Vec::new();
+        for scale in [1.0f32, 2.0] {
+            run_dock(mode, scale, &mut worst);
+        }
+        for scale in [1.0f32, 2.0] {
+            run_table(mode, scale, &mut worst);
+        }
+        worst.sort_by(|a, b| b.1.total_cmp(&a.1));
+        results.push((mode, worst));
     }
 
-    for scale in [1.0f32, 2.0] {
-        let size = (1600.0f32, 1000.0f32);
-        println!(
-            "\ntable scene ({} cells), scale {scale}× ({}×{} px)",
-            TABLE_ROWS * TABLE_COLS,
-            (size.0 * scale) as u32,
-            (size.1 * scale) as u32
-        );
-        print_header();
-        let Table { mut tree, spacer, cells } = build_table();
-        let mut target = Target::new();
-        print_sample("first frame", &frame(&mut tree, &mut target, size, scale), true, &mut worst);
-        let mut tick = 0u64;
-        time("1 cell ticks", 100, &mut worst, |_| {
-            tick += 1;
-            set_label(&mut tree, cells[TABLE_COLS + 3], format!("{:.2}", tick as f64 * 0.37));
-            frame(&mut tree, &mut target, size, scale)
-        });
-        time("50 cells tick", 100, &mut worst, |_| {
-            tick += 1;
-            for (k, &cell) in cells.iter().step_by(TABLE_COLS).enumerate() {
-                set_label(&mut tree, cell, format!("{:.2}", (tick * 50 + k as u64) as f64 * 0.37));
-            }
-            frame(&mut tree, &mut target, size, scale)
-        });
-        time("scroll", 50, &mut worst, |i| {
-            tree.set_style(
-                spacer,
-                Style {
-                    size: Size { width: Dimension::auto(), height: length((i % 20) as f32) },
-                    flex_shrink: 0.0,
-                    ..Default::default()
-                },
-            );
-            frame(&mut tree, &mut target, size, scale)
-        });
-        time("resize warm", 50, &mut worst, |i| frame(&mut tree, &mut target, (size.0 - (i % 2) as f32, size.1), scale));
-        time("resize drag", 50, &mut worst, |i| {
-            frame(&mut tree, &mut target, (size.0 - 2.0 - i as f32, size.1), scale)
-        });
-        tag_scale(&mut worst, "table", scale);
+    for (mode, worst) in &results {
+        println!("\n{} path, slowest per-frame cases:", mode.name());
+        for (label, total) in worst.iter().take(3) {
+            println!("  {label:<26} {total:7.3} ms  ({:.0}% of a 60 Hz frame)", total / BUDGET_60HZ_MS * 100.0);
+        }
     }
-
-    worst.sort_by(|a, b| b.1.total_cmp(&a.1));
-    println!("\nslowest per-frame cases:");
-    for (label, total) in worst.iter().take(3) {
-        println!("  {label:<26} {total:7.3} ms  ({:.0}% of a 60 Hz frame)", total / BUDGET_60HZ_MS * 100.0);
-    }
-    let over: Vec<_> = worst.iter().filter(|(_, t)| *t > BUDGET_60HZ_MS * 0.5).collect();
-    if over.is_empty() {
-        println!("\nresult: CPU chrome is not a bottleneck on this machine (every case < half a 60 Hz frame).");
-    } else {
-        println!(
-            "\nresult: CPU chrome IS a bottleneck here for: {}",
-            over.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(", ")
-        );
+    println!();
+    for (mode, worst) in &results {
+        let over: Vec<_> = worst.iter().filter(|(_, t)| *t > BUDGET_60HZ_MS * 0.5).map(|(l, _)| l.as_str()).collect();
+        if over.is_empty() {
+            println!("result ({} path): not a bottleneck on this machine (every case < half a 60 Hz frame).", mode.name());
+        } else {
+            println!("result ({} path): BOTTLENECK here for: {}", mode.name(), over.join(", "));
+        }
     }
 }
 

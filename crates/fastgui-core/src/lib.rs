@@ -12,7 +12,10 @@ mod queue;
 mod readback;
 pub mod widget;
 
-pub use frame::{ChromeFrame, CpuFrame, FrameSlot, PixelFormat, PixelRect};
+pub use frame::{
+    AtlasUpload, ChromeFrame, ChromeQuad, ChromeQuads, CpuFrame, FrameSlot, PixelFormat, PixelRect, QUAD_CIRCLE,
+    QUAD_SOLID, QUAD_SPRITE,
+};
 pub use queue::{command_channel, oneshot_channel, CommandReceiver, CommandSender, OneshotReceiver, OneshotSender};
 pub use readback::Readback;
 

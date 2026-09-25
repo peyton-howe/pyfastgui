@@ -122,6 +122,20 @@ impl ViewportTexture {
         }
     }
 
+    /// Write tightly packed RGBA8 `pixels` (`rect.width * 4` bytes per row) into `rect`, e.g. a
+    /// sprite into the chrome atlas. A rect not fully inside the image is ignored.
+    pub unsafe fn write_region(&self, rect: PixelRect, pixels: &[u8]) {
+        debug_assert_eq!(pixels.len(), rect.area() as usize * 4);
+        if rect.is_empty() || rect.right() > self.width || rect.bottom() > self.height {
+            return;
+        }
+        let row_bytes = rect.width as usize * 4;
+        for (dy, src) in pixels.chunks_exact(row_bytes).enumerate() {
+            let dst = self.mapped.add((rect.y as usize + dy) * self.row_pitch as usize + rect.x as usize * 4);
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst, row_bytes);
+        }
+    }
+
     pub unsafe fn destroy(&self, device: &Device) {
         device.destroy_image_view(self.view, None);
         device.unmap_memory(self.memory);
@@ -130,7 +144,7 @@ impl ViewportTexture {
     }
 }
 
-fn find_memory_type_index(
+pub(crate) fn find_memory_type_index(
     properties: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
     flags: vk::MemoryPropertyFlags,

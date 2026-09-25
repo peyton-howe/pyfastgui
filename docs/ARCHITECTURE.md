@@ -33,28 +33,29 @@ crates/
                               pass/framebuffer objects)
     src/app.rs                run() → fastgui_app::run::<VulkanRenderer>(…, Debounced)
     src/pipeline.rs           ViewportPipeline: fullscreen-triangle shaders + descriptor set
+    src/quad.rs               QuadPipeline + QuadChrome (atlas + instance buffers)
     src/texture.rs            ViewportTexture: host-visible LINEAR CPU-upload texture
     src/cuda_texture.rs       CudaSharedTexture: exportable image + timeline semaphore (CUDA
                               interop, see below); re-exports CudaExportHandles from fastgui-app
-    shaders/                  viewport.vert/.frag source + precompiled .spv (checked in, so a
-                              plain build doesn't need the Vulkan SDK)
+    shaders/                  viewport + quad .vert/.frag source + precompiled .spv (checked in,
+                              so a plain build doesn't need the Vulkan SDK)
 
   fastgui-render-mtl/     The Metal GPU backend (macOS). Thin `run()` wrapper with Immediate
                           resize. No CUDA — Viewport.create_cuda_surface raises in Python.
-    src/renderer.rs          MetalRenderer (+ SurfaceBackend impl): CAMetalLayer, replaceRegion
+    src/renderer.rs          MetalRenderer (+ SurfaceBackend impl): CAMetalLayer, chrome quads
+                              or replaceRegion CPU chrome, viewport layers
     src/app.rs                run() → fastgui_app::run::<MetalRenderer>(…, Immediate)
-    src/pipeline.rs           ViewportPipeline: MSL fullscreen-triangle + sampler
+    src/pipeline.rs           ViewportPipeline + QuadPipeline (MSL instanced chrome quads)
     src/texture.rs            ViewportTexture: StorageModeShared MTLTexture + replaceRegion
 
-  fastgui-chrome/         Widget rasterizer: walks a WidgetTree and draws it into one retained
-                          RGBA8 buffer via cosmic-text (text shaping) + tiny-skia (2D
-                          rasterization). Layout units are multiplied by a scale factor so
-                          HiDPI backends can keep layout in points while the pixmap matches
-                          backing pixels. Each frame's draw ops are diffed against the last
-                          frame's, so only changed rects are repainted and reported as damage;
-                          text is shaped once into cached runs. The buffer is uploaded through
-                          the same CPU-texture path Viewport frames use (damage rects only).
-    examples/chrome_bench.rs  Layout/rasterize timings + upload bytes: dock tree, 2,000-cell table
+  fastgui-chrome/         Widget chrome display list: cosmic-text shapes text once into cached
+                          runs; tiny-skia paints the CPU fallback pixmap. `build_quads` packs
+                          those runs into a shelf atlas and emits instanced quads (default app
+                          path). `rasterize` keeps the dirty-rect retained buffer
+                          (`FASTGUI_CHROME=cpu`). Layout stays in points; both paths take a
+                          scale factor for HiDPI backing pixels.
+    examples/chrome_bench.rs  Layout/build/copy timings for cpu and gpu paths: dock tree + table
+    src/gpu.rs                Atlas packer + quad builder + CPU shader emulate for tests
 
   fastgui-interop-cuda/   Raw CUDA driver API FFI (struct layouts transcribed from NVIDIA's own
                           cuda-python bindings generator), dynamically loading nvcuda.dll via
@@ -148,28 +149,29 @@ target_id, zone`) via a callback, and decides how to restructure its own tree fr
 
 ## Rendering pipeline
 
-Each frame clears the surface, then optionally draws widget chrome (a window-sized CPU raster
-from `fastgui-chrome`) and then any in-tree `Viewport` widgets on top, each sampled into its
-layout rect via a fullscreen-triangle pipeline (no vertex buffer). `Window.set_viewport` is just
-`set_content` of a filling `Viewport` widget. Color surfaces are `_UNORM` / `BGRA8Unorm`, not
-sRGB — an early bug had the GPU silently gamma-re-encoding colors that were already final
-display bytes, washing out midtones.
+Each frame clears the surface, then optionally draws widget chrome from `fastgui-chrome` and
+then any in-tree `Viewport` widgets on top, each sampled into its layout rect via a
+fullscreen-triangle pipeline (no vertex buffer). `Window.set_viewport` is just `set_content` of
+a filling `Viewport` widget. Color surfaces are `_UNORM` / `BGRA8Unorm`, not sRGB — an early bug
+had the GPU silently gamma-re-encoding colors that were already final display bytes, washing
+out midtones.
 
-On Vulkan, chrome is uploaded through a host-visible `LINEAR` `R8G8B8A8_UNORM` image; vertex
-IDs come from `gl_VertexIndex`, and a smaller viewport/scissor places the triangle in the
-widget's rect. On Metal the same picture is a `CAMetalLayer` drawable, `MTLTexture` +
-`replaceRegion` for CPU bytes, and MSL `vertex_id`. Layout and hit-testing stay in points;
-chrome rasterizes at the window's backing scale so Retina chrome matches the Python window size.
+**Default chrome path (GPU).** `ChromeRenderer::build_quads` diffs the per-widget display list
+and, when anything changed, emits `ChromeQuads`: instanced solid/circle/sprite quads plus
+uploads into a shelf-packed RGBA8 atlas of cached text runs. `SurfaceBackend::set_chrome_quads`
+writes the instance buffer and atlas; each backend's quad pipeline draws them (Metal MSL in
+`pipeline.rs`, Vulkan GLSL/`quad.{vert,frag}.spv` via `quad.rs`). Scrolling or resizing
+re-sends a few hundred KB of quads instead of a window-sized pixmap. Circles are analytic in
+the shader (close to tiny-skia's path AA); sprites copy 1:1 from the atlas.
 
-Chrome is incremental. `ChromeRenderer::rasterize` builds a display list (one item of draw ops
-per widget, in paint order), diffs it against the previous frame's, and repaints only the
-changed items' old and new bounds into its retained buffer, clipped to those rects. It returns
-a `ChromeFrame` whose `damage` lists them (or `None` after a full repaint: first frame, resize,
-tree rebuild, or damage over half the window), and returns nothing at all when no pixel
-changed. `SurfaceBackend::set_chrome_frame` then copies only the damage rects into the existing
-texture. A patch must match a full repaint to the byte (a unit test checks this at 1×/1.5×/2×).
-So ops are only ever shifted by whole pixels: rects are stored as edges, and anything built from
-a path (the slider thumb) is pre-rasterized into a sprite and blitted, like text runs.
+**CPU fallback (`FASTGUI_CHROME=cpu`).** `rasterize` paints a retained window-sized buffer with
+dirty-rect diffs and returns a `ChromeFrame`; `set_chrome_frame` copies only the damage (Vulkan
+host-visible `LINEAR` image, Metal `replaceRegion`). A patch must match a full repaint to the
+byte (unit test at 1×/1.5×/2×). This path is also the pixel reference GPU tests compare against.
+
+Layout and hit-testing stay in points; chrome is built at the window's backing scale so Retina
+matches the Python window size. Viewport layers still use the fullscreen-triangle path
+(`gl_VertexIndex` / MSL `vertex_id`) on top of chrome.
 
 CUDA interop (`fastgui-interop-cuda`, `CudaSharedTexture`) is the one path that bypasses the CPU
 upload entirely: a device-local image is exported via `VK_KHR_external_memory_win32` and

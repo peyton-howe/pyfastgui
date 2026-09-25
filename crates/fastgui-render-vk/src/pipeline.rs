@@ -151,6 +151,11 @@ impl ViewportPipeline {
         self.pipeline
     }
 
+    /// One combined image sampler at binding 0; also what `QuadPipeline` binds its atlas with.
+    pub fn descriptor_set_layout(&self) -> vk::DescriptorSetLayout {
+        self.descriptor_set_layout
+    }
+
     pub fn pipeline_layout(&self) -> vk::PipelineLayout {
         self.pipeline_layout
     }
