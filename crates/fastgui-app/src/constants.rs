@@ -24,3 +24,8 @@ pub const TEAR_GHOST_CLEAR: [f32; 4] = [0.16, 0.20, 0.28, 1.0];
 
 /// Vulkan main-window swapchain recreate debounce (Metal uses immediate resize).
 pub const RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Two presses on the same text input within this long (and a few points of each other) are a
+/// double-click (select the word).
+pub const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
+pub const DOUBLE_CLICK_SLOP: f32 = 4.0;

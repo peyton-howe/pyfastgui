@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use taffy::prelude::*;
 
-use crate::FrameSlot;
+use crate::text_edit::TextEdit;
+use crate::{FrameSlot, Readback};
 
 /// A node in a `WidgetTree` — just a taffy `NodeId`, since taffy already owns the
 /// parent/child/style graph; we only need a side-table for the widget-specific data
@@ -30,6 +31,8 @@ pub type TabSelectCallback = Arc<dyn Fn(usize) + Send + Sync>;
 /// `Float` (tear a docked panel out into an OS window); `None` for ordinary dock rearrange.
 pub type PanelDropCallback =
     Arc<dyn Fn(u64, u64, DropZone, Option<(f32, f32, f32, f32)>) + Send + Sync>;
+/// A `TextInput`'s edited text (`on_change`) or submitted text (`on_submit`, Enter).
+pub type TextCallback = Arc<dyn Fn(String) + Send + Sync>;
 /// Fired when the user clicks a panel/tab close control — argument is that panel's region id.
 pub type PanelCloseCallback = Arc<dyn Fn(u64) + Send + Sync>;
 
@@ -43,6 +46,11 @@ pub const CLOSE_HIT_SLOP: f32 = 6.0;
 /// Largest fraction of a title bar / tab segment's width the × may take (drawn or hit), so a
 /// narrow tab header always keeps most of its width for "switch to / drag this tab".
 const CLOSE_MAX_WIDTH_FRACTION: f32 = 0.4;
+
+/// Horizontal space between a `TextInput`'s edge and its text (layout units). Shared by
+/// chrome's drawing and `fastgui-app`'s click-to-caret, so both agree on where text starts.
+pub const TEXT_INPUT_PADDING: f32 = 8.0;
+const TEXT_INPUT_VERTICAL_PADDING: f32 = 6.0;
 
 /// How far (layout units, each side, across the bar) a press still grabs a `Splitter` bar —
 /// see `WidgetTree::splitter_at`. The bar keeps its drawn thickness; only the hit area grows.
@@ -210,6 +218,26 @@ pub enum WidgetKind {
         floating: bool,
         container_id: Option<WidgetId>,
     },
+    /// A single-line editable text field (`QLineEdit`). `edit` holds the text, caret, selection
+    /// and undo history; `scroll` (layout units) is how far the text is shifted left so the
+    /// caret stays in view — kept up to date by `fastgui-app`, which can measure text through
+    /// `TextMeasure`. `preedit` is an in-progress IME composition shown at the caret (text,
+    /// plus the IME's own cursor range within it). `mirror` publishes every change for Python's
+    /// synchronous `TextInput.text` getter.
+    TextInput {
+        edit: TextEdit,
+        placeholder: String,
+        font_size: f32,
+        text_color: Color,
+        placeholder_color: Color,
+        background: Color,
+        selection_color: Color,
+        scroll: f32,
+        preedit: Option<(String, Option<(usize, usize)>)>,
+        on_change: Option<TextCallback>,
+        on_submit: Option<TextCallback>,
+        mirror: Option<Readback<String>>,
+    },
     /// A GPU/CPU image rect composited on top of chrome. `frames` is the same latest-wins
     /// mailbox `Viewport.submit_frame` writes; `viewport_id` is a stable identity for the
     /// renderer's GPU texture cache across tree rebuilds (unlike `WidgetId`).
@@ -222,7 +250,7 @@ pub enum WidgetKind {
 impl WidgetKind {
     /// Whether this widget can take keyboard focus (click or Tab to it).
     pub fn is_focusable(&self) -> bool {
-        matches!(self, WidgetKind::Button { .. } | WidgetKind::Slider { .. })
+        matches!(self, WidgetKind::Button { .. } | WidgetKind::Slider { .. } | WidgetKind::TextInput { .. })
     }
 }
 
@@ -594,9 +622,10 @@ impl Default for WidgetTree {
 /// this only has to be good enough that layout doesn't look broken before that happens. Good
 /// enough for M4; swap for measuring through `fastgui-chrome`'s font system if/when this
 /// approximation visibly matters (e.g. non-Latin scripts, tight-fitting layouts).
+const LINE_HEIGHT_RATIO: f32 = 1.3;
+
 fn measure_text(text: &str, font_size: f32) -> Size<f32> {
     const AVG_ADVANCE_RATIO: f32 = 0.55;
-    const LINE_HEIGHT_RATIO: f32 = 1.3;
     let width = text.chars().count() as f32 * font_size * AVG_ADVANCE_RATIO;
     Size { width, height: font_size * LINE_HEIGHT_RATIO }
 }
@@ -618,6 +647,11 @@ fn measure_leaf(
             const BUTTON_PADDING: f32 = 16.0;
             Size { width: text_size.width + BUTTON_PADDING, height: text_size.height + BUTTON_PADDING }
         }
+        Some(WidgetKind::TextInput { font_size, .. }) => Size {
+            // Wide enough to type into when nothing stretches it; the height fits one line.
+            width: 160.0,
+            height: font_size * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
+        },
         Some(
             WidgetKind::Container { .. }
             | WidgetKind::Slider { .. }

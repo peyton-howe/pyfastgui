@@ -8,3 +8,4 @@ publish.workspace = true
 [dependencies]
 crossbeam-channel = "0.5"
 taffy = "0.12"
+unicode-segmentation = "1"

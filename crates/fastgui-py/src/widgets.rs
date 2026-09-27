@@ -5,8 +5,10 @@ use fastgui_core::taffy::prelude::*;
 use fastgui_core::taffy::style::LengthPercentage;
 use fastgui_core::widget::{
     ChangeCallback, ClickCallback, Color, PanelCloseCallback, PanelDropCallback, SplitDirection, TabSelectCallback,
-    WidgetId, WidgetKind, WidgetTree,
+    TextCallback, WidgetId, WidgetKind, WidgetTree,
 };
+use fastgui_core::text_edit::TextEdit;
+use fastgui_core::Readback;
 use crate::backend::{Command, CommandDispatch};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -52,6 +54,16 @@ fn wrap_callback1(callback: Py<PyAny>) -> ChangeCallback {
     Arc::new(move |value: f32| {
         Python::attach(|py| {
             if let Err(err) = callback.call1(py, (value,)) {
+                err.print(py);
+            }
+        });
+    })
+}
+
+fn wrap_callback_text(callback: Py<PyAny>) -> TextCallback {
+    Arc::new(move |text: String| {
+        Python::attach(|py| {
+            if let Err(err) = callback.call1(py, (text,)) {
                 err.print(py);
             }
         });
@@ -269,6 +281,9 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
     if let Ok(w) = obj.cast::<Slider>() {
         return Ok(w.borrow().describe());
     }
+    if let Ok(w) = obj.cast::<TextInput>() {
+        return Ok(w.borrow().describe());
+    }
     if let Ok(w) = obj.cast::<BoxWidget>() {
         return w.borrow().describe();
     }
@@ -292,7 +307,7 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
         return Ok(w.borrow().describe_widget());
     }
     Err(PyTypeError::new_err(
-        "expected a fastgui widget (Box, Label, Button, Slider, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
+        "expected a fastgui widget (Box, Label, Button, Slider, TextInput, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
     ))
 }
 
@@ -658,6 +673,131 @@ impl Slider {
                 track_color: rgba(self.track_color),
                 thumb_color: rgba(self.thumb_color),
                 on_change: on_change.map(wrap_callback1),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+        }
+    }
+}
+
+/// A single-line editable text field.
+#[pyclass]
+pub(crate) struct TextInput {
+    id: IdCell,
+    sender: SenderCell,
+    /// The current text, published by the render thread on every edit (and by `set_text`), so
+    /// `.text` never waits on it. Also what `describe` builds from, so the text survives a
+    /// rebuild (e.g. a `DockArea` rearrange).
+    text: Readback<String>,
+    placeholder: String,
+    font_size: f32,
+    width: Option<f32>,
+    flex_grow: f32,
+    text_color: (f32, f32, f32, f32),
+    placeholder_color: (f32, f32, f32, f32),
+    background: (f32, f32, f32, f32),
+    selection_color: (f32, f32, f32, f32),
+    on_change: Option<Py<PyAny>>,
+    on_submit: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl TextInput {
+    #[new]
+    #[pyo3(signature = (
+        text="",
+        placeholder="",
+        on_change=None,
+        on_submit=None,
+        font_size=16.0,
+        width=None,
+        flex_grow=0.0,
+        text_color=(0.92, 0.93, 0.95, 1.0),
+        placeholder_color=(0.5, 0.52, 0.56, 1.0),
+        background=(0.16, 0.17, 0.2, 1.0),
+        selection_color=(0.25, 0.45, 0.8, 0.6),
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        text: &str,
+        placeholder: &str,
+        on_change: Option<Py<PyAny>>,
+        on_submit: Option<Py<PyAny>>,
+        font_size: f32,
+        width: Option<f32>,
+        flex_grow: f32,
+        text_color: (f32, f32, f32, f32),
+        placeholder_color: (f32, f32, f32, f32),
+        background: (f32, f32, f32, f32),
+        selection_color: (f32, f32, f32, f32),
+    ) -> Self {
+        Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            text: Readback::new(TextEdit::new(text).text().to_owned()),
+            placeholder: placeholder.to_owned(),
+            font_size,
+            width,
+            flex_grow,
+            text_color,
+            placeholder_color,
+            background,
+            selection_color,
+            on_change,
+            on_submit,
+        }
+    }
+
+    /// The field's current text, including edits the user just made. Safe from any thread.
+    #[getter]
+    fn text(&self) -> String {
+        self.text.get()
+    }
+
+    /// Replace the text (caret to the end, undo history cleared). Doesn't call `on_change`,
+    /// which is for user edits. Works before the field is attached, too.
+    fn set_text(&self, text: &str) -> PyResult<()> {
+        let text = TextEdit::new(text).text().to_owned();
+        self.text.set(text.clone());
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::TextInput { edit, scroll, preedit, .. } = kind {
+                edit.set_text(&text);
+                *scroll = 0.0;
+                *preedit = None;
+            }
+        })
+    }
+}
+
+impl TextInput {
+    fn describe(&self) -> DescribedWidget {
+        let (on_change, on_submit) = Python::attach(|py| {
+            (
+                self.on_change.as_ref().map(|cb| cb.clone_ref(py)),
+                self.on_submit.as_ref().map(|cb| cb.clone_ref(py)),
+            )
+        });
+        DescribedWidget {
+            style: StyleParams::leaf(self.flex_grow, self.width, None),
+            kind: WidgetKind::TextInput {
+                edit: TextEdit::new(&self.text.get()),
+                placeholder: self.placeholder.clone(),
+                font_size: self.font_size,
+                text_color: rgba(self.text_color),
+                placeholder_color: rgba(self.placeholder_color),
+                background: rgba(self.background),
+                selection_color: rgba(self.selection_color),
+                scroll: 0.0,
+                preedit: None,
+                on_change: on_change.map(wrap_callback_text),
+                on_submit: on_submit.map(wrap_callback_text),
+                mirror: Some(self.text.clone()),
             },
             id_cell: self.id.clone(),
             sender_cell: self.sender.clone(),
@@ -1239,6 +1379,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Label>()?;
     m.add_class::<Button>()?;
     m.add_class::<Slider>()?;
+    m.add_class::<TextInput>()?;
     m.add_class::<BoxWidget>()?;
     m.add_class::<Splitter>()?;
     m.add_class::<Panel>()?;

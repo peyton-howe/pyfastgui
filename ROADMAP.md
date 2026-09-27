@@ -1232,7 +1232,18 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
    chrome; not yet driven interactively (macOS automation permissions were unavailable).
 2. **Text editing core** — build on `cosmic-text`'s `Editor` (cursor, selection, undo,
    clipboard, IME via winit's `Ime` events). Also replace the `measure_text` heuristic with real
-   `cosmic-text` shaping, and add text wrapping.
+   `cosmic-text` shaping, and add text wrapping. **Single-line editing done (2026-09-27):** rather than
+   `cosmic-text`'s `Editor` (which wants to own the font system and a buffer per field),
+   `fastgui-core::text_edit::TextEdit` is a font-free model — grapheme-aware caret/selection,
+   word motion, undo/redo with typing runs merged — and chrome implements `TextMeasure` from real
+   shaping for caret x / click-to-caret. `WidgetKind::TextInput` / Python `fg.TextInput`
+   (`text` getter via a `Readback` mirror, `set_text`, `on_change`, `on_submit`); platform
+   shortcuts (Cmd on macOS, Ctrl elsewhere), clipboard via `arboard`, IME preedit/commit with the
+   candidate window placed at the caret, horizontal scroll with glyph-clipped line sprites (no
+   clip rects needed). Demo: `text_input_demo.py`. Unit-tested and render-checked to PNG; not yet
+   driven interactively. **Still open:** replace layout's `measure_text` heuristic with real
+   shaping, text wrapping / multi-line `TextEdit`, caret blink, RTL/bidi caret placement (stops
+   are per glyph cluster, correct for LTR only).
 3. **Scroll container + clipping** — needs per-quad clip rects in the GPU quad pipeline (Vulkan
    and Metal). The GPU chrome path already makes scroll cheap (~128 KiB/frame upload in
    `chrome_bench`'s table scene vs 24 MiB on the CPU path).

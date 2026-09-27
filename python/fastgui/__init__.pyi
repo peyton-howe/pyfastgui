@@ -55,7 +55,30 @@ class Slider:
     ) -> None: ...
     def set_value(self, value: float) -> None: ...
 
-Widget = Union[Label, Button, Slider, "Box", "Splitter", "Panel", "Tabs", "DockArea", Viewport]
+class TextInput:
+    """A single-line editable text field. Click or Tab to focus; supports selection, word
+    motion, undo/redo, the system clipboard and IME input."""
+    def __init__(
+        self,
+        text: str = "",
+        placeholder: str = "",
+        on_change: Callable[[str], None] | None = None,
+        on_submit: Callable[[str], None] | None = None,
+        font_size: float = 16.0,
+        width: float | None = None,
+        flex_grow: float = 0.0,
+        text_color: RGBA = (0.92, 0.93, 0.95, 1.0),
+        placeholder_color: RGBA = (0.5, 0.52, 0.56, 1.0),
+        background: RGBA = (0.16, 0.17, 0.2, 1.0),
+        selection_color: RGBA = (0.25, 0.45, 0.8, 0.6),
+    ) -> None: ...
+    @property
+    def text(self) -> str:
+        """The current text, including the user's latest edits. Safe from any thread."""
+    def set_text(self, text: str) -> None:
+        """Replace the text without calling `on_change`. Works before the field is attached."""
+
+Widget = Union[Label, Button, Slider, TextInput, "Box", "Splitter", "Panel", "Tabs", "DockArea", Viewport]
 
 class Box:
     def __init__(

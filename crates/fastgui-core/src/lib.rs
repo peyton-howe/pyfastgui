@@ -10,6 +10,7 @@
 mod frame;
 mod queue;
 mod readback;
+pub mod text_edit;
 pub mod widget;
 
 pub use frame::{

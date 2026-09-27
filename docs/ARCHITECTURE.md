@@ -15,7 +15,10 @@ crates/
     src/readback.rs          Readback<T> (mutex-cached last-committed value, for sync getters)
     src/frame.rs              FrameSlot<T> (latest-wins mailbox), CpuFrame, PixelFormat
     src/widget.rs             WidgetTree (wraps taffy::TaffyTree), WidgetKind (including
-                              Viewport), WidgetId, Color, hit_test / find_region_at, DropZone
+                              Viewport), WidgetId, Color, hit_test / find_region_at, DropZone,
+                              keyboard focus (set_focus / focus_next)
+    src/text_edit.rs          TextEdit (text + caret/selection + undo, grapheme-aware, no
+                              fonts) and the TextMeasure trait chrome implements
 
   fastgui-app/            Shared winit ApplicationHandler: command queue, dock/float/ghost
                           input, chrome dirty checks, multi-window lifecycle. Layout/hit-test
@@ -24,6 +27,8 @@ crates/
     src/app.rs                App<B: SurfaceBackend>, ApplicationHandler, floaters, tear ghost
     src/command.rs            Command, EventWaker, CommandDispatch, RenderThreadHandles
     src/surface.rs            SurfaceBackend trait + MainResizePolicy (Immediate vs Debounced)
+    src/keyboard.rs           Tab/Escape focus keys; routes key presses to the focused widget
+    src/text_input.rs         TextInput keys/mouse/IME/clipboard (arboard), caret scrolling
 
   fastgui-render-vk/      The Vulkan GPU backend (Windows + Linux). Thin `run()` wrapper with
                           Debounced main-window resize + CUDA surface create. Selected by

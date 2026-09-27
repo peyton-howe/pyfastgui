@@ -24,8 +24,9 @@ mod gpu;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-use cosmic_text::{Attrs, Buffer, Color as CosmicColor, FontSystem, Metrics, Shaping, SwashCache};
-use fastgui_core::widget::{Color, DropZone, WidgetKind, WidgetTree};
+use cosmic_text::{Attrs, Buffer, Color as CosmicColor, FontSystem, Metrics, Shaping, SwashCache, Wrap};
+use fastgui_core::text_edit::{TextEdit, TextMeasure};
+use fastgui_core::widget::{Color, DropZone, WidgetKind, WidgetTree, TEXT_INPUT_PADDING};
 use fastgui_core::{ChromeFrame, PixelRect};
 use tiny_skia::{Paint, Pixmap, Rect, Transform};
 
@@ -63,6 +64,18 @@ const SLIDER_THUMB_RADIUS: f32 = 8.0;
 const FOCUS_RING_COLOR: Color = Color([0.4, 0.7, 1.0, 1.0]);
 const FOCUS_RING_WIDTH: f32 = 2.0;
 
+/// `(byte index, x)` caret positions along one shaped line; see `ChromeRenderer::line_stops`.
+type CaretStops = Arc<[(usize, f32)]>;
+
+/// Line height as a multiple of font size — cosmic-text `Metrics` everywhere in chrome.
+const LINE_HEIGHT_RATIO: f32 = 1.25;
+
+/// Text-input caret width (points, before scale).
+const CARET_WIDTH: f32 = 1.5;
+
+/// Past this many measured lines, the caret-stop cache starts over.
+const LINE_CACHE_LIMIT: usize = 256;
+
 pub struct ChromeRenderer {
     font_system: FontSystem,
     swash_cache: SwashCache,
@@ -75,6 +88,8 @@ pub struct ChromeRenderer {
     damage: Vec<PixelRect>,
     /// State of the GPU path (`build_quads`); the CPU path (`rasterize`) doesn't touch it.
     gpu: gpu::GpuState,
+    /// Caret stops of recently measured single lines, keyed by (text, font size bits).
+    line_cache: HashMap<(String, u32), CaretStops>,
 }
 
 impl ChromeRenderer {
@@ -87,6 +102,7 @@ impl ChromeRenderer {
             items: Vec::new(),
             damage: Vec::new(),
             gpu: gpu::GpuState::default(),
+            line_cache: HashMap::new(),
         }
     }
 
@@ -234,6 +250,33 @@ impl ChromeRenderer {
                         self.push_close_glyph(&mut ops, close, *font_size * scale, *text_color);
                     }
                 }
+                WidgetKind::TextInput {
+                    edit,
+                    placeholder,
+                    font_size,
+                    text_color,
+                    placeholder_color,
+                    background,
+                    selection_color,
+                    scroll,
+                    preedit,
+                    ..
+                } => {
+                    push_fill(&mut ops, rect, *background);
+                    let field = TextField {
+                        edit,
+                        placeholder,
+                        preedit: preedit.as_ref(),
+                        focused: tree.focused() == Some(id),
+                        font_size: *font_size,
+                        text_color: *text_color,
+                        placeholder_color: *placeholder_color,
+                        selection_color: *selection_color,
+                        caret_color: FOCUS_RING_COLOR,
+                        scroll: *scroll,
+                    };
+                    self.push_text_field(&mut ops, logical_rect, scale, &field);
+                }
                 WidgetKind::Viewport { .. } => {
                     // Placeholder only — the GPU draws the real frame in this rect after chrome.
                     push_fill(&mut ops, rect, Color([0.05, 0.06, 0.08, 1.0]));
@@ -256,11 +299,107 @@ impl ChromeRenderer {
         items
     }
 
+    /// A `TextInput`'s contents inside its (already filled) `logical_rect`: selection highlight,
+    /// one unwrapped line of text shifted left by `scroll` and clipped to the padded interior,
+    /// an underline under any IME composition, and the caret while focused. Measured at the
+    /// drawn (scaled) size so the caret sits exactly between the glyphs that are drawn.
+    fn push_text_field(&mut self, ops: &mut Vec<Op>, logical_rect: WidgetRect, scale: f32, field: &TextField<'_>) {
+        let rect = scale_rect(logical_rect, scale);
+        let padding = TEXT_INPUT_PADDING * scale;
+        let font_size = field.font_size * scale;
+        let line_height = font_size * LINE_HEIGHT_RATIO;
+        let inner = WidgetRect {
+            x: rect.x + padding,
+            y: (rect.y + (rect.height - line_height) / 2.0).round(),
+            width: (rect.width - 2.0 * padding).max(0.0),
+            height: line_height.min(rect.height),
+        };
+        if inner.width <= 0.0 || inner.height <= 0.0 {
+            return;
+        }
+        let scroll = (field.scroll * scale).round();
+
+        // While composing, the IME's text shows at the caret (and the selection isn't drawn).
+        let (display, caret, composing) = field.edit.composed(field.preedit.filter(|_| field.focused));
+        let selection = if composing.is_some() { 0..0 } else { field.edit.selection() };
+        let stops = self.line_stops(&display, font_size);
+        let x_at = |index: usize| inner.x + stop_x(&stops, index) - scroll;
+        let clip = |x0: f32, x1: f32| (x0.max(inner.x), x1.min(inner.x + inner.width));
+
+        if field.focused && !selection.is_empty() {
+            let (x0, x1) = clip(x_at(selection.start), x_at(selection.end));
+            push_fill(ops, WidgetRect { x: x0, width: x1 - x0, ..inner }, field.selection_color);
+        }
+        if display.is_empty() {
+            if !field.placeholder.is_empty() {
+                self.push_line_text(ops, inner, field.placeholder, font_size, 0.0, field.placeholder_color);
+            }
+        } else {
+            self.push_line_text(ops, inner, &display, font_size, scroll, field.text_color);
+        }
+        if let Some(range) = composing {
+            let (x0, x1) = clip(x_at(range.start), x_at(range.end));
+            let thickness = scale.max(1.0);
+            push_fill(
+                ops,
+                WidgetRect { x: x0, y: inner.y + inner.height - thickness, width: x1 - x0, height: thickness },
+                field.text_color,
+            );
+        }
+        if field.focused {
+            let width = (CARET_WIDTH * scale).max(1.0);
+            let x = x_at(caret).round().clamp(inner.x, inner.x + inner.width - width);
+            push_fill(ops, WidgetRect { x, width, ..inner }, field.caret_color);
+        }
+    }
+
+    /// One line of `text`, not wrapped, shifted left by `scroll` px and clipped to `rect`.
+    fn push_line_text(&mut self, ops: &mut Vec<Op>, rect: WidgetRect, text: &str, font_size: f32, scroll: f32, color: Color) {
+        let run = self.text_cache.get(
+            &mut self.font_system,
+            &mut self.swash_cache,
+            text,
+            font_size,
+            rect,
+            color,
+            Some(scroll),
+        );
+        if run.width > 0 {
+            ops.push(Op::Text { run, x: rect.x.round() as i32, y: rect.y.round() as i32 });
+        }
+    }
+
+    /// `(byte index, x)` caret stops for `text` shaped as one unwrapped line at `font_size`:
+    /// one per glyph cluster, in byte order, ending with `(text.len(), line width)`.
+    fn line_stops(&mut self, text: &str, font_size: f32) -> CaretStops {
+        let key = (text.to_owned(), font_size.to_bits());
+        if let Some(stops) = self.line_cache.get(&key) {
+            return stops.clone();
+        }
+        if self.line_cache.len() >= LINE_CACHE_LIMIT {
+            self.line_cache.clear();
+        }
+        let buffer = shape_line(&mut self.font_system, text, font_size, None);
+        let mut stops: Vec<(usize, f32)> = Vec::new();
+        let mut width: f32 = 0.0;
+        for run in buffer.layout_runs() {
+            width = width.max(run.line_w);
+            stops.extend(run.glyphs.iter().map(|glyph| (glyph.start, glyph.x)));
+        }
+        stops.sort_by_key(|&(index, _)| index);
+        stops.dedup_by_key(|&mut (index, _)| index);
+        stops.retain(|&(index, _)| index < text.len());
+        stops.push((text.len(), width));
+        let stops: CaretStops = stops.into();
+        self.line_cache.insert(key, stops.clone());
+        stops
+    }
+
     fn push_text(&mut self, ops: &mut Vec<Op>, rect: WidgetRect, text: &str, font_size: f32, color: Color) {
         if text.is_empty() || rect.width <= 0.0 || rect.height <= 0.0 {
             return;
         }
-        let run = self.text_cache.get(&mut self.font_system, &mut self.swash_cache, text, font_size, rect, color);
+        let run = self.text_cache.get(&mut self.font_system, &mut self.swash_cache, text, font_size, rect, color, None);
         if run.width == 0 {
             return;
         }
@@ -331,6 +470,51 @@ impl ChromeRenderer {
             }
         }
     }
+}
+
+impl TextMeasure for ChromeRenderer {
+    fn caret_x(&mut self, text: &str, font_size: f32, index: usize) -> f32 {
+        stop_x(&self.line_stops(text, font_size), index)
+    }
+
+    fn index_at(&mut self, text: &str, font_size: f32, x: f32) -> usize {
+        let stops = self.line_stops(text, font_size);
+        stops
+            .iter()
+            .min_by(|a, b| (a.1 - x).abs().total_cmp(&(b.1 - x).abs()))
+            .map_or(0, |&(index, _)| index)
+    }
+}
+
+/// What `push_text_field` needs from a `WidgetKind::TextInput`.
+struct TextField<'a> {
+    edit: &'a TextEdit,
+    placeholder: &'a str,
+    preedit: Option<&'a (String, Option<(usize, usize)>)>,
+    focused: bool,
+    font_size: f32,
+    text_color: Color,
+    placeholder_color: Color,
+    selection_color: Color,
+    caret_color: Color,
+    scroll: f32,
+}
+
+/// X of the caret before byte `index`: the last stop at or before it (inside a multi-glyph
+/// cluster that's the cluster's start).
+fn stop_x(stops: &[(usize, f32)], index: usize) -> f32 {
+    let after = stops.partition_point(|&(stop, _)| stop <= index);
+    stops[..after].last().map_or(0.0, |&(_, x)| x)
+}
+
+/// A cosmic-text buffer holding `text` as lines laid out in a `width`-wide box (`None`: one
+/// unwrapped line).
+fn shape_line(font_system: &mut FontSystem, text: &str, font_size: f32, height: Option<f32>) -> Buffer {
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, font_size * LINE_HEIGHT_RATIO));
+    buffer.set_wrap(font_system, Wrap::None);
+    buffer.set_size(font_system, None, height);
+    buffer.set_text(font_system, text, &Attrs::new(), Shaping::Advanced);
+    buffer
 }
 
 impl Default for ChromeRenderer {
@@ -529,6 +713,8 @@ impl Sprite {
         Self { id: next_sprite_id(), x: x0, y: y0, width, height, pixels: pixmap.take() }
     }
 
+    /// `line_scroll: Some(px)` lays `text` out as one unwrapped line shifted left by `px` and
+    /// clips it to `rect` (a text field); `None` wraps it in `rect` (a label).
     fn shape(
         font_system: &mut FontSystem,
         swash_cache: &mut SwashCache,
@@ -536,17 +722,35 @@ impl Sprite {
         font_size: f32,
         rect: WidgetRect,
         color: CosmicColor,
+        line_scroll: Option<f32>,
     ) -> Self {
-        let metrics = Metrics::new(font_size, font_size * 1.25);
-        let mut buffer = Buffer::new(font_system, metrics);
-        buffer.set_size(font_system, Some(rect.width), Some(rect.height));
-        buffer.set_text(font_system, text, &Attrs::new(), Shaping::Advanced);
+        let buffer = match line_scroll {
+            Some(_) => shape_line(font_system, text, font_size, Some(rect.height)),
+            None => {
+                let metrics = Metrics::new(font_size, font_size * LINE_HEIGHT_RATIO);
+                let mut buffer = Buffer::new(font_system, metrics);
+                buffer.set_size(font_system, Some(rect.width), Some(rect.height));
+                buffer.set_text(font_system, text, &Attrs::new(), Shaping::Advanced);
+                buffer
+            }
+        };
 
         // cosmic-text reports coverage one pixel span at a time; collect first to size the run.
         let mut spans = Vec::new();
+        let (shift, clip) = match line_scroll {
+            Some(scroll) => (scroll.round() as i32, Some((rect.width as i32, rect.height.ceil() as i32))),
+            None => (0, None),
+        };
         buffer.draw(font_system, swash_cache, color, |x, y, w, h, color| {
-            if color.a() != 0 && w > 0 && h > 0 {
-                spans.push((x, y, w as i32, h as i32, color));
+            if color.a() == 0 || w == 0 || h == 0 {
+                return;
+            }
+            let (mut x0, mut x1, mut y0, mut y1) = (x - shift, x - shift + w as i32, y, y + h as i32);
+            if let Some((width, height)) = clip {
+                (x0, x1, y0, y1) = (x0.max(0), x1.min(width), y0.max(0), y1.min(height));
+            }
+            if x1 > x0 && y1 > y0 {
+                spans.push((x0, y0, x1 - x0, y1 - y0, color));
             }
         });
         let Some(x0) = spans.iter().map(|s| s.0).min() else { return Self::default() };
@@ -576,6 +780,8 @@ struct TextParams {
     width: u32,
     height: u32,
     color: [u8; 4],
+    /// `Some(scroll bits)` for a clipped single line (see `Sprite::shape`).
+    line_scroll: Option<u32>,
 }
 
 struct CachedRun {
@@ -591,6 +797,7 @@ struct TextCache {
 }
 
 impl TextCache {
+    #[allow(clippy::too_many_arguments)]
     fn get(
         &mut self,
         font_system: &mut FontSystem,
@@ -599,6 +806,7 @@ impl TextCache {
         font_size: f32,
         rect: WidgetRect,
         color: Color,
+        line_scroll: Option<f32>,
     ) -> Arc<Sprite> {
         let color = to_cosmic_color(color);
         let params = TextParams {
@@ -606,6 +814,7 @@ impl TextCache {
             width: rect.width.to_bits(),
             height: rect.height.to_bits(),
             color: [color.r(), color.g(), color.b(), color.a()],
+            line_scroll: line_scroll.map(f32::to_bits),
         };
         let generation = self.generation;
         let by_text = self.runs.entry(params).or_default();
@@ -613,7 +822,7 @@ impl TextCache {
             cached.last_used = generation;
             return cached.run.clone();
         }
-        let run = Arc::new(Sprite::shape(font_system, swash_cache, text, font_size, rect, color));
+        let run = Arc::new(Sprite::shape(font_system, swash_cache, text, font_size, rect, color, line_scroll));
         by_text.insert(text.to_owned(), CachedRun { run: run.clone(), last_used: generation });
         run
     }

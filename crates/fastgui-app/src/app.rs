@@ -6,7 +6,7 @@ use fastgui_chrome::ChromeRenderer;
 use fastgui_core::widget::{DropZone, Rect, WidgetId, WidgetKind, WidgetTree, SPLITTER_HIT_SLOP};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId, WindowLevel};
@@ -17,6 +17,7 @@ use crate::constants::*;
 use crate::coords::{remap_rect, scale_rect};
 use crate::ghost::build_tear_ghost_tree;
 use crate::keyboard::handle_key;
+use crate::text_input::{self, KeyPress, SystemClipboard};
 use crate::resize_edge::{classify_float_resize_edge, resize_edge_cursor, ResizeEdge};
 use crate::surface::{MainResizePolicy, SurfaceBackend};
 
@@ -113,6 +114,9 @@ struct FloatingWindow<B: SurfaceBackend> {
     last_raster_scale: f64,
     dragging_slider: Option<WidgetId>,
     dragging_splitter: Option<WidgetId>,
+    dragging_text: Option<WidgetId>,
+    last_click: Option<(Instant, (f32, f32))>,
+    ime_allowed: bool,
 }
 
 struct App<B: SurfaceBackend> {
@@ -138,8 +142,16 @@ struct App<B: SurfaceBackend> {
     /// Held modifier keys (Shift for Shift+Tab). One copy for every window: winit reports
     /// changes to whichever window has keyboard focus.
     modifiers: ModifiersState,
+    /// Opened on first copy/paste; shared by every window.
+    clipboard: SystemClipboard,
     dragging_slider: Option<WidgetId>,
     dragging_splitter: Option<WidgetId>,
+    /// A `TextInput` whose selection follows the cursor until mouse-up.
+    dragging_text: Option<WidgetId>,
+    /// Time and place of the last press on a `TextInput`, for double-click detection.
+    last_click: Option<(Instant, (f32, f32))>,
+    /// Whether the main window currently accepts IME input (a `TextInput` has focus).
+    ime_allowed: bool,
     /// `(title bar's own WidgetId, that Panel's region_id)` while a `Panel` title bar is being
     /// dragged for rearrangement.
     dragging_panel_title: Option<(WidgetId, u64)>,
@@ -382,6 +394,9 @@ impl<B: SurfaceBackend> App<B> {
             last_raster_scale: 0.0,
             dragging_slider: None,
             dragging_splitter: None,
+            dragging_text: None,
+            last_click: None,
+            ime_allowed: false,
         };
         self.floating_by_region.insert(region_id, window_id);
         self.floating.insert(window_id, floater);
@@ -550,6 +565,12 @@ impl<B: SurfaceBackend> App<B> {
             WidgetKind::Splitter { .. } => {
                 self.dragging_splitter = Some(id);
             }
+            WidgetKind::TextInput { .. } => {
+                let double = is_double_click(&mut self.last_click, self.cursor);
+                let extend = self.modifiers.shift_key();
+                text_input::handle_press(&mut self.widget_tree, id, self.cursor.0, extend, double, &mut self.chrome);
+                self.dragging_text = Some(id);
+            }
             WidgetKind::TabBar { panel_ids, content_ids, titles, on_close, .. } => {
                 if let Some(index) = self.tab_bar_clicked_index(id) {
                     if let Some(rect) = self.widget_tree.absolute_rect(id) {
@@ -660,6 +681,14 @@ impl<B: SurfaceBackend> App<B> {
                     floater.dragging_splitter = Some(id);
                 }
             }
+            WidgetKind::TextInput { .. } => {
+                let extend = self.modifiers.shift_key();
+                if let Some(floater) = self.floating.get_mut(&window_id) {
+                    let double = is_double_click(&mut floater.last_click, cursor);
+                    text_input::handle_press(&mut floater.widget_tree, id, cursor.0, extend, double, &mut floater.chrome);
+                    floater.dragging_text = Some(id);
+                }
+            }
             WidgetKind::TabBar { panel_ids, titles, on_close, .. } => {
                 if let Some(index) = Self::floating_tab_bar_clicked_index(floater, id) {
                     if let Some(rect) = floater.widget_tree.absolute_rect(id) {
@@ -711,6 +740,10 @@ impl<B: SurfaceBackend> App<B> {
             }
             WidgetKind::Container { .. } | WidgetKind::Label { .. } | WidgetKind::Viewport { .. } => {}
         }
+    }
+
+    fn focused_text_input(&self) -> Option<WidgetId> {
+        self.widget_tree.focused().filter(|&id| is_text_input(&self.widget_tree, id))
     }
 
     fn tab_bar_clicked_index(&self, bar_id: WidgetId) -> Option<usize> {
@@ -1435,6 +1468,9 @@ impl<B: SurfaceBackend> App<B> {
         // panels instead of over/undershooting until the resize settles.
         let layout = (self.physical_width, self.physical_height);
         let surface = self.last_applied_physical;
+        if let Some(window) = &self.window {
+            sync_ime(window, &self.widget_tree, &mut self.chrome, &mut self.ime_allowed);
+        }
         let draws: Vec<_> = self
             .viewport_draws()
             .into_iter()
@@ -1462,6 +1498,7 @@ impl<B: SurfaceBackend> App<B> {
             event_loop.exit();
             return false;
         }
+        sync_ime(&floater.window, &floater.widget_tree, &mut floater.chrome, &mut floater.ime_allowed);
         let draws = Self::floating_viewport_draws(floater);
         let draw_chrome = floater.has_widget_content;
         if let Err(err) = floater.renderer.render_frame(clear_color, draw_chrome, &draws) {
@@ -1604,9 +1641,13 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                 self.cursor = (logical.x as f32, logical.y as f32);
                 let dragging = self.dragging_slider.is_some()
                     || self.dragging_splitter.is_some()
-                    || self.dragging_panel_title.is_some();
+                    || self.dragging_panel_title.is_some()
+                    || self.dragging_text.is_some();
                 if self.dragging_slider.is_some() {
                     self.update_dragged_slider();
+                }
+                if let Some(id) = self.dragging_text {
+                    text_input::handle_drag(&mut self.widget_tree, id, self.cursor.0, &mut self.chrome);
                 }
                 if self.dragging_splitter.is_some() {
                     self.update_dragged_splitter();
@@ -1630,9 +1671,11 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                 ElementState::Released => {
                     let was_dragging = self.dragging_slider.is_some()
                         || self.dragging_splitter.is_some()
-                        || self.dragging_panel_title.is_some();
+                        || self.dragging_panel_title.is_some()
+                        || self.dragging_text.is_some();
                     self.dragging_slider = None;
                     self.dragging_splitter = None;
+                    self.dragging_text = None;
                     // Floater OS-window drag is owned by the floater's mouse-up path.
                     if self.dragging_from_floating.is_none() {
                         self.handle_panel_drop();
@@ -1645,7 +1688,16 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
             },
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                if handle_key(&mut self.widget_tree, &event.logical_key, self.modifiers.shift_key()) {
+                let press = key_press(&event, self.modifiers);
+                if handle_key(&mut self.widget_tree, &press, &mut self.chrome, &mut self.clipboard) {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::Ime(ime) => {
+                if let Some(id) = self.focused_text_input() {
+                    text_input::handle_ime(&mut self.widget_tree, id, &ime, &mut self.chrome);
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -1729,8 +1781,13 @@ impl<B: SurfaceBackend> App<B> {
                     floater.cursor = (logical.x as f32, logical.y as f32);
                 }
                 let dragging_widget = self.floating.get(&window_id).is_some_and(|f| {
-                    f.dragging_slider.is_some() || f.dragging_splitter.is_some()
+                    f.dragging_slider.is_some() || f.dragging_splitter.is_some() || f.dragging_text.is_some()
                 });
+                if let Some(floater) = self.floating.get_mut(&window_id) {
+                    if let Some(id) = floater.dragging_text {
+                        text_input::handle_drag(&mut floater.widget_tree, id, floater.cursor.0, &mut floater.chrome);
+                    }
+                }
                 let dragging_window = self.dragging_floating_panel.is_some_and(|(id, _)| id == window_id);
                 let resizing =
                     self.dragging_floating_resize.as_ref().is_some_and(|d| d.window_id == window_id);
@@ -1761,13 +1818,14 @@ impl<B: SurfaceBackend> App<B> {
                 ElementState::Pressed => self.handle_floating_mouse_press(window_id),
                 ElementState::Released => {
                     let was_dragging = self.floating.get(&window_id).is_some_and(|f| {
-                        f.dragging_slider.is_some() || f.dragging_splitter.is_some()
+                        f.dragging_slider.is_some() || f.dragging_splitter.is_some() || f.dragging_text.is_some()
                     }) || self.dragging_floating_panel.is_some_and(|(id, _)| id == window_id)
                         || self.dragging_floating_resize.as_ref().is_some_and(|d| d.window_id == window_id)
                         || self.dragging_from_floating.is_some();
                     if let Some(floater) = self.floating.get_mut(&window_id) {
                         floater.dragging_slider = None;
                         floater.dragging_splitter = None;
+                        floater.dragging_text = None;
                     }
                     self.dragging_floating_panel = None;
                     self.dragging_floating_resize = None;
@@ -1780,9 +1838,18 @@ impl<B: SurfaceBackend> App<B> {
             },
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                let shift = self.modifiers.shift_key();
+                let press = key_press(&event, self.modifiers);
                 if let Some(floater) = self.floating.get_mut(&window_id) {
-                    if handle_key(&mut floater.widget_tree, &event.logical_key, shift) {
+                    if handle_key(&mut floater.widget_tree, &press, &mut floater.chrome, &mut self.clipboard) {
+                        floater.window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::Ime(ime) => {
+                if let Some(floater) = self.floating.get_mut(&window_id) {
+                    let focused = floater.widget_tree.focused();
+                    if let Some(id) = focused.filter(|&id| is_text_input(&floater.widget_tree, id)) {
+                        text_input::handle_ime(&mut floater.widget_tree, id, &ime, &mut floater.chrome);
                         floater.window.request_redraw();
                     }
                 }
@@ -1793,6 +1860,42 @@ impl<B: SurfaceBackend> App<B> {
             }
             _ => {}
         }
+    }
+}
+
+fn is_text_input(tree: &WidgetTree, id: WidgetId) -> bool {
+    matches!(tree.kind(id), Some(WidgetKind::TextInput { .. }))
+}
+
+fn key_press(event: &KeyEvent, modifiers: ModifiersState) -> KeyPress<'_> {
+    KeyPress { key: &event.logical_key, text: event.text.as_deref(), modifiers }
+}
+
+/// Record a press at `cursor`; returns whether it completes a double-click with the last one.
+fn is_double_click(last: &mut Option<(Instant, (f32, f32))>, cursor: (f32, f32)) -> bool {
+    let double = last.is_some_and(|(at, (x, y))| {
+        at.elapsed() <= DOUBLE_CLICK_INTERVAL
+            && (x - cursor.0).abs() <= DOUBLE_CLICK_SLOP
+            && (y - cursor.1).abs() <= DOUBLE_CLICK_SLOP
+    });
+    // A third quick press starts over instead of chaining into another double-click.
+    *last = if double { None } else { Some((Instant::now(), cursor)) };
+    double
+}
+
+/// Allow IME input while a `TextInput` has focus (only then, so shortcuts and dead keys behave
+/// normally elsewhere), and keep the candidate window next to its caret.
+fn sync_ime(window: &Window, tree: &WidgetTree, chrome: &mut ChromeRenderer, allowed: &mut bool) {
+    let area = text_input::ime_cursor_area(tree, chrome);
+    if area.is_some() != *allowed {
+        *allowed = area.is_some();
+        window.set_ime_allowed(*allowed);
+    }
+    if let Some(rect) = area {
+        window.set_ime_cursor_area(
+            LogicalPosition::new(f64::from(rect.x), f64::from(rect.y)),
+            LogicalSize::new(f64::from(rect.width), f64::from(rect.height)),
+        );
     }
 }
 
@@ -1825,8 +1928,12 @@ pub fn run<B: SurfaceBackend>(
         has_widget_content: false,
         cursor: (0.0, 0.0),
         modifiers: ModifiersState::empty(),
+        clipboard: SystemClipboard::default(),
         dragging_slider: None,
         dragging_splitter: None,
+        dragging_text: None,
+        last_click: None,
+        ime_allowed: false,
         dragging_panel_title: None,
         hover_region: None,
         dragging_floating_panel: None,

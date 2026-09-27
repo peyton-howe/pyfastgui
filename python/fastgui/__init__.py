@@ -1,4 +1,4 @@
-from ._fastgui import Box, Button, CudaSurface, Label, Panel, Slider, Splitter, Tabs, Viewport, Window
+from ._fastgui import Box, Button, CudaSurface, Label, Panel, Slider, Splitter, Tabs, TextInput, Viewport, Window
 
 _REGIONS = ("center", "left", "right", "top", "bottom")
 
@@ -336,6 +336,7 @@ __all__ = [
     "Slider",
     "Splitter",
     "Tabs",
+    "TextInput",
     "Viewport",
     "Window",
 ]

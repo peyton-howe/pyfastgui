@@ -454,3 +454,72 @@ fn focus_ring_adds_four_quads_and_rebuilds() {
     let focused = chrome.build_quads(&tree, 200, 100, None, 1.0).expect("focus change rebuilds").quads.len();
     assert_eq!(focused, unfocused + 4);
 }
+
+#[test]
+fn caret_stops_are_monotonic_and_round_trip() {
+    let mut chrome = ChromeRenderer::new();
+    let text = "Hello wörld 👍🏽!";
+    let stops = chrome.line_stops(text, 16.0);
+    assert_eq!(stops.last().map(|s| s.0), Some(text.len()));
+    assert!(stops.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].1), "{stops:?}");
+    for &(index, x) in stops.iter() {
+        assert_eq!(chrome.index_at(text, 16.0, x + 0.2), index);
+        assert_eq!(chrome.caret_x(text, 16.0, index), x);
+    }
+    assert_eq!(chrome.index_at(text, 16.0, -50.0), 0);
+    assert_eq!(chrome.index_at(text, 16.0, 1e6), text.len());
+    assert_eq!(chrome.caret_x("", 16.0, 0), 0.0);
+}
+
+fn text_input_tree(text: &str, width: f32, scroll: f32) -> (WidgetTree, WidgetId) {
+    let mut tree = WidgetTree::new();
+    let root = tree.root();
+    let input = tree.new_node(
+        Style { size: Size { width: Dimension::length(width), height: Dimension::length(32.0) }, ..Default::default() },
+        WidgetKind::TextInput {
+            edit: fastgui_core::text_edit::TextEdit::new(text),
+            placeholder: "type here".into(),
+            font_size: 16.0,
+            text_color: Color([1.0; 4]),
+            placeholder_color: Color([0.5, 0.5, 0.5, 1.0]),
+            background: Color([0.2, 0.2, 0.2, 1.0]),
+            selection_color: Color([0.2, 0.4, 0.8, 1.0]),
+            scroll,
+            preedit: None,
+            on_change: None,
+            on_submit: None,
+            mirror: None,
+        },
+    );
+    tree.add_child(root, input);
+    tree.compute_layout(400.0, 100.0);
+    (tree, input)
+}
+
+#[test]
+fn long_text_input_line_is_clipped_to_its_field_at_any_scroll() {
+    let text = "a long line of text that is much wider than the little field it sits in";
+    for scroll in [0.0, 120.0] {
+        let (mut tree, input) = text_input_tree(text, 100.0, scroll);
+        tree.set_focus(Some(input));
+        let mut chrome = ChromeRenderer::new();
+        let items = chrome.build_items(&tree, None, 2.0, PixelRect { x: 0, y: 0, width: 800, height: 200 });
+        let field = &items.iter().find(|item| item.key == u64::from(input)).expect("field item").ops;
+        let text_ops: Vec<_> = field.iter().filter_map(|op| match op { Op::Text { run, x, .. } => Some((run, *x)), _ => None }).collect();
+        assert_eq!(text_ops.len(), 1, "one line of text at scroll {scroll}");
+        let (run, x) = text_ops[0];
+        let padding = (TEXT_INPUT_PADDING * 2.0) as i32;
+        assert!(x + run.x >= padding && x + run.x + run.width as i32 <= 200 - padding, "scroll {scroll}: text spills out");
+        // Background, focus ring (4), text, caret — no selection.
+        assert_eq!(field.len(), 7, "scroll {scroll}");
+    }
+}
+
+#[test]
+fn empty_unfocused_text_input_shows_placeholder_without_caret() {
+    let (tree, input) = text_input_tree("", 200.0, 0.0);
+    let mut chrome = ChromeRenderer::new();
+    let items = chrome.build_items(&tree, None, 1.0, PixelRect { x: 0, y: 0, width: 400, height: 100 });
+    let field = &items.iter().find(|item| item.key == u64::from(input)).unwrap().ops;
+    assert!(matches!(field.as_slice(), [Op::Fill { .. }, Op::Text { .. }]), "background + placeholder only");
+}

@@ -13,6 +13,7 @@ mod ghost;
 mod keyboard;
 mod resize_edge;
 mod surface;
+mod text_input;
 
 pub use app::{run, RunError};
 pub use command::{Command, CommandDispatch, EventWaker, RenderThreadHandles};
