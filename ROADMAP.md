@@ -1208,6 +1208,86 @@ Concrete and fully achievable/verifiable on this machine (at least the Windows l
   session or a different machine needs to redo the M0 toolchain setup (Rust, MSVC, Vulkan
   SDK, both venvs) before any of this builds.
 
+## M7 — Widget set: Qt parity and beyond (planned, not started)
+
+Goal: match Qt's everyday widget coverage, then go past it where fastgui's architecture
+(GPU-native chrome, CUDA interop, no-GIL cross-thread mutation) gives a real advantage.
+
+**Current set:** `Box` (flex), `Label`, `Button`, `Slider`, `Splitter`, `Panel`, `Tabs`,
+`DockArea`, floating panels, `Viewport` (CPU/CUDA frames). See `WidgetKind` in
+`fastgui-core/src/widget.rs`.
+
+Order matters: most missing widgets are blocked on infrastructure, not on the widget code
+itself. Adding widgets before 7A lands means more `Slider`-style self-contained one-offs.
+
+### 7A. Foundations (do first)
+
+1. **Keyboard focus + routing** — a focused-widget id, Tab/Shift+Tab traversal, key events
+   delivered to the focused widget. Prerequisite for every input widget.
+2. **Text editing core** — build on `cosmic-text`'s `Editor` (cursor, selection, undo,
+   clipboard, IME via winit's `Ime` events). Also replace the `measure_text` heuristic with real
+   `cosmic-text` shaping, and add text wrapping.
+3. **Scroll container + clipping** — needs per-quad clip rects in the GPU quad pipeline (Vulkan
+   and Metal). The GPU chrome path already makes scroll cheap (~128 KiB/frame upload in
+   `chrome_bench`'s table scene vs 24 MiB on the CPU path).
+4. **Overlay / popup layer** — z-ordered layer above content, dismiss-on-outside-click. Grow it
+   out of the floating-panel machinery. Unblocks menus, combos, tooltips, dialogs.
+5. **Virtualization** — build only visible rows; required for lists/trees/tables to scale.
+6. **Theming** — shared palette/font/spacing tokens instead of per-widget color arguments.
+
+### 7B. Tier 1 — core form controls
+
+- Single-line and multi-line text input (`QLineEdit` / `QTextEdit`)
+- Checkbox, radio group, toggle switch
+- Spin box (int/float) and a drag-to-scrub numeric field
+- Combo box / dropdown (needs 7A.4)
+- Progress bar
+- Scroll area (needs 7A.3)
+- Grid layout — `taffy` already supports CSS Grid, so this is mostly bindings
+- Image widget
+
+### 7C. Tier 2 — application structure
+
+- Menu bar, context menus, keyboard shortcuts / accelerators
+- Toolbar, status bar
+- Tooltips
+- Modal and modeless dialogs; native file/color pickers via the OS (e.g. the `rfd` crate)
+- Group box, collapsible section, stacked widget (one child visible at a time)
+
+### 7D. Tier 3 — data views
+
+- Virtualized list, tree, and table views. Simpler than Qt's model/view: accept numpy arrays or
+  Arrow columns directly for tables.
+- Property inspector (label + editor per row)
+
+### 7E. Tier 4 — beyond Qt (fastgui's differentiators)
+
+- **GPU plot widgets** (line, scatter, heatmap) fed straight from numpy or CUDA buffers —
+  pyqtgraph-class functionality built in, at better frame rates. Recommended headline feature
+  once 7A–7C are in.
+- **Image/tensor viewer** on `Viewport`: zoom, pan, pixel-value readout, colormaps. Requires the
+  still-missing `Viewport` aspect-ratio preservation (see M4 known simplifications).
+- **Node graph editor** — no built-in Qt equivalent.
+- **Log/console view** appendable from any thread without locks; code editor with syntax
+  highlighting.
+- **Timeline / sequencer**; gauges and meters for live telemetry.
+- **Command palette** (Ctrl+K-style search over app commands).
+- **Reactive data binding** — widgets bound to Python values/observables instead of manual
+  callback wiring.
+
+### 7F. Cross-cutting (plan early, don't bolt on)
+
+- **Accessibility** via `accesskit` (has a winit adapter). Qt has screen-reader support;
+  skipping this is where fastgui would fall short of it.
+- **HiDPI** scale factor applied to chrome.
+- **Drag-and-drop** between widgets and from the OS, generalizing the docking drag code.
+
+### Suggested order
+
+7A.1–7A.2 (focus + text input) → 7A.3–7A.4 (scroll + popups) → 7B → 7C → GPU plotting (7E) →
+7D → rest of 7E. Keep 7F in mind throughout, especially focus traversal (it doubles as the
+accessibility tree's navigation order).
+
 ## How this project has been built (read before continuing)
 
 - **No per-milestone re-planning ceremony** — implement directly using the architecture
