@@ -1060,10 +1060,12 @@ outside the slider knob's AA rim.
 - *Hidden-tab slider thumb.* Inactive tab content is `Display::None` with a 0×0 rect at the
   origin; `push_slider` still drew the thumb circle there (blue quarter-disk in `tabs_demo`).
   Empty rects now skip the thumb; `hidden_slider_does_not_draw_thumb_at_origin` covers it.
-- *`ERROR_SURFACE_LOST_KHR`.* Destroying the window out from under the app (e.g. xkill during
-  `vk_chrome_stress`) used to bubble out of `render_frame` and panic via `.expect("run")`.
-  Acquire/present now treat surface-lost like a skipped frame (same spirit as Metal's missing
-  drawable); a normal close was already fine.
+- *`ERROR_SURFACE_LOST_KHR` + `Destroyed`.* Destroying the window out from under the app (e.g.
+  xkill during `vk_chrome_stress`) used to panic via `.expect("run")`. Acquire/present now skip
+  surface-lost frames; `WindowEvent::Destroyed` exits the main loop (and routes floater destroy
+  through the close callback). Re-checked on Linux Mesa (`450f1b5`): six programs exit 0 ~0.1 s
+  after external destroy on both chrome paths; floater destroy fires CLOSE 8/8. Real NVIDIA/AMD/
+  Intel Vulkan still worth a pass before merge (all Linux verification so far is llvmpipe).
 
 **Local macOS dev gotcha:** `.venv/lib/python3.14/site-packages/fastgui` is a symlink to this
 repo's `python/fastgui`, which shadows maturin's editable `.pth`. The repo's `.so` always
