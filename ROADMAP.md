@@ -1049,10 +1049,14 @@ Vulkan (Mesa llvmpipe) with validation — `vulkan_quads_match_cpu_painter`, eve
 outside the slider knob's AA rim.
 - *Debounced resize scramble (Vulkan).* Mid-resize, `build_quads` uses the new size while the
   swapchain is still old; `quad.frag` now remaps `gl_FragCoord` by viewport/target so coverage
-  and atlas fetches stay in quad space (stretched-but-readable, like the CPU texture).
+  and atlas fetches stay in quad space (stretched-but-readable, like the CPU texture). Re-checked
+  on Linux Mesa + validation (`ea7f195`): mid-resize vs CPU differing pixels dropped from
+  ~21k–75k to ~3k–8k on dock/tabs demos; settled frames match a fresh launch; zero validation
+  messages.
 - *0×0 atlas.* A text-free tree never overflowed the empty atlas, so backends got a zero-extent
   image (8 validation errors on `live_camera_feed`). `build_quads` now resets to `ATLAS_MIN_SIZE`
-  (512) first; `gpu_atlas_is_never_zero_sized` covers it.
+  (512) first; `gpu_atlas_is_never_zero_sized` covers it. Confirmed on Linux: `live_camera_feed`
+  GPU path is clean on 3.13 and 3.14t.
 
 **Local macOS dev gotcha:** `.venv/lib/python3.14/site-packages/fastgui` is a symlink to this
 repo's `python/fastgui`, which shadows maturin's editable `.pth`. The repo's `.so` always
