@@ -13,7 +13,7 @@ use winit::window::{Window, WindowId, WindowLevel};
 use crate::cloak::set_cloaked;
 use crate::command::{Command, RenderThreadHandles};
 use crate::constants::*;
-use crate::coords::scale_rect;
+use crate::coords::{remap_rect, scale_rect};
 use crate::ghost::build_tear_ghost_tree;
 use crate::resize_edge::{classify_float_resize_edge, resize_edge_cursor, ResizeEdge};
 use crate::surface::{MainResizePolicy, SurfaceBackend};
@@ -1418,7 +1418,16 @@ impl<B: SurfaceBackend> App<B> {
             event_loop.exit();
             return false;
         }
-        let draws = self.viewport_draws();
+        // Mid debounced resize the layout is already at the new size but the surface isn't;
+        // stretch viewport rects the same way chrome is stretched so they stay inside their
+        // panels instead of over/undershooting until the resize settles.
+        let layout = (self.physical_width, self.physical_height);
+        let surface = self.last_applied_physical;
+        let draws: Vec<_> = self
+            .viewport_draws()
+            .into_iter()
+            .map(|(id, rect)| (id, remap_rect(rect, layout, surface)))
+            .collect();
         let draw_chrome = self.has_widget_content;
         let clear_color = self.clear_color;
         if let Some(renderer) = &mut self.renderer {

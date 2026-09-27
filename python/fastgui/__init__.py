@@ -93,6 +93,18 @@ class DockArea:
             return
         if dragged_id == target_id:
             return
+        # A tab dropped on its own group: extraction rebuilds that group as a new `Tabs` (new
+        # id) or collapses it to its last `Panel`, so `target_id` won't survive `_extract`.
+        # Remember a sibling tab to re-find the group by afterwards.
+        own_group_sibling = None
+        if target_id != _ROOT_REGION_ID and self._root is not None:
+            target_leaf = _find_leaf(self._root, target_id)
+            if target_leaf is not None and isinstance(target_leaf["widget"], Tabs):
+                member_ids = [p.id for p in target_leaf["widget"].panels]
+                if dragged_id in member_ids:
+                    if zone == "center":
+                        return  # Already in this group.
+                    own_group_sibling = next(i for i in member_ids if i != dragged_id)
         from_floating = False
         if self._root is None:
             # Empty dock (every panel was torn out): only a floating re-dock can fill it.
@@ -145,6 +157,10 @@ class DockArea:
                 first, second, ratio = extracted, remainder, 0.25
             new_root = {"kind": "split", "direction": direction, "ratio": ratio, "first": first, "second": second}
         else:
+            if own_group_sibling is not None:
+                target_leaf = _find_leaf_containing(remainder, own_group_sibling)
+                if target_leaf is not None:
+                    target_id = target_leaf["widget"].id
             target_leaf = _find_leaf(remainder, target_id)
             if target_leaf is None:
                 # Target vanished (e.g. it was the dragged panel's own sibling and got collapsed
@@ -284,6 +300,20 @@ def _find_leaf(node, region_id: int):
     if node["kind"] == "leaf":
         return node if node["widget"].id == region_id else None
     return _find_leaf(node["first"], region_id) or _find_leaf(node["second"], region_id)
+
+
+def _find_leaf_containing(node, panel_id: int):
+    """The leaf holding `panel_id`: the `Panel` leaf itself, or the `Tabs` leaf it's a tab of."""
+    if node is None:
+        return None
+    if node["kind"] == "leaf":
+        widget = node["widget"]
+        if widget.id == panel_id:
+            return node
+        if isinstance(widget, Tabs) and any(p.id == panel_id for p in widget.panels):
+            return node
+        return None
+    return _find_leaf_containing(node["first"], panel_id) or _find_leaf_containing(node["second"], panel_id)
 
 
 def _replace(node, region_id: int, replacement):
