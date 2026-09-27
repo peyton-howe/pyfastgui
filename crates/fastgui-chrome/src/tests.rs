@@ -429,3 +429,28 @@ fn hidden_slider_does_not_draw_thumb_at_origin() {
         "top-left pixel looks like the slider thumb: {corner:?}"
     );
 }
+
+#[test]
+fn focus_ring_adds_four_quads_and_rebuilds() {
+    let mut tree = WidgetTree::new();
+    let root = tree.root();
+    let button = tree.new_node(
+        Style { size: Size { width: Dimension::length(80.0), height: Dimension::length(30.0) }, ..Default::default() },
+        WidgetKind::Button {
+            text: "Go".into(),
+            font_size: 14.0,
+            text_color: Color([1.0; 4]),
+            background: Color([0.2, 0.2, 0.2, 1.0]),
+            on_click: None,
+        },
+    );
+    tree.add_child(root, button);
+    tree.compute_layout(200.0, 100.0);
+
+    let mut chrome = ChromeRenderer::new();
+    let unfocused = chrome.build_quads(&tree, 200, 100, None, 1.0).expect("first frame").quads.len();
+    assert!(chrome.build_quads(&tree, 200, 100, None, 1.0).is_none(), "no change, no rebuild");
+    tree.set_focus(Some(button));
+    let focused = chrome.build_quads(&tree, 200, 100, None, 1.0).expect("focus change rebuilds").quads.len();
+    assert_eq!(focused, unfocused + 4);
+}

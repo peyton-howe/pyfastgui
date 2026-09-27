@@ -193,6 +193,8 @@ Roughly, the checklist an existing widget's implementation demonstrates:
    and wire any special attach-time cross-referencing into `attach()` if needed.
 4. Handle any new input behavior (click, drag) in `fastgui-app`'s shared
    `handle_mouse_press` / cursor-move / release dispatch (one place for both backends).
+   If it takes keyboard input, add it to `WidgetKind::is_focusable` (Tab order and
+   click-to-focus come with that) and handle its keys in `fastgui-app/src/keyboard.rs`.
 5. Add the type stub in `python/fastgui/__init__.pyi`.
 6. Verify by actually running an example — see ROADMAP.md's "How this project has been built"
    for why this step isn't optional.

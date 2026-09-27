@@ -59,6 +59,10 @@ const TEXT_CACHE_KEEP_FRAMES: u64 = 120;
 
 const SLIDER_THUMB_RADIUS: f32 = 8.0;
 
+/// Keyboard-focus outline, drawn just inside the focused widget's rect (points, before scale).
+const FOCUS_RING_COLOR: Color = Color([0.4, 0.7, 1.0, 1.0]);
+const FOCUS_RING_WIDTH: f32 = 2.0;
+
 pub struct ChromeRenderer {
     font_system: FontSystem,
     swash_cache: SwashCache,
@@ -234,6 +238,9 @@ impl ChromeRenderer {
                     // Placeholder only — the GPU draws the real frame in this rect after chrome.
                     push_fill(&mut ops, rect, Color([0.05, 0.06, 0.08, 1.0]));
                 }
+            }
+            if tree.focused() == Some(id) {
+                push_outline(&mut ops, rect, FOCUS_RING_WIDTH * scale, FOCUS_RING_COLOR);
             }
             items.push(Item::new(u64::from(id), ops, window));
         }
@@ -644,6 +651,19 @@ fn push_slider(
     let fraction = if max > min { ((value - min) / (max - min)).clamp(0.0, 1.0) } else { 0.0 };
     let (cx, cy, radius) = (rect.x + fraction * rect.width, rect.y + rect.height / 2.0, SLIDER_THUMB_RADIUS * scale);
     ops.push(Op::Circle { cx, cy, radius, color: thumb_color, sprite: OnceLock::new() });
+}
+
+/// A `width`-thick border along the inside of `rect`, as four fills.
+fn push_outline(ops: &mut Vec<Op>, rect: WidgetRect, width: f32, color: Color) {
+    let width = width.min(rect.width / 2.0).min(rect.height / 2.0);
+    if width <= 0.0 {
+        return;
+    }
+    let WidgetRect { x, y, width: w, height: h } = rect;
+    push_fill(ops, WidgetRect { x, y, width: w, height: width }, color);
+    push_fill(ops, WidgetRect { x, y: y + h - width, width: w, height: width }, color);
+    push_fill(ops, WidgetRect { x, y: y + width, width, height: h - 2.0 * width }, color);
+    push_fill(ops, WidgetRect { x: x + w - width, y: y + width, width, height: h - 2.0 * width }, color);
 }
 
 fn push_fill(ops: &mut Vec<Op>, rect: WidgetRect, color: Color) {

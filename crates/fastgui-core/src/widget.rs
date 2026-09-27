@@ -219,6 +219,13 @@ pub enum WidgetKind {
     },
 }
 
+impl WidgetKind {
+    /// Whether this widget can take keyboard focus (click or Tab to it).
+    pub fn is_focusable(&self) -> bool {
+        matches!(self, WidgetKind::Button { .. } | WidgetKind::Slider { .. })
+    }
+}
+
 /// An axis-aligned rect in window (physical pixel) coordinates — a widget's absolute position
 /// after `compute_layout`, unlike taffy's own `Layout::location`, which is parent-relative.
 #[derive(Clone, Copy, Debug, Default)]
@@ -280,6 +287,9 @@ pub struct WidgetTree {
     /// nothing about the UI actually changed.
     dirty: bool,
     absolute_rects: HashMap<WidgetId, Rect>,
+    /// The widget keyboard input goes to (see `fastgui-app`'s key handling). Cleared by
+    /// `reset`, so a `set_content` rebuild starts unfocused.
+    focused: Option<WidgetId>,
 }
 
 /// Always fills the window: whatever `Window.set_content(widget)` was given becomes this
@@ -298,7 +308,7 @@ impl WidgetTree {
         let root = taffy.new_leaf(root_style()).expect("creating the root node cannot fail");
         let mut kinds = HashMap::new();
         kinds.insert(root, WidgetKind::Container { background: Color::TRANSPARENT, region_id: None });
-        Self { taffy, kinds, root, dirty: true, absolute_rects: HashMap::new() }
+        Self { taffy, kinds, root, dirty: true, absolute_rects: HashMap::new(), focused: None }
     }
 
     pub fn root(&self) -> WidgetId {
@@ -323,6 +333,7 @@ impl WidgetTree {
         self.kinds.clear();
         self.root = self.taffy.new_leaf(root_style()).expect("creating the root node cannot fail");
         self.kinds.insert(self.root, WidgetKind::Container { background: Color::TRANSPARENT, region_id: None });
+        self.focused = None;
         self.mark_dirty();
     }
 
@@ -494,6 +505,45 @@ impl WidgetTree {
             }
         }
         best.map(|(_, id)| id)
+    }
+
+    pub fn focused(&self) -> Option<WidgetId> {
+        self.focused
+    }
+
+    /// Give `id` keyboard focus (`None` clears it). Ignores ids that aren't focusable, so a
+    /// click on a label or background just clears focus. Marks dirty only on a change, since
+    /// the focus ring is chrome.
+    pub fn set_focus(&mut self, id: Option<WidgetId>) {
+        let id = id.filter(|&id| self.kind(id).is_some_and(WidgetKind::is_focusable));
+        if id != self.focused {
+            self.focused = id;
+            self.dirty = true;
+        }
+    }
+
+    /// Move focus to the next (or, with `backward`, previous) focusable widget in tree order,
+    /// wrapping around — Tab / Shift+Tab. Skips widgets laid out at zero size, which is how
+    /// hidden tab content and other `Display::None` subtrees end up. Returns the new focus.
+    pub fn focus_next(&mut self, backward: bool) -> Option<WidgetId> {
+        let order: Vec<WidgetId> = self
+            .walk()
+            .filter(|&id| self.kind(id).is_some_and(WidgetKind::is_focusable))
+            .filter(|&id| self.absolute_rect(id).is_some_and(|r| r.width > 0.0 && r.height > 0.0))
+            .collect();
+        if order.is_empty() {
+            self.set_focus(None);
+            return None;
+        }
+        let current = self.focused.and_then(|f| order.iter().position(|&id| id == f));
+        let next = match (current, backward) {
+            (Some(i), false) => (i + 1) % order.len(),
+            (Some(i), true) => (i + order.len() - 1) % order.len(),
+            (None, false) => 0,
+            (None, true) => order.len() - 1,
+        };
+        self.set_focus(Some(order[next]));
+        self.focused
     }
 
     /// Find the `DockArea` region (a `Container { region_id: Some(_), .. }` — a `Panel`'s or
@@ -870,6 +920,66 @@ mod tests {
         tree.compute_layout(100.0, 80.0);
         let found = tree.find_region_at(20.0, 20.0).expect("docked region under overlay");
         assert_eq!(found.0, 1);
+    }
+
+    fn focus_tree() -> (WidgetTree, WidgetId, WidgetId, WidgetId, WidgetId) {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let button = |tree: &mut WidgetTree| {
+            tree.new_node(
+                Style { size: Size { width: Dimension::length(40.0), height: Dimension::length(20.0) }, ..Default::default() },
+                WidgetKind::Button {
+                    text: "b".into(),
+                    font_size: 12.0,
+                    text_color: Color::TRANSPARENT,
+                    background: Color::TRANSPARENT,
+                    on_click: None,
+                },
+            )
+        };
+        let a = button(&mut tree);
+        let label = tree.new_node(
+            Style::default(),
+            WidgetKind::Label { text: "x".into(), font_size: 12.0, color: Color::TRANSPARENT },
+        );
+        let hidden = tree.new_node(
+            Style { display: Display::None, ..Default::default() },
+            WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+        );
+        let hidden_button = button(&mut tree);
+        tree.add_child(hidden, hidden_button);
+        let b = button(&mut tree);
+        for child in [a, label, hidden, b] {
+            tree.add_child(root, child);
+        }
+        tree.compute_layout(200.0, 200.0);
+        (tree, a, label, hidden_button, b)
+    }
+
+    #[test]
+    fn focus_next_cycles_visible_focusables_both_ways() {
+        let (mut tree, a, _, _, b) = focus_tree();
+        assert_eq!(tree.focus_next(false), Some(a));
+        assert_eq!(tree.focus_next(false), Some(b), "skips the label and the hidden button");
+        assert_eq!(tree.focus_next(false), Some(a), "wraps");
+        assert_eq!(tree.focus_next(true), Some(b), "backward wraps");
+        tree.set_focus(None);
+        assert_eq!(tree.focus_next(true), Some(b), "backward from nothing starts at the end");
+    }
+
+    #[test]
+    fn set_focus_ignores_unfocusable_and_reset_clears() {
+        let (mut tree, a, label, _, _) = focus_tree();
+        tree.set_focus(Some(a));
+        tree.clear_dirty();
+        tree.set_focus(Some(a));
+        assert!(!tree.is_dirty(), "refocusing the same widget changes nothing");
+        tree.set_focus(Some(label));
+        assert_eq!(tree.focused(), None);
+        assert!(tree.is_dirty());
+        tree.set_focus(Some(a));
+        tree.reset();
+        assert_eq!(tree.focused(), None);
     }
 
     #[test]

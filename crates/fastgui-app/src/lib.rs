@@ -10,6 +10,7 @@ mod constants;
 mod coords;
 mod cuda_handles;
 mod ghost;
+mod keyboard;
 mod resize_edge;
 mod surface;
 

@@ -8,6 +8,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::cloak::set_cloaked;
@@ -15,6 +16,7 @@ use crate::command::{Command, RenderThreadHandles};
 use crate::constants::*;
 use crate::coords::{remap_rect, scale_rect};
 use crate::ghost::build_tear_ghost_tree;
+use crate::keyboard::handle_key;
 use crate::resize_edge::{classify_float_resize_edge, resize_edge_cursor, ResizeEdge};
 use crate::surface::{MainResizePolicy, SurfaceBackend};
 
@@ -133,6 +135,9 @@ struct App<B: SurfaceBackend> {
     /// just a clear color -- `basic_window.py` -- and we skip chrome rasterization entirely.
     has_widget_content: bool,
     cursor: (f32, f32),
+    /// Held modifier keys (Shift for Shift+Tab). One copy for every window: winit reports
+    /// changes to whichever window has keyboard focus.
+    modifiers: ModifiersState,
     dragging_slider: Option<WidgetId>,
     dragging_splitter: Option<WidgetId>,
     /// `(title bar's own WidgetId, that Panel's region_id)` while a `Panel` title bar is being
@@ -527,7 +532,10 @@ impl<B: SurfaceBackend> App<B> {
             self.dragging_splitter = Some(bar);
             return;
         }
-        let Some(id) = self.widget_tree.hit_test(self.cursor.0, self.cursor.1) else { return };
+        let hit = self.widget_tree.hit_test(self.cursor.0, self.cursor.1);
+        // Clicking a focusable widget focuses it; clicking anything else clears focus.
+        self.widget_tree.set_focus(hit);
+        let Some(id) = hit else { return };
         let Some(kind) = self.widget_tree.kind(id) else { return };
         match kind {
             WidgetKind::Button { on_click, .. } => {
@@ -629,7 +637,11 @@ impl<B: SurfaceBackend> App<B> {
             }
             return;
         }
-        let Some(id) = floater.widget_tree.hit_test(cursor.0, cursor.1) else { return };
+        let hit = floater.widget_tree.hit_test(cursor.0, cursor.1);
+        let Some(floater) = self.floating.get_mut(&window_id) else { return };
+        floater.widget_tree.set_focus(hit);
+        let floater = &*floater;
+        let Some(id) = hit else { return };
         let Some(kind) = floater.widget_tree.kind(id) else { return };
         match kind {
             WidgetKind::Button { on_click, .. } => {
@@ -1631,6 +1643,14 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                     }
                 }
             },
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if handle_key(&mut self.widget_tree, &event.logical_key, self.modifiers.shift_key()) {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => {
                 self.render_window(event_loop, window_id);
                 self.schedule_control_flow(event_loop);
@@ -1758,6 +1778,15 @@ impl<B: SurfaceBackend> App<B> {
                     }
                 }
             },
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                let shift = self.modifiers.shift_key();
+                if let Some(floater) = self.floating.get_mut(&window_id) {
+                    if handle_key(&mut floater.widget_tree, &event.logical_key, shift) {
+                        floater.window.request_redraw();
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => {
                 self.render_window(event_loop, window_id);
                 self.schedule_control_flow(event_loop);
@@ -1795,6 +1824,7 @@ pub fn run<B: SurfaceBackend>(
         last_raster_scale: 0.0,
         has_widget_content: false,
         cursor: (0.0, 0.0),
+        modifiers: ModifiersState::empty(),
         dragging_slider: None,
         dragging_splitter: None,
         dragging_panel_title: None,

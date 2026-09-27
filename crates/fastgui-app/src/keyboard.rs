@@ -1,0 +1,157 @@
+//! Keyboard focus traversal and activation, shared by the main window and floaters (each has
+//! its own `WidgetTree`, so its own focus).
+
+use fastgui_core::widget::{WidgetKind, WidgetTree};
+use winit::keyboard::{Key, NamedKey};
+
+/// Fraction of a slider's range one arrow press moves it; PageUp/PageDown move ten steps.
+const SLIDER_STEP: f32 = 0.01;
+const SLIDER_PAGE: f32 = 0.1;
+
+/// Apply one key press to `tree`: Tab / Shift+Tab move focus, Escape clears it, and the
+/// focused widget handles the rest (Enter/Space click a `Button`; arrows, PageUp/PageDown and
+/// Home/End move a `Slider`). Returns whether anything happened, i.e. whether to redraw.
+pub fn handle_key(tree: &mut WidgetTree, key: &Key, shift: bool) -> bool {
+    match key {
+        Key::Named(NamedKey::Tab) => {
+            tree.focus_next(shift);
+            return true;
+        }
+        Key::Named(NamedKey::Escape) if tree.focused().is_some() => {
+            tree.set_focus(None);
+            return true;
+        }
+        _ => {}
+    }
+    let Some(id) = tree.focused() else { return false };
+    match tree.kind(id) {
+        Some(WidgetKind::Button { on_click, .. }) => {
+            let activate = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space))
+                || matches!(key, Key::Character(c) if c == " ");
+            if activate {
+                if let Some(callback) = on_click.clone() {
+                    callback();
+                }
+            }
+            activate
+        }
+        Some(&WidgetKind::Slider { value, min, max, .. }) => {
+            let range = max - min;
+            let target = match key {
+                Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowDown) => value - range * SLIDER_STEP,
+                Key::Named(NamedKey::ArrowRight | NamedKey::ArrowUp) => value + range * SLIDER_STEP,
+                Key::Named(NamedKey::PageDown) => value - range * SLIDER_PAGE,
+                Key::Named(NamedKey::PageUp) => value + range * SLIDER_PAGE,
+                Key::Named(NamedKey::Home) => min,
+                Key::Named(NamedKey::End) => max,
+                _ => return false,
+            };
+            set_slider_value(tree, id, target.clamp(min.min(max), max.max(min)));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Set a slider's value and fire its `on_change` — unless the value didn't move (already at
+/// an end), so holding an arrow key against the stop doesn't spam the callback.
+fn set_slider_value(tree: &mut WidgetTree, id: fastgui_core::widget::WidgetId, new_value: f32) {
+    let mut changed = false;
+    tree.mutate_kind(id, |kind| {
+        if let WidgetKind::Slider { value, .. } = kind {
+            changed = *value != new_value;
+            *value = new_value;
+        }
+    });
+    if !changed {
+        return;
+    }
+    if let Some(WidgetKind::Slider { on_change: Some(callback), .. }) = tree.kind(id) {
+        callback(new_value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use fastgui_core::taffy::prelude::*;
+    use fastgui_core::widget::{Color, WidgetId};
+
+    use super::*;
+
+    fn fixed(w: f32, h: f32) -> Style {
+        Style { size: Size { width: Dimension::length(w), height: Dimension::length(h) }, ..Default::default() }
+    }
+
+    fn tree_with(kinds: Vec<WidgetKind>) -> (WidgetTree, Vec<WidgetId>) {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let ids: Vec<_> = kinds.into_iter().map(|k| tree.new_node(fixed(100.0, 20.0), k)).collect();
+        for &id in &ids {
+            tree.add_child(root, id);
+        }
+        tree.compute_layout(300.0, 300.0);
+        (tree, ids)
+    }
+
+    fn slider(value: f32, on_change: Option<fastgui_core::widget::ChangeCallback>) -> WidgetKind {
+        WidgetKind::Slider {
+            value,
+            min: 0.0,
+            max: 2.0,
+            track_color: Color::TRANSPARENT,
+            thumb_color: Color::TRANSPARENT,
+            on_change,
+        }
+    }
+
+    #[test]
+    fn enter_and_space_click_focused_button() {
+        let clicks = Arc::new(AtomicUsize::new(0));
+        let counter = clicks.clone();
+        let (mut tree, ids) = tree_with(vec![WidgetKind::Button {
+            text: "Go".into(),
+            font_size: 12.0,
+            text_color: Color::TRANSPARENT,
+            background: Color::TRANSPARENT,
+            on_click: Some(Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })),
+        }]);
+        assert!(!handle_key(&mut tree, &Key::Named(NamedKey::Enter), false), "nothing focused");
+        tree.set_focus(Some(ids[0]));
+        assert!(handle_key(&mut tree, &Key::Named(NamedKey::Enter), false));
+        assert!(handle_key(&mut tree, &Key::Named(NamedKey::Space), false));
+        assert!(!handle_key(&mut tree, &Key::Character("a".into()), false));
+        assert_eq!(clicks.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn arrows_step_slider_and_stop_at_ends() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (mut tree, ids) = tree_with(vec![slider(1.0, Some(Arc::new(move |v| sink.lock().unwrap().push(v))))]);
+        tree.set_focus(Some(ids[0]));
+        handle_key(&mut tree, &Key::Named(NamedKey::ArrowRight), false);
+        handle_key(&mut tree, &Key::Named(NamedKey::PageDown), false);
+        handle_key(&mut tree, &Key::Named(NamedKey::End), false);
+        handle_key(&mut tree, &Key::Named(NamedKey::ArrowUp), false);
+        let values = seen.lock().unwrap().clone();
+        assert_eq!(values.len(), 3, "the press against the max stop fires nothing: {values:?}");
+        assert!((values[0] - 1.02).abs() < 1e-5 && (values[1] - 0.82).abs() < 1e-5 && values[2] == 2.0);
+    }
+
+    #[test]
+    fn tab_and_escape_move_and_clear_focus() {
+        let (mut tree, ids) = tree_with(vec![slider(0.0, None), slider(0.0, None)]);
+        assert!(handle_key(&mut tree, &Key::Named(NamedKey::Tab), false));
+        assert_eq!(tree.focused(), Some(ids[0]));
+        handle_key(&mut tree, &Key::Named(NamedKey::Tab), true);
+        assert_eq!(tree.focused(), Some(ids[1]));
+        assert!(handle_key(&mut tree, &Key::Named(NamedKey::Escape), false));
+        assert_eq!(tree.focused(), None);
+        assert!(!handle_key(&mut tree, &Key::Named(NamedKey::Escape), false));
+    }
+}

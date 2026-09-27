@@ -1223,7 +1223,13 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 ### 7A. Foundations (do first)
 
 1. **Keyboard focus + routing** — a focused-widget id, Tab/Shift+Tab traversal, key events
-   delivered to the focused widget. Prerequisite for every input widget.
+   delivered to the focused widget. Prerequisite for every input widget. **Done (2026-09-27):** focus
+   lives in `WidgetTree` (`set_focus`, `focus_next`, per window, cleared on `reset`);
+   `WidgetKind::is_focusable` is currently `Button` + `Slider`. `fastgui-app/src/keyboard.rs`
+   handles Tab/Shift+Tab, Escape (clear), Enter/Space (click a button), and arrows / PageUp /
+   PageDown / Home / End (slider). Click focuses a focusable widget and clears focus otherwise.
+   Chrome draws a 2pt accent ring inside the focused widget. Unit-tested in core, app and
+   chrome; not yet driven interactively (macOS automation permissions were unavailable).
 2. **Text editing core** — build on `cosmic-text`'s `Editor` (cursor, selection, undo,
    clipboard, IME via winit's `Ime` events). Also replace the `measure_text` heuristic with real
    `cosmic-text` shaping, and add text wrapping.
