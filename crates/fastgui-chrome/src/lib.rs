@@ -631,6 +631,12 @@ fn push_slider(
     thumb_color: Color,
     scale: f32,
 ) {
+    // `Display::None` tabs leave a 0×0 rect at (0,0); the track fill already no-ops on that, but
+    // the thumb is a circle centred on the rect and would otherwise paint a quarter-disk in the
+    // window's top-left corner (tabs_demo's hidden Settings slider).
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
     let track_height = (rect.height * 0.3).max(2.0 * scale);
     let track_y = rect.y + (rect.height - track_height) / 2.0;
     push_fill(ops, WidgetRect { x: rect.x, y: track_y, width: rect.width, height: track_height }, track_color);

@@ -381,3 +381,51 @@ fn gpu_atlas_is_never_zero_sized() {
     assert!(frame.atlas_size > 0, "text-free first frame produced a {0}×{0} atlas", frame.atlas_size);
     assert!(frame.atlas_uploads.is_empty());
 }
+
+/// A `Display::None` slider (inactive tab content) must not leave its thumb at the origin —
+/// that was the stray blue quarter-circle in `tabs_demo`'s top-left corner.
+#[test]
+fn hidden_slider_does_not_draw_thumb_at_origin() {
+    let mut tree = WidgetTree::new();
+    let root = tree.root();
+    let visible = tree.new_node(
+        Style { flex_grow: 1.0, ..Default::default() },
+        WidgetKind::Container { background: Color([0.16, 0.17, 0.2, 1.0]), region_id: None },
+    );
+    tree.add_child(root, visible);
+    let hidden = tree.new_node(
+        Style { flex_grow: 1.0, display: Display::None, ..Default::default() },
+        WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+    );
+    tree.add_child(root, hidden);
+    let slider = tree.new_node(
+        Style { size: Size { width: Dimension::auto(), height: length(24.0_f32) }, ..Default::default() },
+        WidgetKind::Slider {
+            value: 0.3,
+            min: 0.0,
+            max: 1.0,
+            track_color: Color([0.3, 0.3, 0.35, 1.0]),
+            thumb_color: Color([0.4, 0.65, 1.0, 1.0]),
+            on_change: None,
+        },
+    );
+    tree.add_child(hidden, slider);
+    tree.compute_layout(400.0, 300.0);
+
+    let mut gpu = ChromeRenderer::new();
+    let frame = gpu.build_quads(&tree, 400, 300, None, 1.0).expect("first frame");
+    let near_origin = frame.quads.iter().filter(|q| {
+        q.kind == fastgui_core::QUAD_CIRCLE && q.rect[0] < 8.0 && q.rect[1] < 8.0
+    });
+    assert_eq!(near_origin.count(), 0, "hidden slider must not emit a circle near (0,0)");
+
+    let mut cpu = ChromeRenderer::new();
+    let painted = cpu.rasterize(&tree, 400, 300, None, 1.0).expect("first frame");
+    // Background is ~[0.10, 0.11, 0.13]; the thumb is bright blue — any corner pixel that far
+    // from the clear color would be the bug.
+    let corner = &painted.data[..4];
+    assert!(
+        corner[2] < 80,
+        "top-left pixel looks like the slider thumb: {corner:?}"
+    );
+}

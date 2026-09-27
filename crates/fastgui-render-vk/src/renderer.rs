@@ -631,6 +631,9 @@ impl VulkanRenderer {
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     return self.recreate_swapchain(self.extent.width, self.extent.height);
                 }
+                // Window destroyed out from under us (xkill, compositor teardown, …). Skip the
+                // frame; CloseRequested/Destroyed will exit. Recreating needs a live surface.
+                Err(vk::Result::ERROR_SURFACE_LOST_KHR) => return Ok(()),
                 Err(e) => return Err(e.into()),
             };
 
@@ -815,6 +818,7 @@ impl VulkanRenderer {
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     self.recreate_swapchain(self.extent.width, self.extent.height)?;
                 }
+                Err(vk::Result::ERROR_SURFACE_LOST_KHR) => return Ok(()),
                 Err(e) => return Err(e.into()),
             }
 

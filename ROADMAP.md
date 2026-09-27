@@ -1057,6 +1057,13 @@ outside the slider knob's AA rim.
   image (8 validation errors on `live_camera_feed`). `build_quads` now resets to `ATLAS_MIN_SIZE`
   (512) first; `gpu_atlas_is_never_zero_sized` covers it. Confirmed on Linux: `live_camera_feed`
   GPU path is clean on 3.13 and 3.14t.
+- *Hidden-tab slider thumb.* Inactive tab content is `Display::None` with a 0×0 rect at the
+  origin; `push_slider` still drew the thumb circle there (blue quarter-disk in `tabs_demo`).
+  Empty rects now skip the thumb; `hidden_slider_does_not_draw_thumb_at_origin` covers it.
+- *`ERROR_SURFACE_LOST_KHR`.* Destroying the window out from under the app (e.g. xkill during
+  `vk_chrome_stress`) used to bubble out of `render_frame` and panic via `.expect("run")`.
+  Acquire/present now treat surface-lost like a skipped frame (same spirit as Metal's missing
+  drawable); a normal close was already fine.
 
 **Local macOS dev gotcha:** `.venv/lib/python3.14/site-packages/fastgui` is a symlink to this
 repo's `python/fastgui`, which shadows maturin's editable `.pth`. The repo's `.so` always
