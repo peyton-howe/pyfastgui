@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use fastgui_chrome::ChromeRenderer;
-use fastgui_core::widget::{WidgetId, WidgetKind, WidgetTree, SPLITTER_HIT_SLOP};
+use fastgui_core::widget::{DropZone, Rect, WidgetId, WidgetKind, WidgetTree, SPLITTER_HIT_SLOP};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -12,7 +13,7 @@ use winit::window::{Window, WindowId, WindowLevel};
 use crate::cloak::set_cloaked;
 use crate::command::{Command, RenderThreadHandles};
 use crate::constants::*;
-use crate::coords::scale_rect;
+use crate::coords::{remap_rect, scale_rect};
 use crate::ghost::build_tear_ghost_tree;
 use crate::resize_edge::{classify_float_resize_edge, resize_edge_cursor, ResizeEdge};
 use crate::surface::{MainResizePolicy, SurfaceBackend};
@@ -62,6 +63,34 @@ impl<E: std::error::Error + Send + Sync + 'static> From<winit::error::EventLoopE
     fn from(value: winit::error::EventLoopError) -> Self {
         RunError::EventLoop(value)
     }
+}
+
+/// Whether chrome is drawn by the GPU (quads + glyph atlas, the default) or rasterized on the
+/// CPU and uploaded as a texture (`FASTGUI_CHROME=cpu`: a fallback, and a way to compare the two
+/// on one machine). Read once per process.
+fn gpu_chrome() -> bool {
+    static GPU: OnceLock<bool> = OnceLock::new();
+    *GPU.get_or_init(|| !std::env::var("FASTGUI_CHROME").is_ok_and(|v| v.eq_ignore_ascii_case("cpu")))
+}
+
+/// Build this frame's chrome for `tree` (already laid out) and hand it to `renderer`, down
+/// whichever path `gpu_chrome` picked. Sends nothing when nothing changed.
+fn update_chrome<B: SurfaceBackend>(
+    chrome: &mut ChromeRenderer,
+    renderer: &mut B,
+    tree: &WidgetTree,
+    (width, height): (u32, u32),
+    drop_indicator: Option<(Rect, DropZone)>,
+    scale: f32,
+) -> Result<(), B::Error> {
+    if gpu_chrome() {
+        if let Some(quads) = chrome.build_quads(tree, width, height, drop_indicator, scale) {
+            renderer.set_chrome_quads(&quads)?;
+        }
+    } else if let Some(frame) = chrome.rasterize(tree, width, height, drop_indicator, scale) {
+        renderer.set_chrome_frame(&frame)?;
+    }
+    Ok(())
 }
 
 /// One floating panel as its own undecorated OS window (not an overlay in the main tree).
@@ -367,22 +396,22 @@ impl<B: SurfaceBackend> App<B> {
             || (self.last_raster_scale - self.scale_factor).abs() > 1e-6;
         let dragging_panel = self.dragging_panel_title.is_some();
         let chrome_dirty = self.widget_tree.is_dirty() || size_changed || dragging_panel;
-        if chrome_dirty {
+        // Only with a renderer to take the result: chrome keeps the frame it rasterized and
+        // later sends just what changed, so a frame nobody uploaded would be lost for good.
+        if let (true, Some(renderer)) = (chrome_dirty, &mut self.renderer) {
             self.widget_tree.compute_layout(self.width as f32, self.height as f32);
             let drop_indicator = self.hover_region.map(|(_, rect, zone)| (rect, zone));
-            let frame = self.chrome.rasterize(
+            update_chrome(
+                &mut self.chrome,
+                renderer,
                 &self.widget_tree,
-                self.physical_width,
-                self.physical_height,
+                (self.physical_width, self.physical_height),
                 drop_indicator,
                 self.scale_factor as f32,
-            );
+            )?;
             self.widget_tree.clear_dirty();
             self.last_chrome_size = Some((self.width, self.height));
             self.last_raster_scale = self.scale_factor;
-            if let Some(renderer) = &mut self.renderer {
-                renderer.set_chrome_frame(frame)?;
-            }
         }
 
         let mut live_ids = Vec::new();
@@ -418,17 +447,17 @@ impl<B: SurfaceBackend> App<B> {
                 .widget_tree
                 .compute_layout(floater.width as f32, floater.height as f32);
             // Drop indicator is drawn on the main window only.
-            let frame = floater.chrome.rasterize(
+            update_chrome(
+                &mut floater.chrome,
+                &mut floater.renderer,
                 &floater.widget_tree,
-                floater.physical_width,
-                floater.physical_height,
+                (floater.physical_width, floater.physical_height),
                 None,
                 floater.scale_factor as f32,
-            );
+            )?;
             floater.widget_tree.clear_dirty();
             floater.last_chrome_size = Some((floater.width, floater.height));
             floater.last_raster_scale = floater.scale_factor;
-            floater.renderer.set_chrome_frame(frame)?;
         }
 
         let mut live_ids = Vec::new();
@@ -918,15 +947,16 @@ impl<B: SurfaceBackend> App<B> {
         let mut widget_tree = build_tear_ghost_tree(&title);
         let mut chrome = ChromeRenderer::new();
         widget_tree.compute_layout(logical.width as f32, logical.height as f32);
-        let frame = chrome.rasterize(
+        update_chrome(
+            &mut chrome,
+            &mut renderer,
             &widget_tree,
-            physical.width,
-            physical.height,
+            (physical.width, physical.height),
             None,
             scale_factor as f32,
-        );
+        )
+        .map_err(RunError::Renderer)?;
         widget_tree.clear_dirty();
-        renderer.set_chrome_frame(frame).map_err(RunError::Renderer)?;
         // Stays hidden if a dock drop is already previewed (see `TearGhost::visible`);
         // `update_tear_ghost` shows it once the cursor leaves every drop zone.
         let visible = self.hover_region.is_none();
@@ -1388,7 +1418,16 @@ impl<B: SurfaceBackend> App<B> {
             event_loop.exit();
             return false;
         }
-        let draws = self.viewport_draws();
+        // Mid debounced resize the layout is already at the new size but the surface isn't;
+        // stretch viewport rects the same way chrome is stretched so they stay inside their
+        // panels instead of over/undershooting until the resize settles.
+        let layout = (self.physical_width, self.physical_height);
+        let surface = self.last_applied_physical;
+        let draws: Vec<_> = self
+            .viewport_draws()
+            .into_iter()
+            .map(|(id, rect)| (id, remap_rect(rect, layout, surface)))
+            .collect();
         let draw_chrome = self.has_widget_content;
         let clear_color = self.clear_color;
         if let Some(renderer) = &mut self.renderer {
@@ -1520,7 +1559,10 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            // `Destroyed`: the window was torn down without a close request (xkill,
+            // `xdotool windowclose`, compositor teardown). Its surface is gone and the renderer
+            // now skips SURFACE_LOST frames, so nothing else would ever end the loop.
+            WindowEvent::CloseRequested | WindowEvent::Destroyed => event_loop.exit(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale_factor = scale_factor;
             }
@@ -1624,7 +1666,9 @@ impl<B: SurfaceBackend> App<B> {
             // the panel listed as floating with nothing on screen to get it back. Every floater
             // has one (`fastgui-py`'s `bind_panel_to_dock_handlers` falls back to the window's
             // own `_take_floating_panel`), so the `None` case is only a safety net.
-            WindowEvent::CloseRequested => {
+            // A floater destroyed externally goes through the same close path, so Python drops
+            // it instead of keeping a panel whose window no longer exists.
+            WindowEvent::CloseRequested | WindowEvent::Destroyed => {
                 if let Some(callback) = self.floating_close_callback(window_id) {
                     let region_id = self.floating[&window_id].region_id;
                     callback(region_id);

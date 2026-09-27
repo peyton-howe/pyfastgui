@@ -9,12 +9,13 @@ use ash::{
     vk, Device, Entry, Instance,
 };
 use fastgui_core::widget::Rect;
-use fastgui_core::CpuFrame;
+use fastgui_core::{ChromeFrame, ChromeQuads, CpuFrame, PixelRect};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::cuda_texture::{CudaExportHandles, CudaSharedTexture};
 use crate::error::VkRendererError as Error;
 use crate::pipeline::ViewportPipeline;
+use crate::quad::{QuadChrome, QuadPipeline};
 use crate::texture::ViewportTexture;
 
 const FRAMES_IN_FLIGHT: usize = 2;
@@ -56,7 +57,11 @@ pub struct VulkanRenderer {
     images_in_flight: Vec<vk::Fence>,
     frame: usize,
     viewport_pipeline: ViewportPipeline,
+    quad_pipeline: QuadPipeline,
+    /// CPU-rasterized chrome (`set_chrome_frame`); cleared when quads are set, and vice versa.
     chrome: Option<SampledLayer>,
+    /// Chrome as GPU quads (`set_chrome_quads`), the default path.
+    quad_chrome: QuadChrome,
     /// GPU textures for in-tree `Viewport` widgets, keyed by the stable `viewport_id`.
     layers: HashMap<u64, SampledLayer>,
     // `None` on GPUs/drivers without VK_KHR_external_memory_win32 + VK_KHR_external_semaphore_win32
@@ -117,6 +122,14 @@ impl VulkanRenderer {
             if want_debug_utils {
                 extension_names.push(debug_utils::NAME.as_ptr());
             }
+            // Portability drivers (MoltenVK on macOS) are only enumerated when asked for. Only
+            // present on such systems, so this changes nothing on Windows/Linux drivers.
+            let want_portability = available_extensions.iter().any(|e| {
+                CStr::from_ptr(e.extension_name.as_ptr()) == khr::portability_enumeration::NAME
+            });
+            if want_portability {
+                extension_names.push(khr::portability_enumeration::NAME.as_ptr());
+            }
 
             let app_name = c"fastgui";
             let app_info = vk::ApplicationInfo::default()
@@ -127,7 +140,12 @@ impl VulkanRenderer {
             let instance_create_info = vk::InstanceCreateInfo::default()
                 .application_info(&app_info)
                 .enabled_layer_names(&layer_names_raw)
-                .enabled_extension_names(&extension_names);
+                .enabled_extension_names(&extension_names)
+                .flags(if want_portability {
+                    vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+                } else {
+                    vk::InstanceCreateFlags::empty()
+                });
 
             let instance = entry.create_instance(&instance_create_info, None)?;
 
@@ -205,6 +223,11 @@ impl VulkanRenderer {
                 && has_device_extension(khr::external_semaphore_win32::NAME);
 
             let mut device_extension_names_raw = vec![swapchain::NAME.as_ptr()];
+            // Required on a portability driver whenever the device lists it.
+            let portability_subset = c"VK_KHR_portability_subset";
+            if has_device_extension(portability_subset) {
+                device_extension_names_raw.push(portability_subset.as_ptr());
+            }
             if cuda_interop_available {
                 device_extension_names_raw.extend([
                     khr::external_memory::NAME.as_ptr(),
@@ -287,6 +310,8 @@ impl VulkanRenderer {
                 .collect::<Result<Vec<_>, _>>()?;
 
             let viewport_pipeline = ViewportPipeline::new(&device, surface_format.format)?;
+            let quad_pipeline =
+                QuadPipeline::new(&device, surface_format.format, viewport_pipeline.descriptor_set_layout())?;
 
             let mut renderer = Self {
                 _entry: entry,
@@ -312,6 +337,8 @@ impl VulkanRenderer {
                 images_in_flight: Vec::new(),
                 frame: 0,
                 viewport_pipeline,
+                quad_pipeline,
+                quad_chrome: QuadChrome::new(FRAMES_IN_FLIGHT),
                 chrome: None,
                 layers: HashMap::new(),
                 cuda_interop,
@@ -431,31 +458,56 @@ impl VulkanRenderer {
         self.recreate_swapchain(width, height)
     }
 
-    pub fn set_chrome_frame(&mut self, frame: CpuFrame) -> Result<(), Error> {
+    /// Copies only `frame.damage` when the existing texture already holds the previous frame
+    /// at this size; see `SurfaceBackend::set_chrome_frame`.
+    /// Take the chrome as quads + atlas uploads (see `fastgui_chrome::ChromeRenderer::build_quads`).
+    pub fn set_chrome_quads(&mut self, frame: &ChromeQuads<'_>) -> Result<(), Error> {
+        unsafe {
+            if let Some(old) = self.chrome.take() {
+                self.device.queue_wait_idle(self.queue)?;
+                self.destroy_layer(old);
+            }
+            self.quad_chrome.update(&self.device, &self.memory_properties, &self.viewport_pipeline, frame)
+        }
+    }
+
+    pub fn set_chrome_frame(&mut self, frame: &ChromeFrame<'_>) -> Result<(), Error> {
+        if self.quad_chrome.is_active() {
+            unsafe {
+                self.device.device_wait_idle()?;
+                self.quad_chrome.destroy(&self.device, &self.viewport_pipeline);
+            }
+        }
         let mut slot = self.chrome.take();
-        let result = self.upsert_cpu_layer_slot(&mut slot, frame);
+        let result = self.upsert_cpu_layer_slot(&mut slot, frame.width, frame.height, frame.data, frame.damage);
         self.chrome = slot;
         result
     }
 
     pub fn set_layer_frame(&mut self, viewport_id: u64, frame: CpuFrame) -> Result<(), Error> {
         let mut slot = self.layers.remove(&viewport_id);
-        let result = self.upsert_cpu_layer_slot(&mut slot, frame);
+        let result = self.upsert_cpu_layer_slot(&mut slot, frame.width, frame.height, &frame.data, None);
         if let Some(layer) = slot {
             self.layers.insert(viewport_id, layer);
         }
         result
     }
 
+    /// Write a tightly packed RGBA8 `width`x`height` frame into `slot`'s texture, (re)creating
+    /// it on a size change. `damage`, when given, limits the copy to those rects — only valid
+    /// when the texture already holds the previous frame, so it's ignored after a recreate.
     fn upsert_cpu_layer_slot(
         &mut self,
         slot: &mut Option<SampledLayer>,
-        frame: CpuFrame,
+        width: u32,
+        height: u32,
+        data: &[u8],
+        damage: Option<&[PixelRect]>,
     ) -> Result<(), Error> {
         unsafe {
             let need_recreate = match slot {
                 Some(SampledLayer { image: GpuImage::Cpu(texture), .. }) => {
-                    texture.width != frame.width || texture.height != frame.height
+                    texture.width != width || texture.height != height
                 }
                 Some(SampledLayer { image: GpuImage::Cuda(_), .. }) | None => true,
             };
@@ -465,15 +517,21 @@ impl VulkanRenderer {
                 if let Some(old) = slot.take() {
                     self.destroy_layer(old);
                 }
-                let texture =
-                    ViewportTexture::new(&self.device, &self.memory_properties, frame.width, frame.height)?;
+                let texture = ViewportTexture::new(&self.device, &self.memory_properties, width, height)?;
                 let descriptor_set = self.viewport_pipeline.alloc_set(&self.device)?;
                 self.viewport_pipeline.bind_texture(&self.device, descriptor_set, texture.view);
                 *slot = Some(SampledLayer { image: GpuImage::Cpu(texture), descriptor_set });
             }
 
             if let Some(SampledLayer { image: GpuImage::Cpu(texture), .. }) = slot {
-                texture.upload(&frame);
+                match damage {
+                    Some(rects) if !need_recreate => {
+                        for rect in rects {
+                            texture.upload_rect(data, *rect);
+                        }
+                    }
+                    _ => texture.upload(data),
+                }
             }
         }
         Ok(())
@@ -573,6 +631,10 @@ impl VulkanRenderer {
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     return self.recreate_swapchain(self.extent.width, self.extent.height);
                 }
+                // Window destroyed out from under us (xkill, compositor teardown, …). Skip the
+                // frame; `WindowEvent::Destroyed` in fastgui-app exits (main) or runs the floater
+                // close callback. Recreating needs a live surface.
+                Err(vk::Result::ERROR_SURFACE_LOST_KHR) => return Ok(()),
                 Err(e) => return Err(e.into()),
             };
 
@@ -582,6 +644,11 @@ impl VulkanRenderer {
             }
             self.images_in_flight[image_index as usize] = fence;
             self.device.reset_fences(&[fence])?;
+
+            if draw_chrome {
+                // This slot's fence was just waited on, so its instance buffer is free to rewrite.
+                self.quad_chrome.prepare(&self.device, &self.memory_properties, self.frame)?;
+            }
 
             let cmd = self.command_buffers[self.frame];
             self.device
@@ -622,6 +689,7 @@ impl VulkanRenderer {
             let mut wait_values = vec![0u64];
 
             if draw_chrome {
+                barriers.extend(self.quad_chrome.atlas_barrier(color_subresource));
                 if let Some(layer) = &mut self.chrome {
                     sync_sampled_image(
                         &mut layer.image,
@@ -668,6 +736,10 @@ impl VulkanRenderer {
                 .color_attachments(&color_attachments);
 
             self.device.cmd_begin_rendering(cmd, &rendering_info);
+
+            if draw_chrome {
+                self.quad_chrome.record(&self.device, cmd, &self.quad_pipeline, self.frame, self.extent);
+            }
 
             let bind_pipeline = draw_chrome && self.chrome.is_some()
                 || viewports.iter().any(|(id, _)| self.layers.contains_key(id));
@@ -747,6 +819,7 @@ impl VulkanRenderer {
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     self.recreate_swapchain(self.extent.width, self.extent.height)?;
                 }
+                Err(vk::Result::ERROR_SURFACE_LOST_KHR) => return Ok(()),
                 Err(e) => return Err(e.into()),
             }
 
@@ -888,6 +961,8 @@ impl Drop for VulkanRenderer {
                     self.destroy_layer(layer);
                 }
             }
+            self.quad_chrome.destroy(&self.device, &self.viewport_pipeline);
+            self.quad_pipeline.destroy(&self.device);
             self.viewport_pipeline.destroy(&self.device);
             for &s in &self.image_available {
                 self.device.destroy_semaphore(s, None);
@@ -930,8 +1005,12 @@ impl fastgui_app::SurfaceBackend for VulkanRenderer {
         VulkanRenderer::resize(self, physical_width, physical_height)
     }
 
-    fn set_chrome_frame(&mut self, frame: CpuFrame) -> Result<(), Self::Error> {
+    fn set_chrome_frame(&mut self, frame: &ChromeFrame<'_>) -> Result<(), Self::Error> {
         VulkanRenderer::set_chrome_frame(self, frame)
+    }
+
+    fn set_chrome_quads(&mut self, frame: &ChromeQuads<'_>) -> Result<(), Self::Error> {
+        VulkanRenderer::set_chrome_quads(self, frame)
     }
 
     fn set_layer_frame(&mut self, viewport_id: u64, frame: CpuFrame) -> Result<(), Self::Error> {

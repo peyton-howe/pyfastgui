@@ -22,3 +22,6 @@ objc2-foundation = { version = "0.2", features = ["all"] }
 objc2-app-kit = { version = "0.2", features = ["all"] }
 objc2-quartz-core = { version = "0.2", features = ["all"] }
 objc2-metal = { version = "0.2", features = ["all"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+fastgui-chrome = { path = "../fastgui-chrome", features = ["testing"] }

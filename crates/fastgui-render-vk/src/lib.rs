@@ -4,6 +4,9 @@ mod app;
 mod cuda_texture;
 mod error;
 mod pipeline;
+mod quad;
+#[cfg(test)]
+mod quad_test;
 mod renderer;
 mod texture;
 

@@ -17,6 +17,8 @@ pub enum VkRendererError {
     NoSurfaceFormat,
     #[error("no host-visible memory type available for the viewport texture")]
     NoHostVisibleTextureMemory,
+    #[error("no host-visible memory type available for the chrome instance buffer")]
+    NoHostVisibleBufferMemory,
     #[error("no device-local memory type available for the CUDA-shared texture")]
     NoDeviceLocalTextureMemory,
     #[error("failed to read shader SPIR-V: {0}")]

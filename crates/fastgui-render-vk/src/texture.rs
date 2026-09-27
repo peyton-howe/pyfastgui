@@ -1,5 +1,5 @@
 use ash::{vk, Device};
-use fastgui_core::CpuFrame;
+use fastgui_core::PixelRect;
 
 use crate::error::VkRendererError as Error;
 
@@ -89,7 +89,7 @@ impl ViewportTexture {
         })
     }
 
-    /// Copy `frame`'s RGBA8 bytes into the mapped image memory, respecting the driver-
+    /// Copy `data`'s tightly packed RGBA8 frame into the mapped image memory, respecting the driver-
     /// reported row pitch (linear images may pad rows; a tightly-packed `memcpy` would
     /// corrupt the image on hardware that pads).
     ///
@@ -98,14 +98,41 @@ impl ViewportTexture {
     /// frame — visually cheap, never unsound (`HOST_COHERENT` memory, plain byte reads/writes
     /// on both sides). Multi-buffering this texture would remove that, at real extra
     /// complexity; not worth it until the tearing is actually a problem someone hits.
-    pub unsafe fn upload(&self, frame: &CpuFrame) {
-        debug_assert_eq!(frame.width, self.width);
-        debug_assert_eq!(frame.height, self.height);
-        let bytes_per_row = self.width as usize * 4;
-        for y in 0..self.height as usize {
-            let src = &frame.data[y * bytes_per_row..(y + 1) * bytes_per_row];
-            let dst = self.mapped.add(y * self.row_pitch as usize);
-            std::ptr::copy_nonoverlapping(src.as_ptr(), dst, bytes_per_row);
+    pub unsafe fn upload(&self, data: &[u8]) {
+        self.upload_rect(data, PixelRect { x: 0, y: 0, width: self.width, height: self.height });
+    }
+
+    /// Copy just `rect` of `data` (a whole tightly packed `width`x`height` RGBA8 frame) into the
+    /// same rect of the image, clipped to it. The rest of the image keeps its contents — linear,
+    /// host-coherent memory in `GENERAL` layout, which nothing else writes.
+    pub unsafe fn upload_rect(&self, data: &[u8], rect: PixelRect) {
+        debug_assert_eq!(data.len(), self.width as usize * self.height as usize * 4);
+        let x1 = rect.right().min(self.width) as usize;
+        let y1 = rect.bottom().min(self.height) as usize;
+        let (x0, y0) = (rect.x as usize, rect.y as usize);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let stride = self.width as usize * 4;
+        let row_bytes = (x1 - x0) * 4;
+        for y in y0..y1 {
+            let src = &data[y * stride + x0 * 4..][..row_bytes];
+            let dst = self.mapped.add(y * self.row_pitch as usize + x0 * 4);
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst, row_bytes);
+        }
+    }
+
+    /// Write tightly packed RGBA8 `pixels` (`rect.width * 4` bytes per row) into `rect`, e.g. a
+    /// sprite into the chrome atlas. A rect not fully inside the image is ignored.
+    pub unsafe fn write_region(&self, rect: PixelRect, pixels: &[u8]) {
+        debug_assert_eq!(pixels.len(), rect.area() as usize * 4);
+        if rect.is_empty() || rect.right() > self.width || rect.bottom() > self.height {
+            return;
+        }
+        let row_bytes = rect.width as usize * 4;
+        for (dy, src) in pixels.chunks_exact(row_bytes).enumerate() {
+            let dst = self.mapped.add((rect.y as usize + dy) * self.row_pitch as usize + rect.x as usize * 4);
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst, row_bytes);
         }
     }
 
@@ -117,7 +144,7 @@ impl ViewportTexture {
     }
 }
 
-fn find_memory_type_index(
+pub(crate) fn find_memory_type_index(
     properties: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
     flags: vk::MemoryPropertyFlags,

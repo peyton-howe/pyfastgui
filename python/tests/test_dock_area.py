@@ -99,6 +99,38 @@ class DockAreaTreeTests(unittest.TestCase):
         self.assertIsNotNone(_find_leaf(dock._root["second"], a.id))
         self.assertIsNotNone(_find_leaf(dock._root["second"], b.id))
 
+    def test_tab_dropped_on_own_group_edge_splits_group(self):
+        a, b, c = _panel("A"), _panel("B"), _panel("C")
+        dock = DockArea()
+        tabs = Tabs([a, b, c])
+        dock.add_panel(tabs, region="center")
+        dock._on_rearrange(a.id, tabs.id, "left")
+        self.assertEqual(dock._root["kind"], "split")
+        self.assertEqual(dock._root["direction"], "row")
+        self.assertEqual(dock._root["first"]["widget"].id, a.id)
+        rest = dock._root["second"]["widget"]
+        self.assertIsInstance(rest, Tabs)
+        self.assertEqual([p.id for p in rest.panels], [b.id, c.id])
+
+    def test_tab_dropped_on_own_two_tab_group_collapses_other_side(self):
+        a, b = _panel("A"), _panel("B")
+        dock = DockArea()
+        tabs = Tabs([a, b])
+        dock.add_panel(tabs, region="center")
+        dock._on_rearrange(b.id, tabs.id, "bottom")
+        self.assertEqual(dock._root["direction"], "column")
+        self.assertEqual(dock._root["first"]["widget"].id, a.id)
+        self.assertEqual(dock._root["second"]["widget"].id, b.id)
+
+    def test_tab_dropped_on_own_group_center_is_noop(self):
+        a, b = _panel("A"), _panel("B")
+        dock = DockArea()
+        tabs = Tabs([a, b])
+        dock.add_panel(tabs, region="center")
+        before = dock._root
+        dock._on_rearrange(a.id, tabs.id, "center")
+        self.assertIs(dock._root, before)
+
     def test_drop_on_self_and_unknown_are_noops(self):
         a, b = _panel("A"), _panel("B")
         dock = DockArea()

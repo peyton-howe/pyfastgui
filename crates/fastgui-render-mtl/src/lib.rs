@@ -7,6 +7,8 @@
 mod app;
 mod error;
 mod pipeline;
+#[cfg(test)]
+mod quad_test;
 mod renderer;
 mod texture;
 

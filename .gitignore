@@ -27,3 +27,6 @@ python/fastgui/*.so
 *.swp
 Thumbs.db
 Desktop.ini
+
+# chrome timing results (scripts/chrome-timing.*)
+chrome-timing-*.txt
