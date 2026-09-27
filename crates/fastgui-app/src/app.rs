@@ -1550,7 +1550,10 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            // `Destroyed`: the window was torn down without a close request (xkill,
+            // `xdotool windowclose`, compositor teardown). Its surface is gone and the renderer
+            // now skips SURFACE_LOST frames, so nothing else would ever end the loop.
+            WindowEvent::CloseRequested | WindowEvent::Destroyed => event_loop.exit(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale_factor = scale_factor;
             }
@@ -1654,7 +1657,9 @@ impl<B: SurfaceBackend> App<B> {
             // the panel listed as floating with nothing on screen to get it back. Every floater
             // has one (`fastgui-py`'s `bind_panel_to_dock_handlers` falls back to the window's
             // own `_take_floating_panel`), so the `None` case is only a safety net.
-            WindowEvent::CloseRequested => {
+            // A floater destroyed externally goes through the same close path, so Python drops
+            // it instead of keeping a panel whose window no longer exists.
+            WindowEvent::CloseRequested | WindowEvent::Destroyed => {
                 if let Some(callback) = self.floating_close_callback(window_id) {
                     let region_id = self.floating[&window_id].region_id;
                     callback(region_id);

@@ -632,7 +632,8 @@ impl VulkanRenderer {
                     return self.recreate_swapchain(self.extent.width, self.extent.height);
                 }
                 // Window destroyed out from under us (xkill, compositor teardown, …). Skip the
-                // frame; CloseRequested/Destroyed will exit. Recreating needs a live surface.
+                // frame; `WindowEvent::Destroyed` in fastgui-app exits (main) or runs the floater
+                // close callback. Recreating needs a live surface.
                 Err(vk::Result::ERROR_SURFACE_LOST_KHR) => return Ok(()),
                 Err(e) => return Err(e.into()),
             };
