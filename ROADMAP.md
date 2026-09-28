@@ -1290,7 +1290,8 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
    and focus reset). Every existing widget's color arguments default to `None` → the current
    theme at describe time; chrome's own colors (background, focus ring/caret, scrim, drop
    preview, list scrollbar) moved from constants to `fastgui_core::theme`. Demo:
-   `theme_demo.py`. **Not yet:** font and spacing tokens; floating panels restyle on their next
+   `theme_demo.py` (light = grey buttons, dark = blue, orange accent recolors buttons too);
+   Python tests in `python/tests/test_theme.py`. **Not yet:** font and spacing tokens; floating panels restyle on their next
    rebuild rather than immediately; the 7B widgets added concurrently still take explicit
    colors and should adopt `palette()` the same way.
 
