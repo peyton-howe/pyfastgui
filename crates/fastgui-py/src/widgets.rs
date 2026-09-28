@@ -4,13 +4,12 @@ use std::sync::{Arc, Mutex};
 use fastgui_core::taffy::prelude::*;
 use fastgui_core::taffy::style::LengthPercentage;
 use fastgui_core::widget::{
-    ChangeCallback, ClickCallback, Color, PanelCloseCallback, PanelDropCallback, SplitDirection, TabSelectCallback,
-    IndexCallback, PopupAnchor, PopupSide, TextCallback, WidgetId, WidgetKind, WidgetTree,
+    BoolCallback, ChangeCallback, ClickCallback, Color, IndexCallback, PanelCloseCallback, PanelDropCallback,
+    PopupAnchor, PopupSide, SplitDirection, TabSelectCallback, TextCallback, WidgetId, WidgetKind, WidgetTree,
 };
 use fastgui_core::text_edit::TextEdit;
-
+use fastgui_core::{CpuFrame, FrameSlot, PixelFormat, Readback};
 use crate::theme::{FontSize, Spacing};
-use fastgui_core::Readback;
 use crate::backend::{Command, CommandDispatch};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -60,6 +59,27 @@ fn wrap_callback1(callback: Py<PyAny>) -> ChangeCallback {
             }
         });
     })
+}
+
+#[allow(dead_code)]
+fn wrap_callback_bool(callback: Py<PyAny>) -> BoolCallback {
+    Arc::new(move |value: bool| {
+        Python::attach(|py| {
+            if let Err(err) = callback.call1(py, (value,)) {
+                err.print(py);
+            }
+        });
+    })
+}
+
+static NEXT_IMAGE_ID: AtomicU64 = AtomicU64::new(1);
+fn next_image_id() -> u64 {
+    NEXT_IMAGE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+static NEXT_RADIO_GROUP: AtomicU64 = AtomicU64::new(1);
+fn next_radio_group() -> u64 {
+    NEXT_RADIO_GROUP.fetch_add(1, Ordering::Relaxed)
 }
 
 fn wrap_callback_text(callback: Py<PyAny>) -> TextCallback {
@@ -146,6 +166,8 @@ struct StyleParams {
     absolute: Option<(f32, f32)>,
     /// Let children flow onto further rows/columns when they don't fit (`Box(wrap=True)`).
     wrap: bool,
+    /// `Some(n)` → CSS Grid with `n` equal `1fr` columns (auto-flow rows). `None` → flexbox.
+    grid_columns: Option<u16>,
 }
 
 impl StyleParams {
@@ -161,6 +183,7 @@ impl StyleParams {
             align_items: None,
             absolute: None,
             wrap: false,
+            grid_columns: None,
         }
     }
 
@@ -195,7 +218,7 @@ impl StyleParams {
                 },
             ),
         };
-        Style {
+        let mut style = Style {
             flex_direction: self.direction,
             flex_grow: self.flex_grow,
             gap: Size { width: lp_gap, height: lp_gap },
@@ -206,7 +229,13 @@ impl StyleParams {
             position,
             inset,
             ..Default::default()
+        };
+        if let Some(columns) = self.grid_columns.filter(|&n| n > 0) {
+            style.display = Display::Grid;
+            style.grid_template_columns = evenly_sized_tracks(columns);
+            style.grid_auto_rows = vec![TrackSizingFunction::AUTO];
         }
+        style
     }
 }
 
@@ -299,6 +328,30 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
     if obj.cast::<Popup>().is_ok() {
         return Err(PyTypeError::new_err("a Popup isn't placed in the layout; open it with popup.show(anchor)"));
     }
+    if let Ok(w) = obj.cast::<Checkbox>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<Radio>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<Toggle>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<SpinBox>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<NumericScrub>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<ProgressBar>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<Image>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<Grid>() {
+        return w.borrow().describe();
+    }
     if let Ok(w) = obj.cast::<BoxWidget>() {
         return w.borrow().describe();
     }
@@ -322,7 +375,7 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
         return Ok(w.borrow().describe_widget());
     }
     Err(PyTypeError::new_err(
-        "expected a fastgui widget (Box, Label, Button, Slider, TextInput, ScrollArea, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
+        "expected a fastgui widget (Box, Grid, Label, Button, Slider, TextInput, ScrollArea, Checkbox, Radio, Toggle, SpinBox, NumericScrub, ProgressBar, Image, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
     ))
 }
 
@@ -333,12 +386,28 @@ pub(crate) fn bind_dispatch(obj: &Bound<'_, PyAny>, dispatch: &CommandDispatch) 
         viewport.borrow().bind_dispatch(dispatch.clone());
         return;
     }
+    if let Ok(image) = obj.cast::<Image>() {
+        image.borrow().bind_dispatch(dispatch.clone());
+        return;
+    }
     if let Ok(box_widget) = obj.cast::<BoxWidget>() {
         Python::attach(|py| {
             for child in box_widget.borrow().children.bind(py).iter() {
                 bind_dispatch(&child, dispatch);
             }
         });
+        return;
+    }
+    if let Ok(grid) = obj.cast::<Grid>() {
+        Python::attach(|py| {
+            for child in grid.borrow().children.bind(py).iter() {
+                bind_dispatch(&child, dispatch);
+            }
+        });
+        return;
+    }
+    if let Ok(scroll) = obj.cast::<ScrollArea>() {
+        Python::attach(|py| bind_dispatch(scroll.borrow().content.bind(py), dispatch));
         return;
     }
     if let Ok(splitter) = obj.cast::<Splitter>() {
@@ -350,10 +419,6 @@ pub(crate) fn bind_dispatch(obj: &Bound<'_, PyAny>, dispatch: &CommandDispatch) 
     }
     if let Ok(panel) = obj.cast::<Panel>() {
         Python::attach(|py| bind_dispatch(panel.borrow().content.bind(py), dispatch));
-        return;
-    }
-    if let Ok(scroll) = obj.cast::<ScrollArea>() {
-        Python::attach(|py| bind_dispatch(scroll.borrow().content.bind(py), dispatch));
         return;
     }
     if let Ok(tabs) = obj.cast::<Tabs>() {
@@ -405,7 +470,7 @@ pub(crate) fn attach(
             width: (bar_spec.direction == SplitDirection::Row).then_some(bar_spec.thickness),
             height: (bar_spec.direction == SplitDirection::Column).then_some(bar_spec.thickness),
             fill: false,
-            align_items: None, absolute: None, wrap: false,
+            align_items: None, absolute: None, wrap: false, grid_columns: None,
         };
         let bar_kind = WidgetKind::Splitter {
             direction: bar_spec.direction,
@@ -440,7 +505,7 @@ pub(crate) fn attach(
             width: None,
             height: Some(bar_spec.height),
             fill: false,
-            align_items: None, absolute: None, wrap: false,
+            align_items: None, absolute: None, wrap: false, grid_columns: None,
         };
         let active = bar_spec.active;
         let bar_kind = WidgetKind::TabBar {
@@ -1231,6 +1296,776 @@ impl ScrollArea {
     }
 }
 
+/// A labeled on/off checkbox.
+#[pyclass]
+pub(crate) struct Checkbox {
+    id: IdCell,
+    sender: SenderCell,
+    checked: Readback<bool>,
+    label: String,
+    font_size: Option<FontSize>,
+    text_color: Option<(f32, f32, f32, f32)>,
+    box_color: Option<(f32, f32, f32, f32)>,
+    check_color: Option<(f32, f32, f32, f32)>,
+    on_change: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl Checkbox {
+    #[new]
+    #[pyo3(signature = (
+        label,
+        checked=false,
+        on_change=None,
+        font_size=None,
+        text_color=None,
+        box_color=None,
+        check_color=None,
+    ))]
+    fn new(
+        label: String,
+        checked: bool,
+        on_change: Option<Py<PyAny>>,
+        font_size: Option<FontSize>,
+        text_color: Option<(f32, f32, f32, f32)>,
+        box_color: Option<(f32, f32, f32, f32)>,
+        check_color: Option<(f32, f32, f32, f32)>,
+    ) -> Self {
+        Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            checked: Readback::new(checked),
+            label,
+            font_size,
+            text_color,
+            box_color,
+            check_color,
+            on_change,
+        }
+    }
+
+    #[getter]
+    fn checked(&self) -> bool {
+        self.checked.get()
+    }
+
+    fn set_checked(&self, checked: bool) -> PyResult<()> {
+        self.checked.set(checked);
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::Checkbox { checked: current, .. } = kind {
+                *current = checked;
+            }
+        })
+    }
+}
+
+impl Checkbox {
+    fn describe(&self) -> DescribedWidget {
+        let mirror = self.checked.clone();
+        let user = self.on_change.as_ref().map(|cb| Python::attach(|py| cb.clone_ref(py)));
+        let on_change: BoolCallback = Arc::new(move |value| {
+            mirror.set(value);
+            if let Some(callback) = user.as_ref() {
+                Python::attach(|py| {
+                    if let Err(err) = callback.call1(py, (value,)) {
+                        err.print(py);
+                    }
+                });
+            }
+        });
+        DescribedWidget {
+            style: StyleParams::leaf(0.0, None, None),
+            kind: WidgetKind::Checkbox {
+                checked: self.checked.get(),
+                label: self.label.clone(),
+                font_size: self.font_size.unwrap_or(FontSize::Body).resolve(),
+                text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
+                box_color: rgba(self.box_color.unwrap_or(crate::theme::palette().surface_alt)),
+                check_color: rgba(self.check_color.unwrap_or(crate::theme::palette().accent)),
+                on_change: Some(on_change),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+        }
+    }
+}
+
+/// One option in a radio group. Radios that share the same `group` id are exclusive.
+#[pyclass]
+pub(crate) struct Radio {
+    id: IdCell,
+    sender: SenderCell,
+    selected: Readback<bool>,
+    label: String,
+    group_id: u64,
+    font_size: Option<FontSize>,
+    text_color: Option<(f32, f32, f32, f32)>,
+    box_color: Option<(f32, f32, f32, f32)>,
+    dot_color: Option<(f32, f32, f32, f32)>,
+    on_select: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl Radio {
+    #[new]
+    #[pyo3(signature = (
+        label,
+        group=None,
+        selected=false,
+        on_select=None,
+        font_size=None,
+        text_color=None,
+        box_color=None,
+        dot_color=None,
+    ))]
+    fn new(
+        label: String,
+        group: Option<u64>,
+        selected: bool,
+        on_select: Option<Py<PyAny>>,
+        font_size: Option<FontSize>,
+        text_color: Option<(f32, f32, f32, f32)>,
+        box_color: Option<(f32, f32, f32, f32)>,
+        dot_color: Option<(f32, f32, f32, f32)>,
+    ) -> Self {
+        Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            selected: Readback::new(selected),
+            label,
+            group_id: group.unwrap_or_else(next_radio_group),
+            font_size,
+            text_color,
+            box_color,
+            dot_color,
+            on_select,
+        }
+    }
+
+    /// Stable group id — pass the same value to peer `Radio`s so only one can be selected.
+    #[getter]
+    fn group(&self) -> u64 {
+        self.group_id
+    }
+
+    #[getter]
+    fn selected(&self) -> bool {
+        self.selected.get()
+    }
+}
+
+impl Radio {
+    fn describe(&self) -> DescribedWidget {
+        let mirror = self.selected.clone();
+        let user = self.on_select.as_ref().map(|cb| Python::attach(|py| cb.clone_ref(py)));
+        // Peers cleared by `forms::select_radio` don't get a callback, so their mirrors can
+        // lag until the next rebuild — fine for demos that key off `on_select`.
+        let on_select: ClickCallback = Arc::new(move || {
+            mirror.set(true);
+            if let Some(callback) = user.as_ref() {
+                Python::attach(|py| {
+                    if let Err(err) = callback.call0(py) {
+                        err.print(py);
+                    }
+                });
+            }
+        });
+        DescribedWidget {
+            style: StyleParams::leaf(0.0, None, None),
+            kind: WidgetKind::Radio {
+                selected: self.selected.get(),
+                label: self.label.clone(),
+                group_id: self.group_id,
+                font_size: self.font_size.unwrap_or(FontSize::Body).resolve(),
+                text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
+                box_color: rgba(self.box_color.unwrap_or(crate::theme::palette().surface_alt)),
+                dot_color: rgba(self.dot_color.unwrap_or(crate::theme::palette().accent)),
+                on_select: Some(on_select),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+        }
+    }
+}
+
+/// Compact on/off switch (no built-in label — pair with a `Label`).
+#[pyclass]
+pub(crate) struct Toggle {
+    id: IdCell,
+    sender: SenderCell,
+    checked: Readback<bool>,
+    track_off: Option<(f32, f32, f32, f32)>,
+    track_on: Option<(f32, f32, f32, f32)>,
+    thumb_color: Option<(f32, f32, f32, f32)>,
+    on_change: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl Toggle {
+    #[new]
+    #[pyo3(signature = (
+        checked=false,
+        on_change=None,
+        track_off=None,
+        track_on=None,
+        thumb_color=None,
+    ))]
+    fn new(
+        checked: bool,
+        on_change: Option<Py<PyAny>>,
+        track_off: Option<(f32, f32, f32, f32)>,
+        track_on: Option<(f32, f32, f32, f32)>,
+        thumb_color: Option<(f32, f32, f32, f32)>,
+    ) -> Self {
+        Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            checked: Readback::new(checked),
+            track_off,
+            track_on,
+            thumb_color,
+            on_change,
+        }
+    }
+
+    #[getter]
+    fn checked(&self) -> bool {
+        self.checked.get()
+    }
+
+    fn set_checked(&self, checked: bool) -> PyResult<()> {
+        self.checked.set(checked);
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::Toggle { checked: current, .. } = kind {
+                *current = checked;
+            }
+        })
+    }
+}
+
+impl Toggle {
+    fn describe(&self) -> DescribedWidget {
+        let mirror = self.checked.clone();
+        let user = self.on_change.as_ref().map(|cb| Python::attach(|py| cb.clone_ref(py)));
+        let on_change: BoolCallback = Arc::new(move |value| {
+            mirror.set(value);
+            if let Some(callback) = user.as_ref() {
+                Python::attach(|py| {
+                    if let Err(err) = callback.call1(py, (value,)) {
+                        err.print(py);
+                    }
+                });
+            }
+        });
+        DescribedWidget {
+            style: StyleParams::leaf(0.0, None, None),
+            kind: WidgetKind::Toggle {
+                checked: self.checked.get(),
+                track_off: rgba(self.track_off.unwrap_or(crate::theme::palette().track)),
+                track_on: rgba(self.track_on.unwrap_or(crate::theme::palette().accent)),
+                thumb_color: rgba(self.thumb_color.unwrap_or(crate::theme::palette().text)),
+                on_change: Some(on_change),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+        }
+    }
+}
+
+/// Numeric stepper with −/+ buttons. `decimals=0` shows an integer.
+#[pyclass]
+pub(crate) struct SpinBox {
+    id: IdCell,
+    sender: SenderCell,
+    value: Readback<f32>,
+    min: f32,
+    max: f32,
+    step: f32,
+    decimals: u32,
+    font_size: Option<FontSize>,
+    width: Option<f32>,
+    text_color: Option<(f32, f32, f32, f32)>,
+    background: Option<(f32, f32, f32, f32)>,
+    button_color: Option<(f32, f32, f32, f32)>,
+    on_change: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl SpinBox {
+    #[new]
+    #[pyo3(signature = (
+        value=0.0,
+        min=0.0,
+        max=100.0,
+        step=1.0,
+        decimals=0,
+        on_change=None,
+        font_size=None,
+        width=None,
+        text_color=None,
+        background=None,
+        button_color=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        value: f32,
+        min: f32,
+        max: f32,
+        step: f32,
+        decimals: u32,
+        on_change: Option<Py<PyAny>>,
+        font_size: Option<FontSize>,
+        width: Option<f32>,
+        text_color: Option<(f32, f32, f32, f32)>,
+        background: Option<(f32, f32, f32, f32)>,
+        button_color: Option<(f32, f32, f32, f32)>,
+    ) -> Self {
+        let value = value.clamp(min.min(max), max.max(min));
+        Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            value: Readback::new(value),
+            min,
+            max,
+            step,
+            decimals,
+            font_size,
+            width,
+            text_color,
+            background,
+            button_color,
+            on_change,
+        }
+    }
+
+    #[getter]
+    fn value(&self) -> f32 {
+        self.value.get()
+    }
+
+    fn set_value(&self, value: f32) -> PyResult<()> {
+        let value = value.clamp(self.min.min(self.max), self.max.max(self.min));
+        self.value.set(value);
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::SpinBox { value: current, .. } = kind {
+                *current = value;
+            }
+        })
+    }
+}
+
+impl SpinBox {
+    fn describe(&self) -> DescribedWidget {
+        let on_change = self.on_change.as_ref().map(|cb| Python::attach(|py| cb.clone_ref(py)));
+        DescribedWidget {
+            style: StyleParams::leaf(0.0, self.width, None),
+            kind: WidgetKind::SpinBox {
+                value: self.value.get(),
+                min: self.min,
+                max: self.max,
+                step: self.step,
+                decimals: self.decimals,
+                font_size: self.font_size.unwrap_or(FontSize::Body).resolve(),
+                text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
+                background: rgba(self.background.unwrap_or(crate::theme::palette().surface_alt)),
+                button_color: rgba(self.button_color.unwrap_or(crate::theme::palette().button)),
+                on_change: on_change.map(wrap_callback1),
+                mirror: Some(self.value.clone()),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+        }
+    }
+}
+
+/// Drag horizontally to scrub a numeric value.
+#[pyclass]
+pub(crate) struct NumericScrub {
+    id: IdCell,
+    sender: SenderCell,
+    value: Readback<f32>,
+    min: f32,
+    max: f32,
+    speed: f32,
+    decimals: u32,
+    font_size: Option<FontSize>,
+    width: Option<f32>,
+    text_color: Option<(f32, f32, f32, f32)>,
+    background: Option<(f32, f32, f32, f32)>,
+    on_change: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl NumericScrub {
+    #[new]
+    #[pyo3(signature = (
+        value=0.0,
+        min=0.0,
+        max=100.0,
+        speed=0.25,
+        decimals=1,
+        on_change=None,
+        font_size=None,
+        width=None,
+        text_color=None,
+        background=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        value: f32,
+        min: f32,
+        max: f32,
+        speed: f32,
+        decimals: u32,
+        on_change: Option<Py<PyAny>>,
+        font_size: Option<FontSize>,
+        width: Option<f32>,
+        text_color: Option<(f32, f32, f32, f32)>,
+        background: Option<(f32, f32, f32, f32)>,
+    ) -> Self {
+        let value = value.clamp(min.min(max), max.max(min));
+        Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            value: Readback::new(value),
+            min,
+            max,
+            speed,
+            decimals,
+            font_size,
+            width,
+            text_color,
+            background,
+            on_change,
+        }
+    }
+
+    #[getter]
+    fn value(&self) -> f32 {
+        self.value.get()
+    }
+
+    fn set_value(&self, value: f32) -> PyResult<()> {
+        let value = value.clamp(self.min.min(self.max), self.max.max(self.min));
+        self.value.set(value);
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::NumericScrub { value: current, .. } = kind {
+                *current = value;
+            }
+        })
+    }
+}
+
+impl NumericScrub {
+    fn describe(&self) -> DescribedWidget {
+        let on_change = self.on_change.as_ref().map(|cb| Python::attach(|py| cb.clone_ref(py)));
+        DescribedWidget {
+            style: StyleParams::leaf(0.0, self.width, None),
+            kind: WidgetKind::NumericScrub {
+                value: self.value.get(),
+                min: self.min,
+                max: self.max,
+                speed: self.speed,
+                decimals: self.decimals,
+                font_size: self.font_size.unwrap_or(FontSize::Body).resolve(),
+                text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
+                background: rgba(self.background.unwrap_or(crate::theme::palette().surface_alt)),
+                on_change: on_change.map(wrap_callback1),
+                mirror: Some(self.value.clone()),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+        }
+    }
+}
+
+/// Determinate progress track (display only).
+#[pyclass]
+pub(crate) struct ProgressBar {
+    id: IdCell,
+    sender: SenderCell,
+    value: Readback<f32>,
+    min: f32,
+    max: f32,
+    track_color: Option<(f32, f32, f32, f32)>,
+    fill_color: Option<(f32, f32, f32, f32)>,
+    height: f32,
+    flex_grow: f32,
+}
+
+#[pymethods]
+impl ProgressBar {
+    #[new]
+    #[pyo3(signature = (
+        value=0.0,
+        min=0.0,
+        max=1.0,
+        track_color=None,
+        fill_color=None,
+        height=8.0,
+        flex_grow=1.0,
+    ))]
+    fn new(
+        value: f32,
+        min: f32,
+        max: f32,
+        track_color: Option<(f32, f32, f32, f32)>,
+        fill_color: Option<(f32, f32, f32, f32)>,
+        height: f32,
+        flex_grow: f32,
+    ) -> Self {
+        let value = value.clamp(min.min(max), max.max(min));
+        Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            value: Readback::new(value),
+            min,
+            max,
+            track_color,
+            fill_color,
+            height,
+            flex_grow,
+        }
+    }
+
+    #[getter]
+    fn value(&self) -> f32 {
+        self.value.get()
+    }
+
+    fn set_value(&self, value: f32) -> PyResult<()> {
+        let value = value.clamp(self.min.min(self.max), self.max.max(self.min));
+        self.value.set(value);
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::ProgressBar { value: current, min, max, .. } = kind {
+                *current = value.clamp(*min, *max);
+            }
+        })
+    }
+}
+
+impl ProgressBar {
+    fn describe(&self) -> DescribedWidget {
+        DescribedWidget {
+            style: StyleParams::leaf(self.flex_grow, None, Some(self.height)),
+            kind: WidgetKind::ProgressBar {
+                value: self.value.get(),
+                min: self.min,
+                max: self.max,
+                track_color: rgba(self.track_color.unwrap_or(crate::theme::palette().track)),
+                fill_color: rgba(self.fill_color.unwrap_or(crate::theme::palette().accent)),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+        }
+    }
+}
+
+/// A static CPU image composited like a `Viewport`. Feed pixels with `set_image`.
+#[pyclass]
+pub(crate) struct Image {
+    image_id: u64,
+    frames: FrameSlot<CpuFrame>,
+    dispatch: Mutex<Option<CommandDispatch>>,
+    id: IdCell,
+    sender: SenderCell,
+    width: Option<f32>,
+    height: Option<f32>,
+    flex_grow: f32,
+}
+
+#[pymethods]
+impl Image {
+    #[new]
+    #[pyo3(signature = (width=None, height=None, flex_grow=1.0))]
+    fn new(width: Option<f32>, height: Option<f32>, flex_grow: f32) -> Self {
+        Self {
+            image_id: next_image_id(),
+            frames: FrameSlot::new(),
+            dispatch: Mutex::new(None),
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            width,
+            height,
+            flex_grow,
+        }
+    }
+
+    /// Submit a `(height, width, 3|4)` uint8 array as the image contents.
+    fn set_image(&self, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        let buffer = pyo3::buffer::PyBuffer::<u8>::get(data)?;
+        let shape = buffer.shape();
+        if shape.len() != 3 || !(shape[2] == 3 || shape[2] == 4) {
+            return Err(PyValueError::new_err("expected a (height, width, 3-or-4) uint8 array"));
+        }
+        if !buffer.is_c_contiguous() {
+            return Err(PyValueError::new_err("image buffer must be C-contiguous"));
+        }
+        let height = shape[0] as u32;
+        let width = shape[1] as u32;
+        let channels = shape[2];
+        let raw = buffer.to_vec(data.py())?;
+        let rgba = if channels == 4 {
+            raw
+        } else {
+            let mut out = Vec::with_capacity(raw.len() / 3 * 4);
+            for pixel in raw.chunks_exact(3) {
+                out.extend_from_slice(pixel);
+                out.push(255);
+            }
+            out
+        };
+        self.frames.submit(CpuFrame { width, height, format: PixelFormat::Rgba8, data: rgba });
+        if let Some(dispatch) = self.dispatch.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            dispatch.waker.wake();
+        }
+        Ok(())
+    }
+}
+
+impl Image {
+    fn bind_dispatch(&self, dispatch: CommandDispatch) {
+        *self.dispatch.lock().unwrap_or_else(|p| p.into_inner()) = Some(dispatch);
+    }
+
+    fn describe(&self) -> DescribedWidget {
+        DescribedWidget {
+            style: StyleParams::leaf(self.flex_grow, self.width, self.height),
+            kind: WidgetKind::Image { image_id: self.image_id, frames: self.frames.clone() },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+        }
+    }
+}
+
+/// CSS Grid layout: `columns` equal-width tracks, children auto-flow into rows.
+#[pyclass]
+pub(crate) struct Grid {
+    id: IdCell,
+    sender: SenderCell,
+    columns: u16,
+    gap: Spacing,
+    padding: Spacing,
+    flex_grow: f32,
+    width: Option<f32>,
+    height: Option<f32>,
+    background: (f32, f32, f32, f32),
+    children: Py<PyList>,
+}
+
+#[pymethods]
+impl Grid {
+    #[new]
+    #[pyo3(signature = (
+        children,
+        columns=2,
+        gap=Spacing::Units(0.0),
+        padding=Spacing::Units(0.0),
+        flex_grow=0.0,
+        width=None,
+        height=None,
+        background=(0.0, 0.0, 0.0, 0.0),
+    ))]
+    fn new(
+        children: Bound<'_, PyList>,
+        columns: u16,
+        gap: Spacing,
+        padding: Spacing,
+        flex_grow: f32,
+        width: Option<f32>,
+        height: Option<f32>,
+        background: (f32, f32, f32, f32),
+    ) -> PyResult<Self> {
+        if columns == 0 {
+            return Err(PyValueError::new_err("Grid.columns must be >= 1"));
+        }
+        Ok(Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            columns,
+            gap,
+            padding,
+            flex_grow,
+            width,
+            height,
+            background,
+            children: children.unbind(),
+        })
+    }
+}
+
+impl Grid {
+    fn describe(&self) -> PyResult<DescribedWidget> {
+        let children = Python::attach(|py| {
+            self.children
+                .bind(py)
+                .iter()
+                .map(|child| describe(&child))
+                .collect::<PyResult<Vec<_>>>()
+        })?;
+        Ok(DescribedWidget {
+            style: StyleParams {
+                direction: FlexDirection::Row,
+                gap: self.gap.resolve(),
+                padding: self.padding.resolve(),
+                flex_grow: self.flex_grow,
+                width: self.width,
+                height: self.height,
+                fill: false,
+                align_items: None,
+                absolute: None,
+                wrap: false,
+                grid_columns: Some(self.columns),
+            },
+            kind: WidgetKind::Container {
+                background: if self.background.3 > 0.0 { rgba(self.background) } else { transparent() },
+                region_id: None,
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children,
+            splitter_bar: None,
+            tab_bar: None,
+        })
+    }
+}
+
 /// A layout container: lays its children out in a row or column via flexbox (see `taffy`).
 /// `Box` in the Python API, `BoxWidget` here since `Box` is a reserved word in Rust.
 #[pyclass(name = "Box")]
@@ -1301,8 +2136,19 @@ impl BoxWidget {
 
 impl BoxWidget {
     fn describe(&self) -> PyResult<DescribedWidget> {
-        let style =
-            StyleParams { direction: self.direction, gap: self.gap.resolve(), padding: self.padding.resolve(), flex_grow: self.flex_grow, width: self.width, height: self.height, fill: false, align_items: None, absolute: None, wrap: self.wrap };
+        let style = StyleParams {
+            direction: self.direction,
+            gap: self.gap.resolve(),
+            padding: self.padding.resolve(),
+            flex_grow: self.flex_grow,
+            width: self.width,
+            height: self.height,
+            fill: false,
+            align_items: None,
+            absolute: None,
+            wrap: self.wrap,
+            grid_columns: None,
+        };
 
         let children = Python::attach(|py| -> PyResult<Vec<DescribedWidget>> {
             self.children.bind(py).iter().map(|child| describe(&child)).collect()
@@ -1402,7 +2248,7 @@ impl Splitter {
                 width: None,
                 height: None,
                 fill: false,
-                align_items: None, absolute: None, wrap: false,
+                align_items: None, absolute: None, wrap: false, grid_columns: None,
             },
             kind: WidgetKind::Container { background: transparent(), region_id: None },
             id_cell: self.id.clone(),
@@ -1604,7 +2450,19 @@ impl Panel {
             .map(|cb| Python::attach(|py| cb.clone_ref(py)));
 
         let title_bar = DescribedWidget {
-            style: StyleParams { direction: FlexDirection::Row, gap: 0.0, padding: 0.0, flex_grow: 0.0, width: None, height: Some(self.title_height), fill: false, align_items: None, absolute: None, wrap: false },
+            style: StyleParams {
+                direction: FlexDirection::Row,
+                gap: 0.0,
+                padding: 0.0,
+                flex_grow: 0.0,
+                width: None,
+                height: Some(self.title_height),
+                fill: false,
+                align_items: None,
+                absolute: None,
+                wrap: false,
+                grid_columns: None,
+            },
             kind: WidgetKind::PanelTitleBar {
                 panel_id: self.region_id,
                 title: self.title.clone(),
@@ -1634,7 +2492,7 @@ impl Panel {
                 width: None,
                 height: None,
                 fill: false,
-                align_items: None, absolute: None, wrap: false,
+                align_items: None, absolute: None, wrap: false, grid_columns: None,
             },
             kind: WidgetKind::Container { background: rgba(self.background.unwrap_or(crate::theme::palette().surface)), region_id: Some(self.region_id) },
             id_cell: self.id.clone(),
@@ -1778,7 +2636,7 @@ impl Tabs {
                 width: None,
                 height: None,
                 fill: false,
-                align_items: None, absolute: None, wrap: false,
+                align_items: None, absolute: None, wrap: false, grid_columns: None,
             },
             kind: WidgetKind::Container { background: transparent(), region_id: Some(self.region_id) },
             id_cell: self.id.clone(),
@@ -1810,6 +2668,14 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ScrollArea>()?;
     m.add_class::<Popup>()?;
     m.add_class::<ListView>()?;
+    m.add_class::<Checkbox>()?;
+    m.add_class::<Radio>()?;
+    m.add_class::<Toggle>()?;
+    m.add_class::<SpinBox>()?;
+    m.add_class::<NumericScrub>()?;
+    m.add_class::<ProgressBar>()?;
+    m.add_class::<Image>()?;
+    m.add_class::<Grid>()?;
     m.add_class::<BoxWidget>()?;
     m.add_class::<Splitter>()?;
     m.add_class::<Panel>()?;

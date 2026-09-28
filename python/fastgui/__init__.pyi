@@ -189,7 +189,154 @@ class Popup:
     @property
     def is_open(self) -> bool: ...
 
-Widget = Union[Label, Button, Slider, TextInput, "ListView", "ScrollArea", "Box", "Splitter", "Panel", "Tabs", "DockArea", Viewport]
+class Checkbox:
+    def __init__(
+        self,
+        label: str,
+        checked: bool = False,
+        on_change: Callable[[bool], None] | None = None,
+        font_size: FontSize | None = None,
+        text_color: RGBA | None = None,
+        box_color: RGBA | None = None,
+        check_color: RGBA | None = None,
+    ) -> None: ...
+    @property
+    def checked(self) -> bool: ...
+    def set_checked(self, checked: bool) -> None: ...
+
+class Radio:
+    """One option in a radio group. Pass the same `group` id to peers so only one can be selected."""
+    def __init__(
+        self,
+        label: str,
+        group: int | None = None,
+        selected: bool = False,
+        on_select: Callable[[], None] | None = None,
+        font_size: FontSize | None = None,
+        text_color: RGBA | None = None,
+        box_color: RGBA | None = None,
+        dot_color: RGBA | None = None,
+    ) -> None: ...
+    @property
+    def group(self) -> int: ...
+    @property
+    def selected(self) -> bool: ...
+
+class Toggle:
+    def __init__(
+        self,
+        checked: bool = False,
+        on_change: Callable[[bool], None] | None = None,
+        track_off: RGBA | None = None,
+        track_on: RGBA | None = None,
+        thumb_color: RGBA | None = None,
+    ) -> None: ...
+    @property
+    def checked(self) -> bool: ...
+    def set_checked(self, checked: bool) -> None: ...
+
+class SpinBox:
+    def __init__(
+        self,
+        value: float = 0.0,
+        min: float = 0.0,
+        max: float = 100.0,
+        step: float = 1.0,
+        decimals: int = 0,
+        on_change: Callable[[float], None] | None = None,
+        font_size: FontSize | None = None,
+        width: float | None = None,
+        text_color: RGBA | None = None,
+        background: RGBA | None = None,
+        button_color: RGBA | None = None,
+    ) -> None: ...
+    @property
+    def value(self) -> float: ...
+    def set_value(self, value: float) -> None: ...
+
+class NumericScrub:
+    """Drag horizontally to change the value (`speed` units per logical pixel)."""
+    def __init__(
+        self,
+        value: float = 0.0,
+        min: float = 0.0,
+        max: float = 100.0,
+        speed: float = 0.25,
+        decimals: int = 1,
+        on_change: Callable[[float], None] | None = None,
+        font_size: FontSize | None = None,
+        width: float | None = None,
+        text_color: RGBA | None = None,
+        background: RGBA | None = None,
+    ) -> None: ...
+    @property
+    def value(self) -> float: ...
+    def set_value(self, value: float) -> None: ...
+
+class ProgressBar:
+    def __init__(
+        self,
+        value: float = 0.0,
+        min: float = 0.0,
+        max: float = 1.0,
+        track_color: RGBA | None = None,
+        fill_color: RGBA | None = None,
+        height: float = 8.0,
+        flex_grow: float = 1.0,
+    ) -> None: ...
+    @property
+    def value(self) -> float: ...
+    def set_value(self, value: float) -> None: ...
+
+class Image:
+    """Static CPU image composited like a `Viewport`. Feed pixels with `set_image`."""
+    def __init__(
+        self,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+    ) -> None: ...
+    def set_image(self, data: Any) -> None:
+        """Submit a (H, W, 3|4) uint8 array."""
+        ...
+
+class Grid:
+    """CSS Grid with `columns` equal-width tracks; children auto-flow into rows."""
+    def __init__(
+        self,
+        children: Sequence["Widget"],
+        columns: int = 2,
+        gap: Spacing = 0.0,
+        padding: Spacing = 0.0,
+        flex_grow: float = 0.0,
+        width: float | None = None,
+        height: float | None = None,
+        background: RGBA = (0.0, 0.0, 0.0, 0.0),
+    ) -> None: ...
+
+Widget = Union[
+    Label,
+    Button,
+    Slider,
+    TextInput,
+    "ListView",
+    "ScrollArea",
+    "Popup",
+    Checkbox,
+    Radio,
+    Toggle,
+    SpinBox,
+    NumericScrub,
+    ProgressBar,
+    Image,
+    Grid,
+    "Box",
+    "Splitter",
+    "Panel",
+    "Tabs",
+    "DockArea",
+    Viewport,
+]
 
 class Box:
     def __init__(
