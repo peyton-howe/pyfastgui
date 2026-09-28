@@ -82,6 +82,30 @@ class TextInput:
     def set_text(self, text: str) -> None:
         """Replace the text without calling `on_change`. Works before the field is attached."""
 
+class TextArea:
+    """A multi-line editable text field. Enter inserts a hard newline; Cmd/Ctrl+Enter fires
+    `on_submit`. Soft wrap is not implemented yet — long lines are clipped."""
+    def __init__(
+        self,
+        text: str = "",
+        placeholder: str = "",
+        on_change: Callable[[str], None] | None = None,
+        on_submit: Callable[[str], None] | None = None,
+        font_size: FontSize | None = None,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 0.0,
+        text_color: RGBA | None = None,
+        placeholder_color: RGBA | None = None,
+        background: RGBA | None = None,
+        selection_color: RGBA | None = None,
+    ) -> None: ...
+    @property
+    def text(self) -> str:
+        """The current text, including the user's latest edits. Safe from any thread."""
+    def set_text(self, text: str) -> None:
+        """Replace the text without calling `on_change`. Works before the field is attached."""
+
 class ScrollArea:
     """A scrollable viewport onto `content`. The mouse wheel / trackpad scrolls it (the innermost
     scroll area that can still move takes the scroll), overflowing axes get draggable overlay
@@ -319,6 +343,7 @@ Widget = Union[
     Button,
     Slider,
     TextInput,
+    TextArea,
     "ListView",
     "ScrollArea",
     "Popup",

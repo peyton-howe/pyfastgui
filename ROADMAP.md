@@ -1243,8 +1243,9 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
    clip rects needed). Demo: `text_input_demo.py`. Unit-tested and render-checked to PNG; not yet
    driven interactively. **Layout now measures label/button text with real shaping**
    (`WidgetTree::compute_layout_measured` via chrome's `TextMeasure`, 2026-09-28 — labels had
-   been losing their last word to the 0.55×size estimate). **Still open:** text wrapping / multi-line `TextEdit`, caret blink, RTL/bidi caret placement (stops
-   are per glyph cluster, correct for LTR only).
+   been losing their last word to the 0.55×size estimate). Hard-newline multi-line `TextEdit` /
+   `TextArea` is done (see 7B). **Still open:** soft-wrap for multi-line fields, caret blink,
+   RTL/bidi caret placement (stops are per glyph cluster, correct for LTR only).
 3. **Scroll container + clipping** — needs per-quad clip rects in the GPU quad pipeline (Vulkan
    and Metal). The GPU chrome path already makes scroll cheap (~128 KiB/frame upload in
    `chrome_bench`'s table scene vs 24 MiB on the CPU path). **Done (2026-09-27):** `WidgetKind::ScrollArea` /
@@ -1327,8 +1328,10 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 
 ### 7B. Tier 1 — core form controls
 
-- Single-line and multi-line text input (`QLineEdit` / `QTextEdit`) — **single-line done**
-  (see 7A.2); multi-line still open.
+- Single-line and multi-line text input (`QLineEdit` / `QTextEdit`) — **Done (2026-09-28):**
+  single-line (see 7A.2); multi-line `WidgetKind::TextArea` / `fg.TextArea` with hard
+  newlines, Up/Down by line, Home/End per line, vertical caret scroll, Cmd/Ctrl+Enter
+  submit. **Still open:** soft wrap.
 - Checkbox, radio group, toggle switch — **Done (2026-09-27):** `Checkbox` / `Radio` (shared
   `group` id for exclusivity) / `Toggle`; click + Space/Enter; focusable.
 - Spin box (int/float) and a drag-to-scrub numeric field — **Done (2026-09-27):** `SpinBox`

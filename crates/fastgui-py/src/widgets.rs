@@ -319,6 +319,9 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
     if let Ok(w) = obj.cast::<TextInput>() {
         return Ok(w.borrow().describe());
     }
+    if let Ok(w) = obj.cast::<TextArea>() {
+        return Ok(w.borrow().describe());
+    }
     if let Ok(w) = obj.cast::<ScrollArea>() {
         return w.borrow().describe();
     }
@@ -375,7 +378,7 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
         return Ok(w.borrow().describe_widget());
     }
     Err(PyTypeError::new_err(
-        "expected a fastgui widget (Box, Grid, Label, Button, Slider, TextInput, ScrollArea, Checkbox, Radio, Toggle, SpinBox, NumericScrub, ProgressBar, Image, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
+        "expected a fastgui widget (Box, Grid, Label, Button, Slider, TextInput, TextArea, ScrollArea, Checkbox, Radio, Toggle, SpinBox, NumericScrub, ProgressBar, Image, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
     ))
 }
 
@@ -894,6 +897,131 @@ impl TextInput {
                 background: rgba(self.background.unwrap_or(crate::theme::palette().surface_alt)),
                 selection_color: rgba(self.selection_color.unwrap_or(crate::theme::palette().selection)),
                 scroll: 0.0,
+                preedit: None,
+                on_change: on_change.map(wrap_callback_text),
+                on_submit: on_submit.map(wrap_callback_text),
+                mirror: Some(self.text.clone()),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+        }
+    }
+}
+
+/// A multi-line editable text field (hard newlines; soft wrap not yet).
+#[pyclass]
+pub(crate) struct TextArea {
+    id: IdCell,
+    sender: SenderCell,
+    text: Readback<String>,
+    placeholder: String,
+    font_size: Option<FontSize>,
+    width: Option<f32>,
+    height: Option<f32>,
+    flex_grow: f32,
+    text_color: Option<(f32, f32, f32, f32)>,
+    placeholder_color: Option<(f32, f32, f32, f32)>,
+    background: Option<(f32, f32, f32, f32)>,
+    selection_color: Option<(f32, f32, f32, f32)>,
+    on_change: Option<Py<PyAny>>,
+    on_submit: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl TextArea {
+    #[new]
+    #[pyo3(signature = (
+        text="",
+        placeholder="",
+        on_change=None,
+        on_submit=None,
+        font_size=None,
+        width=None,
+        height=None,
+        flex_grow=0.0,
+        text_color=None,
+        placeholder_color=None,
+        background=None,
+        selection_color=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        text: &str,
+        placeholder: &str,
+        on_change: Option<Py<PyAny>>,
+        on_submit: Option<Py<PyAny>>,
+        font_size: Option<FontSize>,
+        width: Option<f32>,
+        height: Option<f32>,
+        flex_grow: f32,
+        text_color: Option<(f32, f32, f32, f32)>,
+        placeholder_color: Option<(f32, f32, f32, f32)>,
+        background: Option<(f32, f32, f32, f32)>,
+        selection_color: Option<(f32, f32, f32, f32)>,
+    ) -> Self {
+        Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            text: Readback::new(TextEdit::new_multiline(text).text().to_owned()),
+            placeholder: placeholder.to_owned(),
+            font_size,
+            width,
+            height,
+            flex_grow,
+            text_color,
+            placeholder_color,
+            background,
+            selection_color,
+            on_change,
+            on_submit,
+        }
+    }
+
+    /// The field's current text, including edits the user just made. Safe from any thread.
+    #[getter]
+    fn text(&self) -> String {
+        self.text.get()
+    }
+
+    /// Replace the text (caret to the end, undo history cleared). Doesn't call `on_change`.
+    fn set_text(&self, text: &str) -> PyResult<()> {
+        let text = TextEdit::new_multiline(text).text().to_owned();
+        self.text.set(text.clone());
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::TextArea { edit, scroll_y, preedit, .. } = kind {
+                edit.set_text(&text);
+                *scroll_y = 0.0;
+                *preedit = None;
+            }
+        })
+    }
+}
+
+impl TextArea {
+    fn describe(&self) -> DescribedWidget {
+        let (on_change, on_submit) = Python::attach(|py| {
+            (
+                self.on_change.as_ref().map(|cb| cb.clone_ref(py)),
+                self.on_submit.as_ref().map(|cb| cb.clone_ref(py)),
+            )
+        });
+        DescribedWidget {
+            style: StyleParams::leaf(self.flex_grow, self.width, self.height),
+            kind: WidgetKind::TextArea {
+                edit: TextEdit::new_multiline(&self.text.get()),
+                placeholder: self.placeholder.clone(),
+                font_size: self.font_size.unwrap_or(FontSize::Body).resolve(),
+                text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
+                placeholder_color: rgba(self.placeholder_color.unwrap_or(crate::theme::palette().text_muted)),
+                background: rgba(self.background.unwrap_or(crate::theme::palette().surface_alt)),
+                selection_color: rgba(self.selection_color.unwrap_or(crate::theme::palette().selection)),
+                scroll_y: 0.0,
                 preedit: None,
                 on_change: on_change.map(wrap_callback_text),
                 on_submit: on_submit.map(wrap_callback_text),
@@ -2665,6 +2793,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Button>()?;
     m.add_class::<Slider>()?;
     m.add_class::<TextInput>()?;
+    m.add_class::<TextArea>()?;
     m.add_class::<ScrollArea>()?;
     m.add_class::<Popup>()?;
     m.add_class::<ListView>()?;

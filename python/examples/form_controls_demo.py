@@ -1,4 +1,4 @@
-"""M7 7B demo: checkbox, radio, toggle, spin box, numeric scrub, progress, grid, image."""
+"""M7 7B demo: checkbox, radio, toggle, spin box, numeric scrub, progress, grid, image, text area."""
 
 import numpy as np
 
@@ -6,7 +6,7 @@ import fastgui as fg
 
 
 def main() -> None:
-    window = fg.Window(title="fastgui — M7 form controls", width=640, height=560)
+    window = fg.Window(title="fastgui — M7 form controls", width=640, height=640)
     status = fg.Label("Try the controls…", font_size=14.0, color=(0.7, 0.75, 0.85, 1.0))
 
     def set_status(text: str) -> None:
@@ -14,6 +14,13 @@ def main() -> None:
 
     checkbox = fg.Checkbox("Enable notifications", on_change=lambda v: set_status(f"checkbox={v}"))
     toggle = fg.Toggle(on_change=lambda v: set_status(f"toggle={v}"))
+    notes = fg.TextArea(
+        placeholder="Notes (Enter = newline, Cmd/Ctrl+Enter = submit)",
+        height=96.0,
+        flex_grow=1.0,
+        on_change=lambda t: set_status(f"notes={len(t)} chars"),
+        on_submit=lambda t: set_status(f"submitted notes ({len(t)} chars)"),
+    )
 
     group = 42
     radios = fg.Box(
@@ -78,6 +85,8 @@ def main() -> None:
             progress,
             fg.Label("Image", font_size=13.0, color=(0.6, 0.65, 0.7, 1.0)),
             image,
+            fg.Label("TextArea", font_size=13.0, color=(0.6, 0.65, 0.7, 1.0)),
+            notes,
         ],
     )
 
