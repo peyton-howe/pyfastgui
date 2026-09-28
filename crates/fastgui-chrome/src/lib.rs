@@ -27,7 +27,10 @@ pub mod testing;
 use cosmic_text::{Attrs, Buffer, Color as CosmicColor, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
 use fastgui_core::text_edit::{TextEdit, TextMeasure};
 use fastgui_core::theme::chrome_theme;
-use fastgui_core::widget::{Color, DropZone, WidgetKind, WidgetTree, TEXT_INPUT_PADDING};
+use fastgui_core::widget::{
+    Color, DropZone, WidgetKind, WidgetTree, LINE_HEIGHT_RATIO as LAYOUT_LINE_HEIGHT_RATIO,
+    TEXT_INPUT_PADDING, TEXT_INPUT_VERTICAL_PADDING,
+};
 use fastgui_core::{ChromeFrame, PixelRect};
 use tiny_skia::{Paint, Pixmap, Rect, Transform};
 
@@ -344,6 +347,33 @@ impl ChromeRenderer {
                     };
                     self.push_text_field(&mut ops, logical_rect, scale, &field);
                 }
+                WidgetKind::TextArea {
+                    edit,
+                    placeholder,
+                    font_size,
+                    text_color,
+                    placeholder_color,
+                    background,
+                    selection_color,
+                    scroll_y,
+                    preedit,
+                    ..
+                } => {
+                    push_fill(&mut ops, rect, *background);
+                    let field = TextAreaField {
+                        edit,
+                        placeholder,
+                        preedit: preedit.as_ref(),
+                        focused: tree.focused() == Some(id),
+                        font_size: *font_size,
+                        text_color: *text_color,
+                        placeholder_color: *placeholder_color,
+                        selection_color: *selection_color,
+                        caret_color: theme.accent,
+                        scroll_y: *scroll_y,
+                    };
+                    self.push_text_area(&mut ops, logical_rect, scale, &field);
+                }
                 WidgetKind::Viewport { .. } | WidgetKind::Image { .. } => {
                     // Placeholder only — the GPU draws the real frame in this rect after chrome.
                     push_fill(&mut ops, rect, Color([0.05, 0.06, 0.08, 1.0]));
@@ -429,6 +459,24 @@ impl ChromeRenderer {
                 WidgetKind::ProgressBar { value, min, max, track_color, fill_color, .. } => {
                     push_progress(&mut ops, rect, *value, *min, *max, *track_color, *fill_color, scale);
                 }
+                WidgetKind::ComboBox {
+                    items,
+                    selected,
+                    placeholder,
+                    font_size,
+                    text_color,
+                    placeholder_color,
+                    background,
+                    border,
+                    ..
+                } => {
+                    // Closed field; dropdown popup is drawn as its own Popup/ListView nodes.
+                    push_fill(&mut ops, rect, *background);
+                    push_outline(&mut ops, rect, scale.max(1.0), *border);
+                    let label = selected.and_then(|i| items.get(i).map(String::as_str)).unwrap_or(placeholder);
+                    let color = if selected.is_some() { *text_color } else { *placeholder_color };
+                    self.push_text(&mut ops, rect, label, *font_size * scale, color);
+                }
             }
             if tree.focused() == Some(id) {
                 push_outline(&mut ops, rect, FOCUS_RING_WIDTH * scale, theme.accent);
@@ -472,6 +520,107 @@ impl ChromeRenderer {
         self.overlay_items = items.len();
         items.extend(overlay);
         items
+    }
+
+    /// A `TextArea`'s contents: hard-newline lines, top-aligned, clipped to the padded interior,
+    /// with per-line selection and a caret on the current line. Soft wrap is not drawn.
+    fn push_text_area(&mut self, ops: &mut Vec<Op>, logical_rect: WidgetRect, scale: f32, field: &TextAreaField<'_>) {
+        let rect = scale_rect(logical_rect, scale);
+        let pad_x = TEXT_INPUT_PADDING * scale;
+        let pad_y = TEXT_INPUT_VERTICAL_PADDING * scale;
+        let font_size = field.font_size * scale;
+        let line_height = font_size * LAYOUT_LINE_HEIGHT_RATIO;
+        let inner = WidgetRect {
+            x: rect.x + pad_x,
+            y: rect.y + pad_y,
+            width: (rect.width - 2.0 * pad_x).max(0.0),
+            height: (rect.height - 2.0 * pad_y).max(0.0),
+        };
+        if inner.width <= 0.0 || inner.height <= 0.0 {
+            return;
+        }
+        let scroll_y = (field.scroll_y * scale).round();
+        let (display, caret, composing) = field.edit.composed(field.preedit.filter(|_| field.focused));
+        let selection = if composing.is_some() { 0..0 } else { field.edit.selection() };
+        let mut content = Vec::new();
+
+        if display.is_empty() {
+            if !field.placeholder.is_empty() {
+                let line_rect = WidgetRect { height: line_height.min(inner.height), ..inner };
+                self.push_line_text(&mut content, line_rect, field.placeholder, font_size, 0.0, field.placeholder_color);
+            }
+        } else {
+            let mut byte = 0usize;
+            for (line_i, line) in display.split('\n').enumerate() {
+                let line_start = byte;
+                let line_end = byte + line.len();
+                let y = inner.y + line_i as f32 * line_height - scroll_y;
+                let line_rect = WidgetRect { x: inner.x, y, width: inner.width, height: line_height };
+                let visible = y + line_height > inner.y && y < inner.y + inner.height;
+                if visible {
+                    if field.focused && !selection.is_empty() {
+                        let crosses = selection.start <= line_end && selection.end > line_start
+                            || (selection.end > line_end && selection.start <= line_start);
+                        let sel_start = selection.start.max(line_start);
+                        let sel_end = selection.end.min(line_end);
+                        if crosses && (sel_start < sel_end || line.is_empty() || selection.end > line_end) {
+                            let stops = self.line_stops(line, font_size);
+                            let x0 = if selection.start <= line_start {
+                                inner.x
+                            } else {
+                                inner.x + stop_x(&stops, sel_start - line_start)
+                            };
+                            let x1 = if selection.end > line_end {
+                                (inner.x + stop_x(&stops, line.len()) + font_size * 0.4).min(inner.x + inner.width)
+                            } else {
+                                inner.x + stop_x(&stops, sel_end - line_start)
+                            };
+                            let (x0, x1) = (x0.max(inner.x), x1.min(inner.x + inner.width));
+                            if x1 > x0 {
+                                push_fill(
+                                    &mut content,
+                                    WidgetRect { x: x0, y, width: x1 - x0, height: line_height },
+                                    field.selection_color,
+                                );
+                            }
+                        }
+                    }
+                    if !line.is_empty() {
+                        self.push_line_text(&mut content, line_rect, line, font_size, 0.0, field.text_color);
+                    }
+                    if let Some(range) = &composing {
+                        let c0 = range.start.max(line_start);
+                        let c1 = range.end.min(line_end);
+                        if c0 < c1 {
+                            let stops = self.line_stops(line, font_size);
+                            let x0 = (inner.x + stop_x(&stops, c0 - line_start)).max(inner.x);
+                            let x1 = (inner.x + stop_x(&stops, c1 - line_start)).min(inner.x + inner.width);
+                            let thickness = scale.max(1.0);
+                            push_fill(
+                                &mut content,
+                                WidgetRect {
+                                    x: x0,
+                                    y: y + line_height - thickness,
+                                    width: (x1 - x0).max(0.0),
+                                    height: thickness,
+                                },
+                                field.text_color,
+                            );
+                        }
+                    }
+                    // Caret on this line's bytes, or on the trailing `\n` (drawn at end of line).
+                    if field.focused && caret >= line_start && caret <= line_end {
+                        let stops = self.line_stops(line, font_size);
+                        let width = (CARET_WIDTH * scale).max(1.0);
+                        let local = caret.saturating_sub(line_start).min(line.len());
+                        let x = (inner.x + stop_x(&stops, local)).round().clamp(inner.x, inner.x + inner.width - width);
+                        push_fill(&mut content, WidgetRect { x, y, width, height: line_height }, field.caret_color);
+                    }
+                }
+                byte = line_end + 1;
+            }
+        }
+        ops.extend(clip_ops(content, Clip::from_rect(inner)));
     }
 
     /// A `TextInput`'s contents inside its (already filled) `logical_rect`: selection highlight,
@@ -805,6 +954,20 @@ struct TextField<'a> {
     selection_color: Color,
     caret_color: Color,
     scroll: f32,
+}
+
+/// What `push_text_area` needs from a `WidgetKind::TextArea`.
+struct TextAreaField<'a> {
+    edit: &'a TextEdit,
+    placeholder: &'a str,
+    preedit: Option<&'a (String, Option<(usize, usize)>)>,
+    focused: bool,
+    font_size: f32,
+    text_color: Color,
+    placeholder_color: Color,
+    selection_color: Color,
+    caret_color: Color,
+    scroll_y: f32,
 }
 
 /// X of the caret before byte `index`: the last stop at or before it (inside a multi-glyph

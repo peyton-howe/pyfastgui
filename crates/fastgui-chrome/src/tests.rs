@@ -524,6 +524,48 @@ fn empty_unfocused_text_input_shows_placeholder_without_caret() {
     assert!(matches!(field.as_slice(), [Op::Fill { .. }, Op::Text { .. }]), "background + placeholder only");
 }
 
+fn text_area_tree(text: &str) -> (WidgetTree, WidgetId) {
+    let mut tree = WidgetTree::new();
+    let root = tree.root();
+    let area = tree.new_node(
+        Style {
+            size: Size { width: Dimension::length(200.0), height: Dimension::length(96.0) },
+            ..Default::default()
+        },
+        WidgetKind::TextArea {
+            edit: fastgui_core::text_edit::TextEdit::new_multiline(text),
+            placeholder: "notes…".into(),
+            font_size: 16.0,
+            text_color: Color([1.0; 4]),
+            placeholder_color: Color([0.5, 0.5, 0.5, 1.0]),
+            background: Color([0.2, 0.2, 0.2, 1.0]),
+            selection_color: Color([0.2, 0.4, 0.8, 1.0]),
+            scroll_y: 0.0,
+            preedit: None,
+            on_change: None,
+            on_submit: None,
+            mirror: None,
+        },
+    );
+    tree.add_child(root, area);
+    tree.compute_layout(400.0, 200.0);
+    (tree, area)
+}
+
+#[test]
+fn text_area_rasterizes_multiline_without_panic() {
+    let (mut tree, area) = text_area_tree("line one\nline two\nline three");
+    tree.set_focus(Some(area));
+    let mut chrome = ChromeRenderer::new();
+    let items = chrome.build_items(&tree, None, 1.0, PixelRect { x: 0, y: 0, width: 400, height: 200 });
+    let field = &items.iter().find(|item| item.key == u64::from(area)).expect("area item").ops;
+    assert!(field.iter().any(|op| matches!(op, Op::Fill { .. })), "background");
+    let text_ops = field.iter().filter(|op| matches!(op, Op::Text { .. })).count();
+    assert_eq!(text_ops, 3, "one shaped line per hard newline");
+    let frame = chrome.rasterize(&tree, 400, 200, None, 1.0).expect("text area paint");
+    assert_eq!((frame.width, frame.height), (400, 200));
+}
+
 /// A 200×90 scroll area at (10, 10) over a column taller than it: labels, a button and a slider
 /// whose thumb the clip edge cuts through at some offsets.
 fn scroll_scene() -> (WidgetTree, WidgetId) {
@@ -947,11 +989,30 @@ fn form_controls_rasterize_without_panicking() {
         Style { size: Size { width: Dimension::length(80.0), height: Dimension::length(48.0) }, ..Default::default() },
         WidgetKind::Image { image_id: 99, frames: fastgui_core::FrameSlot::new() },
     );
+    add(
+        &mut tree,
+        column,
+        Style { size: Size { width: Dimension::length(200.0), height: Dimension::length(72.0) }, ..Default::default() },
+        WidgetKind::TextArea {
+            edit: fastgui_core::text_edit::TextEdit::new_multiline("a\nb\nc"),
+            placeholder: String::new(),
+            font_size: 14.0,
+            text_color: text,
+            placeholder_color: Color([0.5, 0.5, 0.5, 1.0]),
+            background: bg,
+            selection_color: Color([0.2, 0.4, 0.8, 1.0]),
+            scroll_y: 0.0,
+            preedit: None,
+            on_change: None,
+            on_submit: None,
+            mirror: None,
+        },
+    );
 
-    tree.compute_layout(320.0, 360.0);
+    tree.compute_layout(320.0, 440.0);
     let mut chrome = ChromeRenderer::new();
-    let frame = chrome.rasterize(&tree, 320, 360, None, 1.0).expect("form controls paint");
-    assert_eq!((frame.width, frame.height), (320, 360));
+    let frame = chrome.rasterize(&tree, 320, 440, None, 1.0).expect("form controls paint");
+    assert_eq!((frame.width, frame.height), (320, 440));
     let drawn = frame.data.chunks_exact(4).filter(|px| px != &[0, 0, 0, 0]).count();
     assert!(drawn > 500, "expected painted chrome, only {drawn} non-zero pixels");
     let _ = CHECK_SIZE; // keep the shared constant import intentional
