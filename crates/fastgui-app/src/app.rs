@@ -585,6 +585,10 @@ impl<B: SurfaceBackend> App<B> {
             WidgetKind::Splitter { .. } => {
                 self.dragging_splitter = Some(id);
             }
+            WidgetKind::ListView { .. } => {
+                let double = is_double_click(&mut self.last_click, self.cursor);
+                list_press(&mut self.widget_tree, id, self.cursor.1, double);
+            }
             WidgetKind::TextInput { .. } => {
                 let double = is_double_click(&mut self.last_click, self.cursor);
                 let extend = self.modifiers.shift_key();
@@ -715,6 +719,12 @@ impl<B: SurfaceBackend> App<B> {
             WidgetKind::Splitter { .. } => {
                 if let Some(floater) = self.floating.get_mut(&window_id) {
                     floater.dragging_splitter = Some(id);
+                }
+            }
+            WidgetKind::ListView { .. } => {
+                if let Some(floater) = self.floating.get_mut(&window_id) {
+                    let double = is_double_click(&mut floater.last_click, cursor);
+                    list_press(&mut floater.widget_tree, id, cursor.1, double);
                 }
             }
             WidgetKind::TextInput { .. } => {
@@ -1981,6 +1991,17 @@ fn is_text_input(tree: &WidgetTree, id: WidgetId) -> bool {
 
 fn key_press(event: &KeyEvent, modifiers: ModifiersState) -> KeyPress<'_> {
     KeyPress { key: &event.logical_key, text: event.text.as_deref(), modifiers }
+}
+
+/// A press at window y in `ListView` `id`: select the row there, or activate it on a double-click.
+fn list_press(tree: &mut WidgetTree, id: WidgetId, y: f32, double: bool) {
+    let Some(row) = tree.list_row_at(id, y) else { return };
+    tree.list_select(id, Some(row));
+    if double {
+        if let Some(WidgetKind::ListView { on_activate: Some(callback), .. }) = tree.kind(id) {
+            callback.clone()(row);
+        }
+    }
 }
 
 /// Record a press at `cursor`; returns whether it completes a double-click with the last one.

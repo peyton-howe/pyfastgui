@@ -670,3 +670,54 @@ fn popup_quads_form_the_overlay_range() {
     let closed = chrome.build_quads(&tree, 240, 130, None, 1.0).expect("popup closed");
     assert_eq!((closed.quads.len(), closed.overlay_start), (base_len, base_len));
 }
+
+#[test]
+fn clipping_twice_keeps_the_overlap() {
+    let mut chrome = ChromeRenderer::new();
+    let mut ops = Vec::new();
+    chrome.push_text(&mut ops, WidgetRect { x: 0.0, y: 0.0, width: 300.0, height: 30.0 }, "a long line of text", 16.0, Color([1.0; 4]));
+    let ops = clip_ops(ops, Clip { left: 0, top: 0, right: 60, bottom: 100 });
+    let ops = clip_ops(ops, Clip { left: 20, top: 0, right: 200, bottom: 100 });
+    assert!(matches!(ops[0], Op::Text { clip: Some(Clip { left: 20, right: 60, .. }), .. }), "both edges survive");
+}
+
+fn list_view_tree(n: usize, scroll: f32, selected: Option<usize>) -> (WidgetTree, WidgetId) {
+    let mut tree = WidgetTree::new();
+    let root = tree.root();
+    let list = tree.new_node(
+        Style { size: Size { width: Dimension::length(180.0), height: Dimension::length(100.0) }, ..Default::default() },
+        WidgetKind::ListView {
+            items: (0..n).map(|i| format!("Row number {i}")).collect(),
+            row_height: 22.0,
+            font_size: 14.0,
+            scroll,
+            selected,
+            text_color: Color([0.9, 0.9, 0.95, 1.0]),
+            background: Color([0.13, 0.14, 0.17, 1.0]),
+            selection_color: Color([0.25, 0.45, 0.8, 0.6]),
+            on_select: None,
+            on_activate: None,
+            mirror: None,
+        },
+    );
+    tree.add_child(root, list);
+    tree.compute_layout(200.0, 120.0);
+    (tree, list)
+}
+
+#[test]
+fn list_view_shapes_only_visible_rows_and_matches_cpu_painter() {
+    for scale in [1.0f32, 1.5, 2.0] {
+        let size = ((200.0 * scale) as u32, (120.0 * scale) as u32);
+        let (mut tree, list) = list_view_tree(1_000_000, 22.0 * 500_000.0 + 7.5, Some(500_002));
+        let (mut gpu, mut cpu, mut atlas) = (ChromeRenderer::new(), ChromeRenderer::new(), Vec::new());
+        check_gpu_matches_cpu(&mut gpu, &mut cpu, &mut atlas, &mut tree, size, None, scale);
+        let sprites = gpu.gpu.quads.iter().filter(|q| q.kind == fastgui_core::QUAD_SPRITE).count();
+        assert!(sprites <= 6, "only the ~6 rows in view are drawn, not a million: {sprites}");
+        assert!(gpu.text_cache.runs.values().map(|m| m.len()).sum::<usize>() <= 6, "and only they get shaped");
+        let clip = Clip::from_rect(scale_rect(tree.absolute_rect(list).unwrap(), scale));
+        for q in &gpu.gpu.quads[1..] {
+            assert!(q.rect[1] >= clip.top as f32 && q.rect[3] <= clip.bottom as f32, "scale {scale}: {q:?} leaves the list");
+        }
+    }
+}

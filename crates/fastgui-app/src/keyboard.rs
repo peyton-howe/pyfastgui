@@ -66,6 +66,28 @@ pub fn handle_key(
             true
         }
         Some(WidgetKind::TextInput { .. }) => text_input::handle_key(tree, id, press, measure, clipboard),
+        Some(WidgetKind::ListView { items, selected, on_activate, .. }) => {
+            let (count, current) = (items.len(), *selected);
+            let page = tree.list_page_rows(id);
+            let last = count.saturating_sub(1);
+            let target = match key {
+                Key::Named(NamedKey::Enter) => {
+                    if let (Some(callback), Some(row)) = (on_activate.clone(), current) {
+                        callback(row);
+                    }
+                    return current.is_some();
+                }
+                Key::Named(NamedKey::ArrowDown) => current.map_or(0, |i| (i + 1).min(last)),
+                Key::Named(NamedKey::ArrowUp) => current.map_or(0, |i| i.saturating_sub(1)),
+                Key::Named(NamedKey::PageDown) => current.map_or(0, |i| (i + page).min(last)),
+                Key::Named(NamedKey::PageUp) => current.map_or(0, |i| i.saturating_sub(page)),
+                Key::Named(NamedKey::Home) => 0,
+                Key::Named(NamedKey::End) => last,
+                _ => return false,
+            };
+            tree.list_select(id, Some(target));
+            true
+        }
         _ => false,
     }
 }
@@ -215,6 +237,40 @@ mod tests {
         assert_eq!(tree.focused(), Some(ids[0]), "focus comes back to where it was");
         assert!(press(&mut tree, Key::Named(NamedKey::Escape), false));
         assert_eq!(tree.focused(), None, "a second Escape clears focus");
+    }
+
+    #[test]
+    fn list_keys_move_selection_and_enter_activates() {
+        let activated = Arc::new(Mutex::new(Vec::new()));
+        let sink = activated.clone();
+        let (mut tree, ids) = tree_with(vec![WidgetKind::ListView {
+            items: (0..30).map(|i| i.to_string()).collect(),
+            row_height: 5.0,
+            font_size: 12.0,
+            scroll: 0.0,
+            selected: None,
+            text_color: Color::TRANSPARENT,
+            background: Color::TRANSPARENT,
+            selection_color: Color::TRANSPARENT,
+            on_select: None,
+            on_activate: Some(Arc::new(move |i| sink.lock().unwrap().push(i))),
+            mirror: None,
+        }]);
+        tree.set_focus(Some(ids[0]));
+        let selected = |tree: &WidgetTree| match tree.kind(ids[0]) {
+            Some(WidgetKind::ListView { selected, .. }) => *selected,
+            _ => panic!(),
+        };
+        assert!(!press(&mut tree, Key::Named(NamedKey::Enter), false), "nothing selected to activate");
+        press(&mut tree, Key::Named(NamedKey::ArrowDown), false);
+        assert_eq!(selected(&tree), Some(0), "the first Down selects the first row");
+        press(&mut tree, Key::Named(NamedKey::PageDown), false);
+        assert_eq!(selected(&tree), Some(4), "a page is the 20-tall list's 4 rows");
+        press(&mut tree, Key::Named(NamedKey::End), false);
+        press(&mut tree, Key::Named(NamedKey::ArrowDown), false);
+        assert_eq!(selected(&tree), Some(29), "stops at the last row");
+        press(&mut tree, Key::Named(NamedKey::Enter), false);
+        assert_eq!(*activated.lock().unwrap(), [29]);
     }
 
     #[test]

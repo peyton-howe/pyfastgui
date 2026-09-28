@@ -5,7 +5,7 @@ use fastgui_core::taffy::prelude::*;
 use fastgui_core::taffy::style::LengthPercentage;
 use fastgui_core::widget::{
     ChangeCallback, ClickCallback, Color, PanelCloseCallback, PanelDropCallback, SplitDirection, TabSelectCallback,
-    PopupAnchor, PopupSide, TextCallback, WidgetId, WidgetKind, WidgetTree,
+    IndexCallback, PopupAnchor, PopupSide, TextCallback, WidgetId, WidgetKind, WidgetTree,
 };
 use fastgui_core::text_edit::TextEdit;
 use fastgui_core::Readback;
@@ -286,6 +286,9 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
     }
     if let Ok(w) = obj.cast::<ScrollArea>() {
         return w.borrow().describe();
+    }
+    if let Ok(w) = obj.cast::<ListView>() {
+        return Ok(w.borrow().describe());
     }
     if obj.cast::<Popup>().is_ok() {
         return Err(PyTypeError::new_err("a Popup isn't placed in the layout; open it with popup.show(anchor)"));
@@ -824,6 +827,161 @@ impl TextInput {
                 on_change: on_change.map(wrap_callback_text),
                 on_submit: on_submit.map(wrap_callback_text),
                 mirror: Some(self.text.clone()),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+        }
+    }
+}
+
+/// A virtualized list of text rows: only the rows in view are drawn, so it handles millions.
+#[pyclass]
+pub(crate) struct ListView {
+    id: IdCell,
+    sender: SenderCell,
+    /// The current items — what `describe` builds from, kept in sync by `set_items`.
+    items: Arc<Mutex<Arc<Vec<String>>>>,
+    selected: Readback<Option<usize>>,
+    row_height: f32,
+    font_size: f32,
+    flex_grow: f32,
+    width: Option<f32>,
+    height: Option<f32>,
+    text_color: (f32, f32, f32, f32),
+    background: (f32, f32, f32, f32),
+    selection_color: (f32, f32, f32, f32),
+    on_select: Option<Py<PyAny>>,
+    on_activate: Option<Py<PyAny>>,
+}
+
+fn wrap_index_callback(callback: Py<PyAny>) -> IndexCallback {
+    Arc::new(move |index: usize| {
+        Python::attach(|py| {
+            if let Err(err) = callback.call1(py, (index,)) {
+                err.print(py);
+            }
+        });
+    })
+}
+
+#[pymethods]
+impl ListView {
+    #[new]
+    #[pyo3(signature = (
+        items,
+        on_select=None,
+        on_activate=None,
+        row_height=24.0,
+        font_size=14.0,
+        flex_grow=1.0,
+        width=None,
+        height=None,
+        text_color=(0.9, 0.91, 0.94, 1.0),
+        background=(0.13, 0.14, 0.17, 1.0),
+        selection_color=(0.25, 0.45, 0.8, 0.6),
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        items: Vec<String>,
+        on_select: Option<Py<PyAny>>,
+        on_activate: Option<Py<PyAny>>,
+        row_height: f32,
+        font_size: f32,
+        flex_grow: f32,
+        width: Option<f32>,
+        height: Option<f32>,
+        text_color: (f32, f32, f32, f32),
+        background: (f32, f32, f32, f32),
+        selection_color: (f32, f32, f32, f32),
+    ) -> PyResult<Self> {
+        if row_height <= 0.0 {
+            return Err(PyValueError::new_err("row_height must be positive"));
+        }
+        Ok(Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            items: Arc::new(Mutex::new(Arc::new(items))),
+            selected: Readback::new(None),
+            row_height,
+            font_size,
+            flex_grow,
+            width,
+            height,
+            text_color,
+            background,
+            selection_color,
+            on_select,
+            on_activate,
+        })
+    }
+
+    /// Replace the rows (clears the selection and scrolls to the top). Works before attaching.
+    fn set_items(&self, items: Vec<String>) -> PyResult<()> {
+        let items = Arc::new(items);
+        *self.items.lock().unwrap_or_else(|p| p.into_inner()) = items.clone();
+        self.selected.set(None);
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::ListView { items: current, selected, scroll, .. } = kind {
+                *current = Arc::unwrap_or_clone(items);
+                *selected = None;
+                *scroll = 0.0;
+            }
+        })
+    }
+
+    /// Select row `index` (clamped) and scroll it into view, calling `on_select`; `None`
+    /// clears the selection.
+    #[pyo3(signature = (index))]
+    fn select(&self, index: Option<usize>) -> PyResult<()> {
+        let id = self.id.lock().unwrap_or_else(|p| p.into_inner()).ok_or_else(|| {
+            PyRuntimeError::new_err("this widget hasn't been attached to a window yet (call window.set_content first)")
+        })?;
+        let sender = self.sender.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let sender = sender.ok_or_else(|| PyRuntimeError::new_err("this widget hasn't been attached to a window yet"))?;
+        send_tree_mutation(&sender, move |tree| tree.list_select(id, index))
+    }
+
+    /// The selected row, or `None`. Safe from any thread.
+    #[getter]
+    fn selected(&self) -> Option<usize> {
+        self.selected.get()
+    }
+
+    fn __len__(&self) -> usize {
+        self.items.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+}
+
+impl ListView {
+    fn describe(&self) -> DescribedWidget {
+        let (on_select, on_activate) = Python::attach(|py| {
+            (
+                self.on_select.as_ref().map(|cb| cb.clone_ref(py)),
+                self.on_activate.as_ref().map(|cb| cb.clone_ref(py)),
+            )
+        });
+        let items = self.items.lock().unwrap_or_else(|p| p.into_inner()).as_ref().clone();
+        let selected = self.selected.get().filter(|&i| i < items.len());
+        DescribedWidget {
+            style: StyleParams::leaf(self.flex_grow, self.width, self.height),
+            kind: WidgetKind::ListView {
+                items,
+                row_height: self.row_height,
+                font_size: self.font_size,
+                scroll: 0.0,
+                selected,
+                text_color: rgba(self.text_color),
+                background: rgba(self.background),
+                selection_color: rgba(self.selection_color),
+                on_select: on_select.map(wrap_index_callback),
+                on_activate: on_activate.map(wrap_index_callback),
+                mirror: Some(self.selected.clone()),
             },
             id_cell: self.id.clone(),
             sender_cell: self.sender.clone(),
@@ -1623,6 +1781,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TextInput>()?;
     m.add_class::<ScrollArea>()?;
     m.add_class::<Popup>()?;
+    m.add_class::<ListView>()?;
     m.add_class::<BoxWidget>()?;
     m.add_class::<Splitter>()?;
     m.add_class::<Panel>()?;

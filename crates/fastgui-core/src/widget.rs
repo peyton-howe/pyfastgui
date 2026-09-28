@@ -31,6 +31,8 @@ pub type TabSelectCallback = Arc<dyn Fn(usize) + Send + Sync>;
 /// `Float` (tear a docked panel out into an OS window); `None` for ordinary dock rearrange.
 pub type PanelDropCallback =
     Arc<dyn Fn(u64, u64, DropZone, Option<(f32, f32, f32, f32)>) + Send + Sync>;
+/// A `ListView` row index (`on_select` / `on_activate`).
+pub type IndexCallback = Arc<dyn Fn(usize) + Send + Sync>;
 /// A `TextInput`'s edited text (`on_change`) or submitted text (`on_submit`, Enter).
 pub type TextCallback = Arc<dyn Fn(String) + Send + Sync>;
 /// Fired when the user clicks a panel/tab close control — argument is that panel's region id.
@@ -274,6 +276,25 @@ pub enum WidgetKind {
     /// rect (see `WidgetTree::clip_rect`) and can't be clicked where it's clipped out.
     /// Overflowing axes get overlay scrollbars (`scrollbar_thumbs`), drawn in `bar_color`.
     ScrollArea { offset: (f32, f32), background: Color, bar_color: Color },
+    /// A virtualized list of text rows (`QListView`): `items` can be huge — only the rows in
+    /// view are laid out, shaped and drawn, each `row_height` tall. It scrolls itself
+    /// (`scroll`, layout units, vertical) through the same wheel/scrollbar machinery as
+    /// `ScrollArea` (see `WidgetTree::scroll_offset`). Click or arrow keys select (`on_select`),
+    /// double-click or Enter activates (`on_activate`); `mirror` publishes the selection for
+    /// Python's `ListView.selected`.
+    ListView {
+        items: Vec<String>,
+        row_height: f32,
+        font_size: f32,
+        scroll: f32,
+        selected: Option<usize>,
+        text_color: Color,
+        background: Color,
+        selection_color: Color,
+        on_select: Option<IndexCallback>,
+        on_activate: Option<IndexCallback>,
+        mirror: Option<Readback<Option<usize>>>,
+    },
     /// An overlay (menu, dropdown list, tooltip, dialog): an absolutely positioned child of the
     /// root, so it paints above everything else and wins hit tests, placed after layout by
     /// `anchor` (see `WidgetTree::open_popup`). A click outside the topmost popup dismisses it
@@ -302,7 +323,13 @@ pub enum WidgetKind {
 impl WidgetKind {
     /// Whether this widget can take keyboard focus (click or Tab to it).
     pub fn is_focusable(&self) -> bool {
-        matches!(self, WidgetKind::Button { .. } | WidgetKind::Slider { .. } | WidgetKind::TextInput { .. })
+        matches!(
+            self,
+            WidgetKind::Button { .. }
+                | WidgetKind::Slider { .. }
+                | WidgetKind::TextInput { .. }
+                | WidgetKind::ListView { .. }
+        )
     }
 }
 
@@ -566,11 +593,20 @@ impl WidgetTree {
         // Scroll offsets can't exceed the (possibly just shrunk) content's overflow.
         self.scroll_content.clear();
         for (&id, kind) in self.kinds.iter_mut() {
-            let WidgetKind::ScrollArea { offset, .. } = kind else { continue };
             let Ok(layout) = self.taffy.layout(id) else { continue };
-            self.scroll_content.insert(id, layout.content_size);
-            let max = max_scroll(layout.size, layout.content_size);
-            *offset = (offset.0.clamp(0.0, max.0), offset.1.clamp(0.0, max.1));
+            match kind {
+                WidgetKind::ScrollArea { offset, .. } => {
+                    self.scroll_content.insert(id, layout.content_size);
+                    let max = max_scroll(layout.size, layout.content_size);
+                    *offset = (offset.0.clamp(0.0, max.0), offset.1.clamp(0.0, max.1));
+                }
+                WidgetKind::ListView { items, row_height, scroll, .. } => {
+                    let content = Size { width: layout.size.width, height: items.len() as f32 * *row_height };
+                    self.scroll_content.insert(id, content);
+                    *scroll = scroll.clamp(0.0, max_scroll(layout.size, content).1);
+                }
+                _ => {}
+            }
         }
 
         self.absolute_rects.clear();
@@ -640,15 +676,86 @@ impl WidgetTree {
         Some(max_scroll(self.taffy.layout(id).ok()?.size, content))
     }
 
-    /// Set a `ScrollArea`'s offset (clamped). Returns whether it moved.
+    /// The `ListView` rows at least partly in view (for drawing), from the last layout.
+    pub fn list_visible_rows(&self, id: WidgetId) -> std::ops::Range<usize> {
+        let (Some(WidgetKind::ListView { items, row_height, scroll, .. }), Some(rect)) = (self.kind(id), self.absolute_rect(id))
+        else {
+            return 0..0;
+        };
+        if *row_height <= 0.0 {
+            return 0..0;
+        }
+        let first = (*scroll / row_height).floor().max(0.0) as usize;
+        let last = ((*scroll + rect.height) / row_height).ceil().max(0.0) as usize;
+        first.min(items.len())..last.min(items.len())
+    }
+
+    /// The `ListView` row under window y, if any.
+    pub fn list_row_at(&self, id: WidgetId, y: f32) -> Option<usize> {
+        let (Some(WidgetKind::ListView { items, row_height, scroll, .. }), Some(rect)) = (self.kind(id), self.absolute_rect(id))
+        else {
+            return None;
+        };
+        let row = ((y - rect.y + scroll) / row_height).floor();
+        (row >= 0.0 && (row as usize) < items.len()).then_some(row as usize)
+    }
+
+    /// Select row `index` of `ListView` `id` (clamped to its rows; `None` clears) and scroll it
+    /// into view. Fires `on_select` and updates the mirror when the selection changes.
+    pub fn list_select(&mut self, id: WidgetId, index: Option<usize>) {
+        let Some(WidgetKind::ListView { items, row_height, scroll, selected, on_select, mirror, .. }) = self.kinds.get_mut(&id)
+        else {
+            return;
+        };
+        let index = index.filter(|_| !items.is_empty()).map(|i| i.min(items.len() - 1));
+        let changed = *selected != index;
+        *selected = index;
+        let view = self.absolute_rects.get(&id).map_or(0.0, |r| r.height);
+        if let Some(i) = index {
+            let (top, bottom) = (i as f32 * *row_height, (i + 1) as f32 * *row_height);
+            *scroll = scroll.min(top).max(bottom - view);
+        }
+        let (callback, mirror) = (on_select.clone(), mirror.clone());
+        self.mark_dirty();
+        if changed {
+            if let Some(mirror) = mirror {
+                mirror.set(index);
+            }
+            if let (Some(callback), Some(i)) = (callback, index) {
+                callback(i);
+            }
+        }
+    }
+
+    /// How many whole rows fit in `ListView` `id` (at least 1) — PageUp/PageDown's step.
+    pub fn list_page_rows(&self, id: WidgetId) -> usize {
+        let (Some(WidgetKind::ListView { row_height, .. }), Some(rect)) = (self.kind(id), self.absolute_rect(id)) else {
+            return 1;
+        };
+        ((rect.height / row_height).floor() as usize).max(1)
+    }
+
+    /// A scrollable widget's current offset (`ScrollArea`, or a `ListView`'s vertical scroll).
+    pub fn scroll_offset(&self, id: WidgetId) -> Option<(f32, f32)> {
+        match self.kind(id)? {
+            WidgetKind::ScrollArea { offset, .. } => Some(*offset),
+            WidgetKind::ListView { scroll, .. } => Some((0.0, *scroll)),
+            _ => None,
+        }
+    }
+
+    /// Set a scrollable widget's offset (clamped). Returns whether it moved.
     pub fn set_scroll_offset(&mut self, id: WidgetId, x: f32, y: f32) -> bool {
         let Some(max) = self.scroll_extent(id) else { return false };
         let target = (x.clamp(0.0, max.0), y.clamp(0.0, max.1));
-        let Some(WidgetKind::ScrollArea { offset, .. }) = self.kinds.get_mut(&id) else { return false };
-        if *offset == target {
+        if self.scroll_offset(id) == Some(target) {
             return false;
         }
-        *offset = target;
+        match self.kinds.get_mut(&id) {
+            Some(WidgetKind::ScrollArea { offset, .. }) => *offset = target,
+            Some(WidgetKind::ListView { scroll, .. }) => *scroll = target.1,
+            _ => return false,
+        }
         self.mark_dirty();
         true
     }
@@ -657,14 +764,11 @@ impl WidgetTree {
     /// innermost `ScrollArea` under `(x, y)` that can still move that way; one at its limit
     /// passes the scroll out to the one around it. Returns whether anything scrolled.
     pub fn scroll_at(&mut self, x: f32, y: f32, dx: f32, dy: f32) -> bool {
-        let areas: Vec<WidgetId> = self
-            .walk()
-            .filter(|&id| matches!(self.kind(id), Some(WidgetKind::ScrollArea { .. })) && self.visible_at(id, x, y))
-            .collect();
+        let areas: Vec<WidgetId> =
+            self.walk().filter(|&id| self.scroll_offset(id).is_some() && self.visible_at(id, x, y)).collect();
         // `walk` visits parents first, so the innermost area comes last.
         for id in areas.into_iter().rev() {
-            let Some(WidgetKind::ScrollArea { offset, .. }) = self.kind(id) else { continue };
-            let (ox, oy) = *offset;
+            let Some((ox, oy)) = self.scroll_offset(id) else { continue };
             if self.set_scroll_offset(id, ox + dx, oy + dy) {
                 return true;
             }
@@ -696,7 +800,7 @@ impl WidgetTree {
     /// units; `None` for an axis that doesn't overflow. Shared by chrome (drawing) and
     /// `fastgui-app` (dragging) so the drawn thumb is the one you grab.
     pub fn scrollbar_thumbs(&self, id: WidgetId) -> (Option<Rect>, Option<Rect>) {
-        let (Some(WidgetKind::ScrollArea { offset, .. }), Some(rect)) = (self.kind(id), self.absolute_rect(id)) else {
+        let (Some(offset), Some(rect)) = (self.scroll_offset(id), self.absolute_rect(id)) else {
             return (None, None);
         };
         let corner = SCROLLBAR_WIDTH + SCROLLBAR_INSET;
@@ -714,8 +818,7 @@ impl WidgetTree {
     /// The scroll area whose scrollbar thumb is at `(x, y)` (with `slop` extra across the bar),
     /// and whether it's the vertical one. Checked before other hit tests, like splitters.
     pub fn scrollbar_at(&self, x: f32, y: f32, slop: f32) -> Option<(WidgetId, bool)> {
-        let areas: Vec<WidgetId> =
-            self.walk().filter(|&id| matches!(self.kind(id), Some(WidgetKind::ScrollArea { .. }))).collect();
+        let areas: Vec<WidgetId> = self.walk().filter(|&id| self.scroll_offset(id).is_some()).collect();
         areas.into_iter().rev().find_map(|id| {
             if self.clip_rects.get(&id).is_some_and(|c| !c.contains(x, y)) {
                 return None;
@@ -855,7 +958,7 @@ impl WidgetTree {
     /// units along the bar) — dragging a scrollbar. Returns whether it moved.
     pub fn drag_scrollbar(&mut self, id: WidgetId, vertical: bool, thumb_start: f32) -> bool {
         let Some(track) = self.scrollbar_track(id, vertical) else { return false };
-        let Some(WidgetKind::ScrollArea { offset, .. }) = self.kind(id) else { return false };
+        let Some(offset) = self.scroll_offset(id) else { return false };
         let fraction = if track.travel() > 0.0 { (thumb_start - track.start) / track.travel() } else { 0.0 };
         let value = fraction.clamp(0.0, 1.0) * track.max;
         let (x, y) = if vertical { (offset.0, value) } else { (value, offset.1) };
@@ -1139,6 +1242,10 @@ fn measure_leaf(
             | WidgetKind::Viewport { .. },
         )
         | None => Size::ZERO,
+        Some(WidgetKind::ListView { row_height, items, .. }) => {
+            // Up to eight rows tall unless stretched or sized; wide enough to read.
+            Size { width: 160.0, height: row_height * items.len().clamp(1, 8) as f32 }
+        }
     };
     Size {
         width: known_dimensions.width.unwrap_or(content_size.width),
@@ -1758,6 +1865,68 @@ mod tests {
         assert_eq!(tree.focus_next(false), Some(items[0]), "wraps within the popup, skipping the anchor");
         assert_eq!(tree.popup_of(items[1]), tree.topmost_popup());
         assert_eq!(tree.popup_of(anchor), None);
+    }
+
+    /// Every `on_select` call a test list received.
+    type Selections = Arc<std::sync::Mutex<Vec<usize>>>;
+
+    /// A 100-tall list of `n` 20-tall rows at (0, 0).
+    fn list_tree(n: usize) -> (WidgetTree, WidgetId, Selections, Readback<Option<usize>>) {
+        let selections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = selections.clone();
+        let mirror = Readback::new(None);
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let list = tree.new_node(
+            Style { size: Size { width: Dimension::length(150.0), height: Dimension::length(100.0) }, ..Default::default() },
+            WidgetKind::ListView {
+                items: (0..n).map(|i| format!("item {i}")).collect(),
+                row_height: 20.0,
+                font_size: 14.0,
+                scroll: 0.0,
+                selected: None,
+                text_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                selection_color: Color::TRANSPARENT,
+                on_select: Some(Arc::new(move |i| sink.lock().unwrap().push(i))),
+                on_activate: None,
+                mirror: Some(mirror.clone()),
+            },
+        );
+        tree.add_child(root, list);
+        tree.compute_layout(300.0, 300.0);
+        (tree, list, selections, mirror)
+    }
+
+    #[test]
+    fn list_view_draws_only_visible_rows_of_a_million() {
+        let (mut tree, list, _, _) = list_tree(1_000_000);
+        assert_eq!(tree.list_visible_rows(list), 0..5);
+        assert_eq!(tree.scroll_extent(list), Some((0.0, 20_000_000.0 - 100.0)));
+        assert!(tree.scroll_at(10.0, 10.0, 0.0, 30.0), "the wheel scrolls it like a ScrollArea");
+        assert_eq!(tree.list_visible_rows(list), 1..7, "partly visible rows at both ends");
+        assert_eq!(tree.list_row_at(list, 5.0), Some(1));
+        tree.set_scroll_offset(list, 0.0, 1e12);
+        tree.compute_layout(300.0, 300.0);
+        assert_eq!(tree.list_visible_rows(list), 999_995..1_000_000);
+        assert!(tree.scrollbar_thumbs(list).0.is_some(), "it has a draggable scrollbar");
+    }
+
+    #[test]
+    fn list_view_selection_scrolls_into_view_and_notifies() {
+        let (mut tree, list, selections, mirror) = list_tree(50);
+        tree.list_select(list, Some(10));
+        assert_eq!(tree.scroll_offset(list), Some((0.0, 11.0 * 20.0 - 100.0)), "row 10 bottom-aligned");
+        tree.list_select(list, Some(10));
+        tree.list_select(list, Some(2));
+        assert_eq!(tree.scroll_offset(list), Some((0.0, 40.0)), "row 2 top-aligned");
+        tree.list_select(list, Some(999));
+        assert_eq!(*selections.lock().unwrap(), [10, 2, 49], "reselecting fires nothing; clamps to the last row");
+        assert_eq!(mirror.get(), Some(49));
+        assert_eq!(tree.list_page_rows(list), 5);
+        let (mut empty, id, _, _) = list_tree(0);
+        empty.list_select(id, Some(0));
+        assert_eq!(empty.list_row_at(id, 5.0), None);
     }
 
     #[test]

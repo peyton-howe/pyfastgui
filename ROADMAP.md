@@ -1273,6 +1273,15 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
    chrome overlay range, Escape; real-GPU scenario gained a modal popup step (Metal + MoltenVK).
    Demo: `popup_demo.py`. Tooltips (hover delay) still to build on this in 7C.
 5. **Virtualization** — build only visible rows; required for lists/trees/tables to scale.
+   **Done (2026-09-28):** `WidgetKind::ListView` / Python `fg.ListView(items, on_select=,
+   on_activate=)` (`set_items`, `select`, `selected`, `len()`). Data-driven (one node, plain
+   rows) rather than a node per row: chrome draws only `list_visible_rows`, so 1,000,000 rows
+   shape ~6 strings per frame. Shares `ScrollArea`'s scroll machinery (wheel hand-off, draggable
+   scrollbar) via `scroll_offset`/`set_scroll_offset`. Click selects, double-click / Enter
+   activates, arrows / PageUp / PageDown / Home / End move the selection and keep it in view.
+   Also fixed: clipping an already-clipped op (a list inside a scroll area) now keeps the
+   overlap of both clips. Demo: `list_demo.py`. Fixed row height only; tables/trees (7D) build
+   on `list_visible_rows`.
 6. **Theming** — shared palette/font/spacing tokens instead of per-widget color arguments.
 
 ### 7B. Tier 1 — core form controls

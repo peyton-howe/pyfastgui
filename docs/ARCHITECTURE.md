@@ -187,6 +187,12 @@ calls. `Viewport` layers inside a scroll area keep their full-size GPU viewport 
 the scissor (`ViewportDraw::viewport_and_scissor`), so a partly scrolled-out frame is cut off,
 not squashed. Scrollbars are overlay thumbs drawn as extra items after all content.
 
+**Virtualization (`ListView`).** A list is one widget node holding plain row data, not a node
+per row: chrome asks `WidgetTree::list_visible_rows` for the handful of rows in view and shapes
+and draws only those, clipped to the list. It scrolls through the same offset/extent/scrollbar
+code as `ScrollArea` (`WidgetTree::scroll_offset`), with its extent `rows × row_height`, so a
+million rows cost the same per frame as ten.
+
 **Overlays (`Popup`).** A popup is an absolutely positioned last child of the root (so it
 paints last and wins hit tests), moved next to its anchor by `WidgetTree::place_popups` after
 layout. Chrome puts every item inside a popup after the drop indicator and reports where they

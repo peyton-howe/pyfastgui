@@ -94,6 +94,32 @@ class ScrollArea:
     def scroll_to(self, x: float, y: float) -> None:
         """Scroll so content point `(x, y)` is at the top-left (clamped)."""
 
+class ListView:
+    """A virtualized list of text rows: only the rows in view are drawn, so it handles millions.
+    Click or arrow keys select (`on_select(index)`); double-click or Enter activates
+    (`on_activate(index)`). Scrolls with the wheel/trackpad and a draggable scrollbar."""
+    def __init__(
+        self,
+        items: Sequence[str],
+        on_select: Callable[[int], None] | None = None,
+        on_activate: Callable[[int], None] | None = None,
+        row_height: float = 24.0,
+        font_size: float = 14.0,
+        flex_grow: float = 1.0,
+        width: float | None = None,
+        height: float | None = None,
+        text_color: RGBA = (0.9, 0.91, 0.94, 1.0),
+        background: RGBA = (0.13, 0.14, 0.17, 1.0),
+        selection_color: RGBA = (0.25, 0.45, 0.8, 0.6),
+    ) -> None: ...
+    def set_items(self, items: Sequence[str]) -> None:
+        """Replace the rows (clears the selection). Works before attaching."""
+    def select(self, index: int | None) -> None:
+        """Select a row (clamped) and scroll it into view, calling `on_select`."""
+    @property
+    def selected(self) -> int | None: ...
+    def __len__(self) -> int: ...
+
 class Popup:
     """An overlay shown on demand: a menu, dropdown list, tooltip or dialog. Not placed in the
     layout; open it with `show(anchor)` or `Window.show_popup`. A click outside a non-modal popup,
@@ -117,7 +143,7 @@ class Popup:
     @property
     def is_open(self) -> bool: ...
 
-Widget = Union[Label, Button, Slider, TextInput, "ScrollArea", "Box", "Splitter", "Panel", "Tabs", "DockArea", Viewport]
+Widget = Union[Label, Button, Slider, TextInput, "ListView", "ScrollArea", "Box", "Splitter", "Panel", "Tabs", "DockArea", Viewport]
 
 class Box:
     def __init__(

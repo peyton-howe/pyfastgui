@@ -64,6 +64,10 @@ const TEXT_CACHE_KEEP_FRAMES: u64 = 120;
 
 const SLIDER_THUMB_RADIUS: f32 = 8.0;
 
+/// Left/right text inset inside a `ListView` row (points).
+const LIST_TEXT_INSET: f32 = 8.0;
+const LIST_BAR_COLOR: Color = Color([1.0, 1.0, 1.0, 0.35]);
+
 /// Dims everything behind a modal popup.
 const MODAL_SCRIM: Color = Color([0.0, 0.0, 0.0, 0.45]);
 
@@ -232,6 +236,31 @@ impl ChromeRenderer {
                 }
                 WidgetKind::Splitter { bar_color, .. } => push_fill(&mut ops, rect, *bar_color),
                 WidgetKind::ScrollArea { background, .. } => push_fill(&mut ops, rect, *background),
+                WidgetKind::ListView { items, row_height, font_size, scroll, selected, text_color, background, selection_color, .. } => {
+                    push_fill(&mut ops, rect, *background);
+                    for index in tree.list_visible_rows(id) {
+                        let row = WidgetRect {
+                            x: logical_rect.x,
+                            y: logical_rect.y + index as f32 * row_height - scroll,
+                            width: logical_rect.width,
+                            height: *row_height,
+                        };
+                        let row_px = scale_rect(row, scale);
+                        if *selected == Some(index) {
+                            push_fill(&mut ops, row_px, *selection_color);
+                        }
+                        let line = font_size * LINE_HEIGHT_RATIO;
+                        let text = WidgetRect {
+                            x: row.x + LIST_TEXT_INSET,
+                            y: row.y + (row.height - line) / 2.0,
+                            width: (row.width - 2.0 * LIST_TEXT_INSET).max(0.0),
+                            height: line,
+                        };
+                        self.push_text(&mut ops, scale_rect(text, scale), &items[index], font_size * scale, *text_color);
+                    }
+                    // Rows past the list's edges are cut to it.
+                    ops = clip_ops(ops, Clip::from_rect(rect));
+                }
                 WidgetKind::Popup { modal, background, border, .. } => {
                     if *modal {
                         let screen = WidgetRect { x: 0.0, y: 0.0, width: window.width as f32, height: window.height as f32 };
@@ -322,7 +351,11 @@ impl ChromeRenderer {
         let mut in_overlay = false;
         for id in tree.walk() {
             in_overlay |= popups.contains(&id);
-            let Some(WidgetKind::ScrollArea { bar_color, .. }) = tree.kind(id) else { continue };
+            let bar_color = match tree.kind(id) {
+                Some(WidgetKind::ScrollArea { bar_color, .. }) => bar_color,
+                Some(WidgetKind::ListView { .. }) => &LIST_BAR_COLOR,
+                _ => continue,
+            };
             let mut ops = Vec::new();
             let (vertical, horizontal) = tree.scrollbar_thumbs(id);
             for thumb in [vertical, horizontal].into_iter().flatten() {
@@ -619,13 +652,24 @@ impl Clip {
         Some(left >= cl && top >= ct && right <= cr && bottom <= cb)
     }
 
+    /// The overlap of two clips (possibly empty: `right <= left` / `bottom <= top`).
+    fn intersect(self, other: Clip) -> Self {
+        Self {
+            left: self.left.max(other.left),
+            top: self.top.max(other.top),
+            right: self.right.min(other.right),
+            bottom: self.bottom.min(other.bottom),
+        }
+    }
+
     fn shifted(self, dx: i32, dy: i32) -> Self {
         Self { left: self.left + dx, top: self.top + dy, right: self.right + dx, bottom: self.bottom + dy }
     }
 }
 
 /// Restrict `ops` to `clip`: fills are cut to it exactly, ops entirely outside are dropped,
-/// and circles/text that straddle it carry it along (see `Op::Circle` / `Op::Text`).
+/// and circles/text that straddle it carry it along (see `Op::Circle` / `Op::Text`). Clipping
+/// already-clipped ops again (a list inside a scroll area) keeps the overlap of both clips.
 fn clip_ops(ops: Vec<Op>, clip: Clip) -> Vec<Op> {
     let (cl, ct, cr, cb) = (clip.left as f32, clip.top as f32, clip.right as f32, clip.bottom as f32);
     ops.into_iter()
@@ -635,11 +679,13 @@ fn clip_ops(ops: Vec<Op>, clip: Clip) -> Vec<Op> {
                 (right > left && bottom > top).then_some(Op::Fill { left, top, right, bottom, color })
             }
             // One pixel of anti-aliasing past the radius, as drawn.
-            Op::Circle { cx, cy, radius, color, sprite, .. } => {
+            Op::Circle { cx, cy, radius, color, sprite, clip: existing } => {
+                let clip = existing.map_or(clip, |c| c.intersect(clip));
                 let inside = clip.classify(cx - radius - 1.0, cy - radius - 1.0, cx + radius + 1.0, cy + radius + 1.0)?;
                 Some(Op::Circle { cx, cy, radius, color, sprite, clip: (!inside).then_some(clip) })
             }
-            Op::Text { run, x, y, .. } => {
+            Op::Text { run, x, y, clip: existing } => {
+                let clip = existing.map_or(clip, |c| c.intersect(clip));
                 let (left, top) = ((x + run.x) as f32, (y + run.y) as f32);
                 let inside = clip.classify(left, top, left + run.width as f32, top + run.height as f32)?;
                 Some(Op::Text { run, x, y, clip: (!inside).then_some(clip) })
