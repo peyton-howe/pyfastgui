@@ -738,7 +738,7 @@ impl VulkanRenderer {
             self.device.cmd_begin_rendering(cmd, &rendering_info);
 
             if draw_chrome {
-                self.quad_chrome.record(&self.device, cmd, &self.quad_pipeline, self.frame, self.extent);
+                self.quad_chrome.record(&self.device, cmd, &self.quad_pipeline, self.frame, self.extent, false);
             }
 
             let bind_pipeline = draw_chrome && self.chrome.is_some()
@@ -780,6 +780,10 @@ impl VulkanRenderer {
                     extent: vk::Extent2D { width: sw, height: sh },
                 };
                 self.draw_sampled(cmd, layer, vp, scissor);
+            }
+            // Popups go over video too.
+            if draw_chrome {
+                self.quad_chrome.record(&self.device, cmd, &self.quad_pipeline, self.frame, self.extent, true);
             }
 
             self.device.cmd_end_rendering(cmd);

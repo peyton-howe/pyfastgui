@@ -184,6 +184,8 @@ impl HostBuffer {
 pub struct QuadChrome {
     atlas: Option<(ViewportTexture, vk::DescriptorSet)>,
     quads: Vec<ChromeQuad>,
+    /// `ChromeQuads::overlay_start`: quads from here on are drawn after viewports.
+    overlay_start: usize,
     /// Pixel space the quads were built in (their push-constant viewport).
     size: (u32, u32),
     instance_buffers: Vec<Option<HostBuffer>>,
@@ -194,6 +196,7 @@ impl QuadChrome {
         Self {
             atlas: None,
             quads: Vec::new(),
+            overlay_start: 0,
             size: (1, 1),
             instance_buffers: (0..frames_in_flight).map(|_| None).collect(),
         }
@@ -233,6 +236,7 @@ impl QuadChrome {
         }
         self.quads.clear();
         self.quads.extend_from_slice(frame.quads);
+        self.overlay_start = frame.overlay_start;
         self.size = (frame.width, frame.height);
         Ok(())
     }
@@ -284,6 +288,8 @@ impl QuadChrome {
 
     /// Record the instanced draw into `cmd` (inside dynamic rendering, over `extent`), reading
     /// slot `slot`'s instance buffer.
+    /// `overlay` picks the popup quads (drawn after viewports) instead of the ones before them.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn record(
         &self,
         device: &Device,
@@ -291,9 +297,12 @@ impl QuadChrome {
         pipeline: &QuadPipeline,
         slot: usize,
         extent: vk::Extent2D,
+        overlay: bool,
     ) {
         let (Some((_, set)), Some(buffer)) = (&self.atlas, &self.instance_buffers[slot]) else { return };
-        if self.quads.is_empty() {
+        let split = self.overlay_start.min(self.quads.len());
+        let (first, count) = if overlay { (split, self.quads.len() - split) } else { (0, split) };
+        if count == 0 {
             return;
         }
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline);
@@ -322,7 +331,7 @@ impl QuadChrome {
             &push,
         );
         device.cmd_bind_vertex_buffers(cmd, 0, &[buffer.buffer], &[0]);
-        device.cmd_draw(cmd, 4, self.quads.len() as u32, 0, 0);
+        device.cmd_draw(cmd, 4, count as u32, 0, first as u32);
     }
 
     /// Free everything. The caller makes sure the GPU is idle first.

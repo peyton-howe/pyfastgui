@@ -47,6 +47,29 @@ pub const CLOSE_HIT_SLOP: f32 = 6.0;
 /// narrow tab header always keeps most of its width for "switch to / drag this tab".
 const CLOSE_MAX_WIDTH_FRACTION: f32 = 0.4;
 
+/// Where an open `Popup` goes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PopupAnchor {
+    /// Next to a widget, on `side` (flipped to the opposite side when there's no room there).
+    Widget(WidgetId, PopupSide),
+    /// With its top-left at a window point (flipped up/left near the window's far edges).
+    Point(f32, f32),
+    /// Centered in the window (dialogs).
+    Center,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopupSide {
+    Below,
+    Above,
+    Right,
+    Left,
+}
+
+/// Gap between a popup and the widget it's anchored to, and its minimum distance from the
+/// window's edges (layout units).
+const POPUP_GAP: f32 = 2.0;
+
 /// Horizontal space between a `TextInput`'s edge and its text (layout units). Shared by
 /// chrome's drawing and `fastgui-app`'s click-to-caret, so both agree on where text starts.
 pub const TEXT_INPUT_PADDING: f32 = 8.0;
@@ -251,6 +274,22 @@ pub enum WidgetKind {
     /// rect (see `WidgetTree::clip_rect`) and can't be clicked where it's clipped out.
     /// Overflowing axes get overlay scrollbars (`scrollbar_thumbs`), drawn in `bar_color`.
     ScrollArea { offset: (f32, f32), background: Color, bar_color: Color },
+    /// An overlay (menu, dropdown list, tooltip, dialog): an absolutely positioned child of the
+    /// root, so it paints above everything else and wins hit tests, placed after layout by
+    /// `anchor` (see `WidgetTree::open_popup`). A click outside the topmost popup dismisses it
+    /// (`on_dismiss` fires) unless it's `modal`, in which case the click does nothing and
+    /// everything behind it is dimmed. Chrome draws popups after `Viewport` layers, so they
+    /// cover video too. `restore_focus` is where keyboard focus goes back to on close; `open`
+    /// is cleared then (Python's `Popup.is_open`).
+    Popup {
+        anchor: PopupAnchor,
+        modal: bool,
+        background: Color,
+        border: Color,
+        on_dismiss: Option<ClickCallback>,
+        restore_focus: Option<WidgetId>,
+        open: Option<Readback<bool>>,
+    },
     /// A GPU/CPU image rect composited on top of chrome. `frames` is the same latest-wins
     /// mailbox `Viewport.submit_frame` writes; `viewport_id` is a stable identity for the
     /// renderer's GPU texture cache across tree rebuilds (unlike `WidgetId`).
@@ -392,6 +431,11 @@ impl WidgetTree {
     /// and a full rebuild is cheap enough (this is a UI tree, not a scene graph with thousands
     /// of nodes).
     pub fn reset(&mut self) {
+        for kind in self.kinds.values() {
+            if let WidgetKind::Popup { open: Some(open), .. } = kind {
+                open.set(false);
+            }
+        }
         self.taffy = TaffyTree::new();
         self.kinds.clear();
         self.root = self.taffy.new_leaf(root_style()).expect("creating the root node cannot fail");
@@ -554,6 +598,29 @@ impl WidgetTree {
                 }
             }
         }
+        self.place_popups(width, height);
+    }
+
+    /// Move each popup (and everything in it) to where its anchor says, now that its size and
+    /// its anchor's rect are known. Popups sit at (0, 0) in layout; this shifts their rects.
+    fn place_popups(&mut self, width: f32, height: f32) {
+        let popups: Vec<WidgetId> = self.taffy.children(self.root).unwrap_or_default();
+        for popup in popups {
+            let Some(WidgetKind::Popup { anchor, .. }) = self.kinds.get(&popup) else { continue };
+            let Some(size) = self.absolute_rect(popup) else { continue };
+            let (x, y) = place_popup(*anchor, size, |id| self.absolute_rect(id), width, height);
+            let inside: Vec<WidgetId> = self.walk_from(popup).collect();
+            for node in inside {
+                if let Some(rect) = self.absolute_rects.get_mut(&node) {
+                    rect.x += x - size.x;
+                    rect.y += y - size.y;
+                }
+                if let Some(clip) = self.clip_rects.get_mut(&node) {
+                    clip.x += x - size.x;
+                    clip.y += y - size.y;
+                }
+            }
+        }
     }
 
     /// Where `id` may draw and be clicked, if something clips it (it's inside a `ScrollArea`).
@@ -666,6 +733,124 @@ impl WidgetTree {
         })
     }
 
+    /// Add a popup holding `build`'s content (a subtree `build` creates under the popup node it's
+    /// given) and focus its first focusable widget, remembering the current focus to restore on
+    /// close. Returns the popup's id.
+    pub fn open_popup(&mut self, kind: WidgetKind, build: impl FnOnce(&mut Self, WidgetId)) -> WidgetId {
+        let style = Style {
+            position: Position::Absolute,
+            flex_direction: FlexDirection::Column,
+            inset: taffy::prelude::Rect {
+                left: LengthPercentageAuto::length(0.0),
+                top: LengthPercentageAuto::length(0.0),
+                right: LengthPercentageAuto::auto(),
+                bottom: LengthPercentageAuto::auto(),
+            },
+            ..Default::default()
+        };
+        let restore = self.focused;
+        let id = self.new_node(style, kind);
+        if let Some(WidgetKind::Popup { restore_focus, open, .. }) = self.kinds.get_mut(&id) {
+            *restore_focus = restore;
+            if let Some(open) = open {
+                open.set(true);
+            }
+        }
+        let root = self.root;
+        self.add_child(root, id);
+        build(self, id);
+        let first = self.walk_from(id).find(|&n| self.kind(n).is_some_and(WidgetKind::is_focusable));
+        self.focused = first;
+        id
+    }
+
+    /// Close popup `id` (and its content): remove it, restore focus, clear `open`. Doesn't
+    /// fire `on_dismiss` — `dismiss_popup` is the user-driven close.
+    pub fn close_popup(&mut self, id: WidgetId) {
+        let Some(WidgetKind::Popup { restore_focus, open, .. }) = self.kinds.get(&id) else { return };
+        let restore = restore_focus.filter(|f| self.kinds.contains_key(f));
+        if let Some(open) = open {
+            open.set(false);
+        }
+        let inside: Vec<WidgetId> = self.walk_from(id).collect();
+        if self.focused.is_none_or(|f| inside.contains(&f)) {
+            self.focused = restore;
+        }
+        for node in inside {
+            self.kinds.remove(&node);
+            self.absolute_rects.remove(&node);
+            self.clip_rects.remove(&node);
+        }
+        let _ = self.taffy.remove_child(self.root, id);
+        remove_subtree(&mut self.taffy, id);
+        self.mark_dirty();
+    }
+
+    /// Close the topmost popup as the user did (outside click, Escape): fires its `on_dismiss`.
+    /// Returns whether there was one.
+    pub fn dismiss_popup(&mut self) -> bool {
+        let Some(id) = self.topmost_popup() else { return false };
+        let callback = match self.kind(id) {
+            Some(WidgetKind::Popup { on_dismiss, .. }) => on_dismiss.clone(),
+            _ => None,
+        };
+        self.close_popup(id);
+        if let Some(callback) = callback {
+            callback();
+        }
+        true
+    }
+
+    /// The last-opened popup still open, if any.
+    pub fn topmost_popup(&self) -> Option<WidgetId> {
+        self.taffy
+            .children(self.root)
+            .ok()?
+            .into_iter()
+            .rev()
+            .find(|id| matches!(self.kind(*id), Some(WidgetKind::Popup { .. })))
+    }
+
+    /// The popup `id` is inside (or is), if any.
+    pub fn popup_of(&self, id: WidgetId) -> Option<WidgetId> {
+        let mut node = id;
+        loop {
+            if matches!(self.kind(node), Some(WidgetKind::Popup { .. })) {
+                return Some(node);
+            }
+            node = self.taffy.parent(node)?;
+        }
+    }
+
+    /// What a press at `(x, y)` does with popups open: `Pass` lets it through to whatever's
+    /// under it; `Consumed` means it dismissed a popup (outside click) or hit a modal popup's
+    /// dimmed backdrop, and nothing else should see it.
+    pub fn popup_press(&mut self, x: f32, y: f32) -> PopupPress {
+        let Some(top) = self.topmost_popup() else { return PopupPress::Pass };
+        if self.absolute_rect(top).is_some_and(|r| r.contains(x, y)) {
+            return PopupPress::Pass;
+        }
+        match self.kind(top) {
+            Some(WidgetKind::Popup { modal: true, .. }) => PopupPress::Consumed,
+            _ => {
+                self.dismiss_popup();
+                PopupPress::Consumed
+            }
+        }
+    }
+
+    /// Depth-first walk of `id`'s subtree (including `id`).
+    fn walk_from(&self, id: WidgetId) -> impl Iterator<Item = WidgetId> + '_ {
+        let mut stack = vec![id];
+        std::iter::from_fn(move || {
+            let id = stack.pop()?;
+            if let Ok(children) = self.taffy.children(id) {
+                stack.extend(children.into_iter().rev());
+            }
+            Some(id)
+        })
+    }
+
     /// Scroll `id` so its vertical (or horizontal) thumb starts at `thumb_start` (window layout
     /// units along the bar) — dragging a scrollbar. Returns whether it moved.
     pub fn drag_scrollbar(&mut self, id: WidgetId, vertical: bool, thumb_start: f32) -> bool {
@@ -769,8 +954,10 @@ impl WidgetTree {
     /// wrapping around — Tab / Shift+Tab. Skips widgets laid out at zero size, which is how
     /// hidden tab content and other `Display::None` subtrees end up. Returns the new focus.
     pub fn focus_next(&mut self, backward: bool) -> Option<WidgetId> {
+        // An open popup keeps Tab inside it (menus and dialogs trap focus).
+        let scope = self.topmost_popup().unwrap_or(self.root);
         let order: Vec<WidgetId> = self
-            .walk()
+            .walk_from(scope)
             .filter(|&id| self.kind(id).is_some_and(WidgetKind::is_focusable))
             .filter(|&id| self.absolute_rect(id).is_some_and(|r| r.width > 0.0 && r.height > 0.0))
             .collect();
@@ -841,6 +1028,59 @@ impl ScrollTrack {
     }
 }
 
+/// See `WidgetTree::popup_press`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopupPress {
+    Pass,
+    Consumed,
+}
+
+/// Top-left for a popup of `size` (its laid-out rect) given its anchor, keeping it inside a
+/// `width`×`height` window: flipped to the anchor's other side when it doesn't fit, then
+/// clamped. `rect_of` looks up the anchor widget's rect.
+fn place_popup(
+    anchor: PopupAnchor,
+    size: Rect,
+    rect_of: impl Fn(WidgetId) -> Option<Rect>,
+    width: f32,
+    height: f32,
+) -> (f32, f32) {
+    let (w, h) = (size.width, size.height);
+    let fits_x = |x: f32| x >= POPUP_GAP && x + w <= width - POPUP_GAP;
+    let fits_y = |y: f32| y >= POPUP_GAP && y + h <= height - POPUP_GAP;
+    let (x, y) = match anchor {
+        PopupAnchor::Center => ((width - w) / 2.0, (height - h) / 2.0),
+        PopupAnchor::Point(px, py) => {
+            let x = if px + w > width - POPUP_GAP && px - w >= POPUP_GAP { px - w } else { px };
+            let y = if py + h > height - POPUP_GAP && py - h >= POPUP_GAP { py - h } else { py };
+            (x, y)
+        }
+        PopupAnchor::Widget(id, side) => {
+            let a = rect_of(id).unwrap_or_default();
+            let below = a.y + a.height + POPUP_GAP;
+            let above = a.y - POPUP_GAP - h;
+            let right = a.x + a.width + POPUP_GAP;
+            let left = a.x - POPUP_GAP - w;
+            match side {
+                PopupSide::Below => (a.x, if fits_y(below) || !fits_y(above) { below } else { above }),
+                PopupSide::Above => (a.x, if fits_y(above) || !fits_y(below) { above } else { below }),
+                PopupSide::Right => (if fits_x(right) || !fits_x(left) { right } else { left }, a.y),
+                PopupSide::Left => (if fits_x(left) || !fits_x(right) { left } else { right }, a.y),
+            }
+        }
+    };
+    let clamp = |v: f32, extent: f32, limit: f32| v.min(limit - POPUP_GAP - extent).max(POPUP_GAP);
+    (clamp(x, w, width), clamp(y, h, height))
+}
+
+/// Free `id` and its descendants from `taffy` (it's already detached from its parent).
+fn remove_subtree(taffy: &mut TaffyTree<()>, id: WidgetId) {
+    for child in taffy.children(id).unwrap_or_default() {
+        remove_subtree(taffy, child);
+    }
+    let _ = taffy.remove(id);
+}
+
 /// How far content of `content` size can scroll inside a `size` viewport, per axis.
 fn max_scroll(size: Size<f32>, content: Size<f32>) -> (f32, f32) {
     ((content.width - size.width).max(0.0), (content.height - size.height).max(0.0))
@@ -895,6 +1135,7 @@ fn measure_leaf(
             | WidgetKind::TabBar { .. }
             | WidgetKind::PanelTitleBar { .. }
             | WidgetKind::ScrollArea { .. }
+            | WidgetKind::Popup { .. }
             | WidgetKind::Viewport { .. },
         )
         | None => Size::ZERO,
@@ -1395,6 +1636,128 @@ mod tests {
         assert!((offset.1 - 180.0).abs() < 1e-3, "{offset:?}");
         assert!(tree.drag_scrollbar(outer, true, 1e6));
         assert_eq!(tree.scrollbar_thumbs(outer).0.map(|t| t.y + t.height), Some(100.0 - SCROLLBAR_INSET));
+    }
+
+    fn popup_kind(anchor: PopupAnchor, modal: bool, dismissed: Option<Arc<std::sync::atomic::AtomicUsize>>) -> WidgetKind {
+        WidgetKind::Popup {
+            anchor,
+            modal,
+            background: Color::TRANSPARENT,
+            border: Color::TRANSPARENT,
+            on_dismiss: dismissed.map(|count| {
+                Arc::new(move || {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }) as ClickCallback
+            }),
+            restore_focus: None,
+            open: Some(Readback::new(false)),
+        }
+    }
+
+    fn sized_button(tree: &mut WidgetTree, w: f32, h: f32) -> WidgetId {
+        tree.new_node(
+            Style { size: Size { width: Dimension::length(w), height: Dimension::length(h) }, flex_shrink: 0.0, ..Default::default() },
+            WidgetKind::Button {
+                text: String::new(),
+                font_size: 12.0,
+                text_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                on_click: None,
+            },
+        )
+    }
+
+    /// A 200×200 window with an anchor button at `(x, y)` (60×20) via margins.
+    fn popup_tree(x: f32, y: f32) -> (WidgetTree, WidgetId) {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let anchor = sized_button(&mut tree, 60.0, 20.0);
+        let mut style = tree.style(anchor).unwrap().clone();
+        style.margin = taffy::prelude::Rect {
+            left: LengthPercentageAuto::length(x),
+            top: LengthPercentageAuto::length(y),
+            right: LengthPercentageAuto::length(0.0),
+            bottom: LengthPercentageAuto::length(0.0),
+        };
+        tree.set_style(anchor, style);
+        tree.add_child(root, anchor);
+        tree.compute_layout(200.0, 200.0);
+        (tree, anchor)
+    }
+
+    fn open_menu(tree: &mut WidgetTree, anchor: PopupAnchor, modal: bool, items: usize) -> (WidgetId, Vec<WidgetId>) {
+        let mut ids = Vec::new();
+        let popup = tree.open_popup(popup_kind(anchor, modal, None), |tree, popup| {
+            for _ in 0..items {
+                let b = sized_button(tree, 50.0, 30.0);
+                tree.add_child(popup, b);
+                ids.push(b);
+            }
+        });
+        tree.compute_layout(200.0, 200.0);
+        (popup, ids)
+    }
+
+    #[test]
+    fn popup_opens_below_its_anchor_and_flips_or_clamps() {
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        let (popup, items) = open_menu(&mut tree, PopupAnchor::Widget(anchor, PopupSide::Below), false, 2);
+        let r = tree.absolute_rect(popup).unwrap();
+        assert_eq!((r.x, r.y, r.width, r.height), (10.0, 20.0 + 20.0 + POPUP_GAP, 50.0, 60.0));
+        assert_eq!(tree.absolute_rect(items[1]).unwrap().y, r.y + 30.0, "content moves with it");
+
+        let (mut tree, anchor) = popup_tree(170.0, 150.0);
+        let (popup, _) = open_menu(&mut tree, PopupAnchor::Widget(anchor, PopupSide::Below), false, 2);
+        let r = tree.absolute_rect(popup).unwrap();
+        assert_eq!(r.y, 150.0 - POPUP_GAP - 60.0, "no room below: flips above");
+        assert_eq!(r.x, 200.0 - POPUP_GAP - 50.0, "clamped inside the window");
+
+        let (popup, _) = open_menu(&mut tree, PopupAnchor::Center, true, 1);
+        let r = tree.absolute_rect(popup).unwrap();
+        assert_eq!((r.x, r.y), (75.0, 85.0));
+    }
+
+    #[test]
+    fn outside_press_dismisses_non_modal_but_not_modal() {
+        let dismissed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        tree.set_focus(Some(anchor));
+        let popup = tree.open_popup(
+            popup_kind(PopupAnchor::Widget(anchor, PopupSide::Below), false, Some(dismissed.clone())),
+            |tree, popup| {
+                let b = sized_button(tree, 50.0, 30.0);
+                tree.add_child(popup, b);
+            },
+        );
+        tree.compute_layout(200.0, 200.0);
+        let Some(WidgetKind::Popup { open: Some(open), .. }) = tree.kind(popup) else { panic!() };
+        let open = open.clone();
+        assert!(open.get());
+        assert_ne!(tree.focused(), Some(anchor), "focus moved into the popup");
+        assert_eq!(tree.popup_press(20.0, 50.0), PopupPress::Pass, "inside the popup");
+        assert_eq!(tree.popup_press(150.0, 150.0), PopupPress::Consumed);
+        assert_eq!(dismissed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!open.get() && tree.topmost_popup().is_none() && tree.kind(popup).is_none());
+        assert_eq!(tree.focused(), Some(anchor), "focus restored");
+        assert_eq!(tree.popup_press(150.0, 150.0), PopupPress::Pass, "nothing open");
+
+        let (modal, _) = open_menu(&mut tree, PopupAnchor::Center, true, 1);
+        assert_eq!(tree.popup_press(1.0, 1.0), PopupPress::Consumed);
+        assert_eq!(tree.topmost_popup(), Some(modal), "a modal popup stays open");
+        tree.close_popup(modal);
+        tree.compute_layout(200.0, 200.0);
+        assert_eq!(tree.hit_test(20.0, 25.0), Some(anchor), "gone from hit testing");
+    }
+
+    #[test]
+    fn tab_stays_inside_the_topmost_popup() {
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        let (_, items) = open_menu(&mut tree, PopupAnchor::Widget(anchor, PopupSide::Below), false, 2);
+        assert_eq!(tree.focused(), Some(items[0]));
+        assert_eq!(tree.focus_next(false), Some(items[1]));
+        assert_eq!(tree.focus_next(false), Some(items[0]), "wraps within the popup, skipping the anchor");
+        assert_eq!(tree.popup_of(items[1]), tree.topmost_popup());
+        assert_eq!(tree.popup_of(anchor), None);
     }
 
     #[test]

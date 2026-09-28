@@ -187,6 +187,14 @@ calls. `Viewport` layers inside a scroll area keep their full-size GPU viewport 
 the scissor (`ViewportDraw::viewport_and_scissor`), so a partly scrolled-out frame is cut off,
 not squashed. Scrollbars are overlay thumbs drawn as extra items after all content.
 
+**Overlays (`Popup`).** A popup is an absolutely positioned last child of the root (so it
+paints last and wins hit tests), moved next to its anchor by `WidgetTree::place_popups` after
+layout. Chrome puts every item inside a popup after the drop indicator and reports where they
+start (`ChromeQuads::overlay_start`); backends draw quads before that index, then `Viewport`
+layers, then the overlay range — so menus and dialogs cover video. Outside clicks go through
+`WidgetTree::popup_press` first (dismiss, or swallowed by a modal backdrop); Escape dismisses
+the topmost popup; Tab is trapped inside it and focus is restored on close.
+
 Layout and hit-testing stay in points; chrome is built at the window's backing scale so Retina
 matches the Python window size. Viewport layers still use the fullscreen-triangle path
 (`gl_VertexIndex` / MSL `vertex_id`) on top of chrome.

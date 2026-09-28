@@ -128,6 +128,9 @@ pub struct ChromeQuads<'a> {
     pub width: u32,
     pub height: u32,
     pub quads: &'a [ChromeQuad],
+    /// Quads from here on are popups (overlays): backends draw them after `Viewport` layers,
+    /// the rest before. Equal to `quads.len()` when no popup is open.
+    pub overlay_start: usize,
     pub atlas_size: u32,
     /// The atlas was repacked from scratch, so uploads may overwrite slots that quads already
     /// in flight on the GPU still sample: wait for the GPU before writing them.

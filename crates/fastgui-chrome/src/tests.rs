@@ -629,3 +629,44 @@ fn clip_ops_cuts_fills_and_tags_straddling_sprites() {
     assert!(matches!(ops[1], Op::Text { clip: Some(c), .. } if c == clip), "partly outside: carries the clip");
     assert!(matches!(ops[2], Op::Text { clip: None, .. }), "wholly inside: no clip needed");
 }
+
+#[test]
+fn popup_quads_form_the_overlay_range() {
+    use fastgui_core::widget::PopupAnchor;
+    let (mut tree, area) = scroll_scene();
+    let mut chrome = ChromeRenderer::new();
+    let base = chrome.build_quads(&tree, 240, 130, None, 1.0).expect("first frame");
+    assert_eq!(base.overlay_start, base.quads.len(), "no popup: nothing in the overlay range");
+    let base_len = base.quads.len();
+
+    let popup_kind = |modal| WidgetKind::Popup {
+        anchor: PopupAnchor::Center,
+        modal,
+        background: Color([0.14, 0.15, 0.18, 1.0]),
+        border: Color([0.3, 0.3, 0.4, 1.0]),
+        on_dismiss: None,
+        restore_focus: None,
+        open: None,
+    };
+    let popup = tree.open_popup(popup_kind(true), |tree, popup| {
+        let label = tree.new_node(
+            Style::default(),
+            WidgetKind::Label { text: "In a popup".into(), font_size: 14.0, color: Color([1.0; 4]) },
+        );
+        tree.add_child(popup, label);
+    });
+    tree.compute_layout(240.0, 130.0);
+    let frame = chrome.build_quads(&tree, 240, 130, None, 1.0).expect("popup opened");
+    let overlay = &frame.quads[frame.overlay_start..];
+    assert_eq!(frame.overlay_start, base_len, "the base content is unchanged and comes first");
+    assert_eq!(overlay[0].rect, [0.0, 0.0, 240.0, 130.0], "a modal popup dims the whole window first");
+    assert!(overlay.iter().any(|q| q.kind == fastgui_core::QUAD_SPRITE), "its text is in the overlay");
+    let r = tree.absolute_rect(popup).unwrap();
+    assert!((r.x + r.width / 2.0 - 120.0).abs() < 0.5 && (r.y + r.height / 2.0 - 65.0).abs() < 0.5, "centered");
+
+    tree.close_popup(popup);
+    tree.compute_layout(240.0, 130.0);
+    let _ = area;
+    let closed = chrome.build_quads(&tree, 240, 130, None, 1.0).expect("popup closed");
+    assert_eq!((closed.quads.len(), closed.overlay_start), (base_len, base_len));
+}

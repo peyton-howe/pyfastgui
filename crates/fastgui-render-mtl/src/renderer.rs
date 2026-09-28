@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use fastgui_app::ViewportDraw;
-use fastgui_core::{ChromeFrame, ChromeQuads, CpuFrame};
+use fastgui_core::{ChromeFrame, ChromeQuad, ChromeQuads, CpuFrame};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::ClassType;
@@ -31,6 +31,8 @@ pub(crate) struct QuadChrome {
     /// `None` when there are no quads.
     instances: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     count: usize,
+    /// `ChromeQuads::overlay_start`.
+    overlay_start: usize,
     atlas: ViewportTexture,
     /// Physical size the quads were built for (their coordinate space).
     width: u32,
@@ -64,19 +66,36 @@ impl QuadChrome {
             };
             Some(buffer.ok_or(Error::NoBuffer)?)
         };
-        Ok(Self { instances, count: frame.quads.len(), atlas, width: frame.width, height: frame.height })
+        Ok(Self {
+            instances,
+            count: frame.quads.len(),
+            overlay_start: frame.overlay_start.min(frame.quads.len()),
+            atlas,
+            width: frame.width,
+            height: frame.height,
+        })
     }
 
     /// One instanced draw of every quad (a 4-vertex strip per instance) into a `target_width` x
     /// `target_height` attachment, in the quads' own pixel space.
+    /// Draw the quads before the overlay (`overlay: false`) or the overlay quads (`true`).
     pub(crate) fn encode(
         &self,
         encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
         pipeline: &QuadPipeline,
         target_width: u32,
         target_height: u32,
+        overlay: bool,
     ) {
         let Some(instances) = &self.instances else { return };
+        let (first, count) = if overlay {
+            (self.overlay_start, self.count - self.overlay_start)
+        } else {
+            (0, self.overlay_start)
+        };
+        if count == 0 {
+            return;
+        }
         encoder.setRenderPipelineState(pipeline.state());
         encoder.setViewport(MTLViewport {
             originX: 0.0,
@@ -89,14 +108,14 @@ impl QuadChrome {
         encoder.setScissorRect(MTLScissorRect { x: 0, y: 0, width: target_width as usize, height: target_height as usize });
         let size = [self.width as f32, self.height as f32];
         unsafe {
-            encoder.setVertexBuffer_offset_atIndex(Some(instances), 0, 0);
+            encoder.setVertexBuffer_offset_atIndex(Some(instances), first * std::mem::size_of::<ChromeQuad>(), 0);
             encoder.setVertexBytes_length_atIndex(NonNull::from(&size).cast(), std::mem::size_of_val(&size), 1);
             encoder.setFragmentTexture_atIndex(Some(&self.atlas.texture), 0);
             encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
                 MTLPrimitiveType::TriangleStrip,
                 0,
                 4,
-                self.count,
+                count,
             );
         }
     }
@@ -312,7 +331,7 @@ impl MetalRenderer {
 
         if draw_chrome {
             if let Some(chrome) = &self.quad_chrome {
-                chrome.encode(&encoder, &self.quad_pipeline, self.width, self.height);
+                chrome.encode(&encoder, &self.quad_pipeline, self.width, self.height, false);
             }
             if let Some(chrome) = &self.chrome {
                 encoder.setRenderPipelineState(self.pipeline.state());
@@ -354,6 +373,12 @@ impl MetalRenderer {
             };
             let scissor = MTLScissorRect { x: sx as usize, y: sy as usize, width: sw as usize, height: sh as usize };
             self.draw_sampled(&encoder, layer, viewport, scissor);
+        }
+        // Popups go over video too.
+        if draw_chrome {
+            if let Some(chrome) = &self.quad_chrome {
+                chrome.encode(&encoder, &self.quad_pipeline, self.width, self.height, true);
+            }
         }
 
         encoder.endEncoding();

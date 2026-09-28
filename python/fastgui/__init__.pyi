@@ -94,6 +94,29 @@ class ScrollArea:
     def scroll_to(self, x: float, y: float) -> None:
         """Scroll so content point `(x, y)` is at the top-left (clamped)."""
 
+class Popup:
+    """An overlay shown on demand: a menu, dropdown list, tooltip or dialog. Not placed in the
+    layout; open it with `show(anchor)` or `Window.show_popup`. A click outside a non-modal popup,
+    or Escape, dismisses it (calling `on_dismiss`); a modal one dims the window and blocks clicks
+    behind it. Tab stays inside the open popup; focus returns where it was when it closes. Drawn
+    above everything, including `Viewport` video."""
+    def __init__(
+        self,
+        content: Widget,
+        modal: bool = False,
+        on_dismiss: Callable[[], None] | None = None,
+        padding: float = 6.0,
+        background: RGBA = (0.14, 0.15, 0.18, 1.0),
+        border: RGBA = (0.32, 0.35, 0.42, 1.0),
+    ) -> None: ...
+    def show(self, anchor: Widget, side: str = "below") -> None:
+        """Open next to `anchor` (already shown in a window): "below", "above", "right" or "left",
+        flipped when there's no room. Reopening moves it."""
+    def close(self) -> None:
+        """Close without calling `on_dismiss`."""
+    @property
+    def is_open(self) -> bool: ...
+
 Widget = Union[Label, Button, Slider, TextInput, "ScrollArea", "Box", "Splitter", "Panel", "Tabs", "DockArea", Viewport]
 
 class Box:
@@ -196,6 +219,8 @@ class Window:
     def set_clear_color(self, r: float, g: float, b: float, a: float) -> None: ...
     def set_viewport(self, viewport: Viewport) -> None: ...
     def set_content(self, widget: Widget) -> None: ...
+    def show_popup(self, popup: Popup, x: float | None = None, y: float | None = None) -> None:
+        """Open `popup` with its top-left at `(x, y)`, or centered when both are omitted."""
     def add_floating_panel(self, panel: Panel, x: float, y: float, width: float, height: float) -> None:
         """Open `panel` as a real OS window at `(x, y)` relative to this window's inner origin,
         sized `(width, height)`. Draggable anywhere on screen; resize via edge/corner drag; if

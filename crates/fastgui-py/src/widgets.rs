@@ -5,7 +5,7 @@ use fastgui_core::taffy::prelude::*;
 use fastgui_core::taffy::style::LengthPercentage;
 use fastgui_core::widget::{
     ChangeCallback, ClickCallback, Color, PanelCloseCallback, PanelDropCallback, SplitDirection, TabSelectCallback,
-    TextCallback, WidgetId, WidgetKind, WidgetTree,
+    PopupAnchor, PopupSide, TextCallback, WidgetId, WidgetKind, WidgetTree,
 };
 use fastgui_core::text_edit::TextEdit;
 use fastgui_core::Readback;
@@ -287,6 +287,9 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
     if let Ok(w) = obj.cast::<ScrollArea>() {
         return w.borrow().describe();
     }
+    if obj.cast::<Popup>().is_ok() {
+        return Err(PyTypeError::new_err("a Popup isn't placed in the layout; open it with popup.show(anchor)"));
+    }
     if let Ok(w) = obj.cast::<BoxWidget>() {
         return w.borrow().describe();
     }
@@ -338,6 +341,10 @@ pub(crate) fn bind_dispatch(obj: &Bound<'_, PyAny>, dispatch: &CommandDispatch) 
     }
     if let Ok(panel) = obj.cast::<Panel>() {
         Python::attach(|py| bind_dispatch(panel.borrow().content.bind(py), dispatch));
+        return;
+    }
+    if let Ok(scroll) = obj.cast::<ScrollArea>() {
+        Python::attach(|py| bind_dispatch(scroll.borrow().content.bind(py), dispatch));
         return;
     }
     if let Ok(tabs) = obj.cast::<Tabs>() {
@@ -476,6 +483,19 @@ pub(crate) fn attach(
         tree.set_scroll_container(id);
     }
     id
+}
+
+/// Send a whole-tree `mutation` through `sender` to the window it belongs to (the main window,
+/// or the floating panel's own window).
+fn send_tree_mutation(
+    sender: &CommandDispatch,
+    mutation: impl FnOnce(&mut WidgetTree) + Send + 'static,
+) -> PyResult<()> {
+    let command = match sender.floating_region {
+        Some(region_id) => Command::MutateFloatingTree { region_id, mutation: Box::new(mutation) },
+        None => Command::MutateWidgetTree(Box::new(mutation)),
+    };
+    sender.send(command).map_err(|_| PyRuntimeError::new_err("window has already closed"))
 }
 
 /// Send `mutation` to whichever window `id_cell`/`sender_cell` are attached to, no-op if the
@@ -811,6 +831,146 @@ impl TextInput {
             splitter_bar: None,
             tab_bar: None,
         }
+    }
+}
+
+/// An overlay shown on demand — a menu, dropdown list, tooltip or dialog. `show(anchor)` opens
+/// it next to an attached widget (in that widget's window); `Window.show_popup` opens it at a
+/// point or centered. A click outside a non-modal popup, or Escape, dismisses it (`on_dismiss`
+/// fires); a modal one dims the window and only closes from code (`close()`) or Escape.
+#[pyclass]
+pub(crate) struct Popup {
+    content: Py<PyAny>,
+    modal: bool,
+    padding: f32,
+    background: (f32, f32, f32, f32),
+    border: (f32, f32, f32, f32),
+    on_dismiss: Option<Py<PyAny>>,
+    /// The open popup node, and the window it's in.
+    id: IdCell,
+    sender: SenderCell,
+    open: Readback<bool>,
+}
+
+#[pymethods]
+impl Popup {
+    #[new]
+    #[pyo3(signature = (
+        content,
+        modal=false,
+        on_dismiss=None,
+        padding=6.0,
+        background=(0.14, 0.15, 0.18, 1.0),
+        border=(0.32, 0.35, 0.42, 1.0),
+    ))]
+    fn new(
+        content: Py<PyAny>,
+        modal: bool,
+        on_dismiss: Option<Py<PyAny>>,
+        padding: f32,
+        background: (f32, f32, f32, f32),
+        border: (f32, f32, f32, f32),
+    ) -> Self {
+        Self {
+            content,
+            modal,
+            padding,
+            background,
+            border,
+            on_dismiss,
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            open: Readback::new(false),
+        }
+    }
+
+    /// Open next to `anchor` (a widget already shown in a window) on `side`: "below" (the
+    /// default), "above", "right" or "left" — flipped when there's no room. Reopening moves it.
+    #[pyo3(signature = (anchor, side="below"))]
+    fn show(&self, anchor: &Bound<'_, PyAny>, side: &str) -> PyResult<()> {
+        let side = match side {
+            "below" => PopupSide::Below,
+            "above" => PopupSide::Above,
+            "right" => PopupSide::Right,
+            "left" => PopupSide::Left,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "side must be \"below\", \"above\", \"right\" or \"left\", got {other:?}"
+                )))
+            }
+        };
+        let described = describe(anchor)?;
+        let not_attached = || PyRuntimeError::new_err("the anchor widget isn't shown in a window yet");
+        let anchor_id = described.id_cell.lock().unwrap_or_else(|p| p.into_inner()).ok_or_else(not_attached)?;
+        let sender = described.sender_cell.lock().unwrap_or_else(|p| p.into_inner()).clone().ok_or_else(not_attached)?;
+        self.open_in(&sender, PopupAnchor::Widget(anchor_id, side))
+    }
+
+    /// Close it (without calling `on_dismiss`). No-op when it isn't open.
+    fn close(&self) -> PyResult<()> {
+        let Some(sender) = self.sender.lock().unwrap_or_else(|p| p.into_inner()).clone() else { return Ok(()) };
+        let id_cell = self.id.clone();
+        send_tree_mutation(&sender, move |tree| {
+            if let Some(id) = id_cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                tree.close_popup(id);
+            }
+        })
+    }
+
+    /// Whether it's showing. Safe from any thread.
+    #[getter]
+    fn is_open(&self) -> bool {
+        self.open.get()
+    }
+}
+
+impl Popup {
+    /// Open (or move) this popup in `sender`'s window at `anchor`.
+    pub(crate) fn open_in(&self, sender: &CommandDispatch, anchor: PopupAnchor) -> PyResult<()> {
+        let (content, on_dismiss) = Python::attach(|py| -> PyResult<_> {
+            let content = self.content.bind(py);
+            bind_dispatch(content, sender);
+            Ok((describe(content)?, self.on_dismiss.as_ref().map(|cb| cb.clone_ref(py))))
+        })?;
+        // The content sits in a padded column inside the popup node.
+        let wrapper = DescribedWidget {
+            style: StyleParams { padding: self.padding, ..StyleParams::leaf(0.0, None, None) },
+            kind: WidgetKind::Container { background: transparent(), region_id: None },
+            id_cell: Arc::new(Mutex::new(None)),
+            sender_cell: Arc::new(Mutex::new(None)),
+            children: vec![content],
+            splitter_bar: None,
+            tab_bar: None,
+        };
+        let kind = WidgetKind::Popup {
+            anchor,
+            modal: self.modal,
+            background: rgba(self.background),
+            border: rgba(self.border),
+            on_dismiss: on_dismiss.map(wrap_callback0),
+            restore_focus: None,
+            open: Some(self.open.clone()),
+        };
+        // Reopening in another window closes it in the old one first.
+        let previous = self.sender.lock().unwrap_or_else(|p| p.into_inner()).replace(sender.clone());
+        if let Some(previous) = previous.filter(|p| p.floating_region != sender.floating_region) {
+            let id_cell = self.id.clone();
+            send_tree_mutation(&previous, move |tree| {
+                if let Some(id) = id_cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    tree.close_popup(id);
+                }
+            })?;
+        }
+        let (id_cell, attach_sender) = (self.id.clone(), sender.clone());
+        send_tree_mutation(sender, move |tree| {
+            let mut id = id_cell.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(old) = id.take() {
+                tree.close_popup(old);
+            }
+            *id = Some(tree.open_popup(kind, |tree, popup| {
+                attach(tree, popup, wrapper, &attach_sender);
+            }));
+        })
     }
 }
 
@@ -1462,6 +1622,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Slider>()?;
     m.add_class::<TextInput>()?;
     m.add_class::<ScrollArea>()?;
+    m.add_class::<Popup>()?;
     m.add_class::<BoxWidget>()?;
     m.add_class::<Splitter>()?;
     m.add_class::<Panel>()?;

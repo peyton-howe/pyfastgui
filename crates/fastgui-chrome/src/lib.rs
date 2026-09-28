@@ -64,6 +64,9 @@ const TEXT_CACHE_KEEP_FRAMES: u64 = 120;
 
 const SLIDER_THUMB_RADIUS: f32 = 8.0;
 
+/// Dims everything behind a modal popup.
+const MODAL_SCRIM: Color = Color([0.0, 0.0, 0.0, 0.45]);
+
 /// Keyboard-focus outline, drawn just inside the focused widget's rect (points, before scale).
 const FOCUS_RING_COLOR: Color = Color([0.4, 0.7, 1.0, 1.0]);
 const FOCUS_RING_WIDTH: f32 = 2.0;
@@ -94,6 +97,8 @@ pub struct ChromeRenderer {
     gpu: gpu::GpuState,
     /// Caret stops of recently measured single lines, keyed by (text, font size bits).
     line_cache: HashMap<(String, u32), CaretStops>,
+    /// Index of the first popup (overlay) item in the last `build_items` list.
+    overlay_items: usize,
 }
 
 impl ChromeRenderer {
@@ -107,6 +112,7 @@ impl ChromeRenderer {
             damage: Vec::new(),
             gpu: gpu::GpuState::default(),
             line_cache: HashMap::new(),
+            overlay_items: 0,
         }
     }
 
@@ -196,7 +202,14 @@ impl ChromeRenderer {
         window: PixelRect,
     ) -> Vec<Item> {
         let mut items = Vec::new();
+        // Popups are the root's last children, so once the walk reaches one, everything after
+        // it is overlay content; it's collected separately and appended after the drop
+        // indicator (see `overlay_items`).
+        let mut overlay = Vec::new();
+        let mut in_overlay = false;
+        let popups: Vec<_> = tree.walk().filter(|&id| matches!(tree.kind(id), Some(WidgetKind::Popup { .. }))).collect();
         for id in tree.walk() {
+            in_overlay |= popups.contains(&id);
             let (Some(logical_rect), Some(kind)) = (tree.absolute_rect(id), tree.kind(id)) else {
                 continue;
             };
@@ -219,6 +232,14 @@ impl ChromeRenderer {
                 }
                 WidgetKind::Splitter { bar_color, .. } => push_fill(&mut ops, rect, *bar_color),
                 WidgetKind::ScrollArea { background, .. } => push_fill(&mut ops, rect, *background),
+                WidgetKind::Popup { modal, background, border, .. } => {
+                    if *modal {
+                        let screen = WidgetRect { x: 0.0, y: 0.0, width: window.width as f32, height: window.height as f32 };
+                        push_fill(&mut ops, screen, MODAL_SCRIM);
+                    }
+                    push_fill(&mut ops, rect, *background);
+                    push_outline(&mut ops, rect, scale.max(1.0), *border);
+                }
                 WidgetKind::TabBar {
                     titles,
                     active,
@@ -293,11 +314,14 @@ impl ChromeRenderer {
             if let Some(clip) = tree.clip_rect(id) {
                 ops = clip_ops(ops, Clip::from_rect(scale_rect(clip, scale)));
             }
-            items.push(Item::new(u64::from(id), ops, window));
+            let target = if in_overlay { &mut overlay } else { &mut items };
+            target.push(Item::new(u64::from(id), ops, window));
         }
 
         // Overlay scrollbars, after all content so nothing scrolled covers them.
+        let mut in_overlay = false;
         for id in tree.walk() {
+            in_overlay |= popups.contains(&id);
             let Some(WidgetKind::ScrollArea { bar_color, .. }) = tree.kind(id) else { continue };
             let mut ops = Vec::new();
             let (vertical, horizontal) = tree.scrollbar_thumbs(id);
@@ -307,7 +331,8 @@ impl ChromeRenderer {
             if let Some(clip) = tree.clip_rect(id) {
                 ops = clip_ops(ops, Clip::from_rect(scale_rect(clip, scale)));
             }
-            items.push(Item::new(u64::from(id) ^ SCROLLBAR_KEY_BIT, ops, window));
+            let target = if in_overlay { &mut overlay } else { &mut items };
+            target.push(Item::new(u64::from(id) ^ SCROLLBAR_KEY_BIT, ops, window));
         }
 
         // Same rect the release will commit to (`DropZone::preview_rect`), drawn last so no
@@ -318,6 +343,8 @@ impl ChromeRenderer {
             push_fill(&mut ops, scale_rect(zone.preview_rect(region_rect), scale), DROP_INDICATOR_COLOR);
         }
         items.push(Item::new(DROP_INDICATOR_KEY, ops, window));
+        self.overlay_items = items.len();
+        items.extend(overlay);
         items
     }
 

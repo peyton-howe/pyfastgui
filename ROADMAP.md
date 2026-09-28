@@ -1261,6 +1261,17 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
    virtualization (7A.5) for very long lists.
 4. **Overlay / popup layer** — z-ordered layer above content, dismiss-on-outside-click. Grow it
    out of the floating-panel machinery. Unblocks menus, combos, tooltips, dialogs.
+   **Done (2026-09-27):** not from the floating-panel machinery (those are OS windows) but as
+   `WidgetKind::Popup` nodes appended to the root and placed after layout (anchored below/above/
+   right/left of a widget with flip + clamp, at a point, or centered). Outside click dismisses
+   (`on_dismiss`), modal popups dim the window and swallow outside clicks, Escape closes the
+   topmost, Tab is trapped inside, focus restored on close. Chrome's popup items form an overlay
+   quad range drawn after `Viewport` layers on Metal and Vulkan, so popups cover video. Python:
+   `fg.Popup(content, modal=, on_dismiss=)`, `popup.show(anchor, side=)`, `window.show_popup(popup,
+   x, y)`, `close()`, `is_open`. Also fixed: a `Viewport` inside a `ScrollArea` never got its
+   wake handle (`bind_dispatch` skipped scroll areas). Tests: core placement/dismiss/focus trap,
+   chrome overlay range, Escape; real-GPU scenario gained a modal popup step (Metal + MoltenVK).
+   Demo: `popup_demo.py`. Tooltips (hover delay) still to build on this in 7C.
 5. **Virtualization** — build only visible rows; required for lists/trees/tables to scale.
 6. **Theming** — shared palette/font/spacing tokens instead of per-widget color arguments.
 

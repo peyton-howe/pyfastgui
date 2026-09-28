@@ -268,7 +268,10 @@ impl Gpu {
                 .layer_count(1)
                 .color_attachments(&attachments),
         );
-        self.chrome.record(device, cmd, &self.quad_pipeline, 0, extent);
+        // Base range, then the overlay range, as `VulkanRenderer::render_frame` draws them.
+        for overlay in [false, true] {
+            self.chrome.record(device, cmd, &self.quad_pipeline, 0, extent, overlay);
+        }
         device.cmd_end_rendering(cmd);
         device.cmd_pipeline_barrier(
             cmd,

@@ -408,6 +408,18 @@ impl Window {
         Ok(())
     }
 
+    /// Open `popup` in this window with its top-left at `(x, y)` (window coordinates, flipped
+    /// near the far edges), or centered when `x`/`y` are omitted (dialogs).
+    #[pyo3(signature = (popup, x=None, y=None))]
+    fn show_popup(&self, popup: &Bound<'_, widgets::Popup>, x: Option<f32>, y: Option<f32>) -> PyResult<()> {
+        let anchor = match (x, y) {
+            (Some(x), Some(y)) => fastgui_core::widget::PopupAnchor::Point(x, y),
+            (None, None) => fastgui_core::widget::PopupAnchor::Center,
+            _ => return Err(pyo3::exceptions::PyValueError::new_err("pass both x and y, or neither")),
+        };
+        popup.borrow().open_in(&self.dispatch, anchor)
+    }
+
     /// Add `panel` as a real OS window (separate from this window's surface), initially placed
     /// at `(x, y)` relative to this window's inner origin with the given size. Draggable via its
     /// title bar anywhere on screen — including onto another monitor — and resizable via

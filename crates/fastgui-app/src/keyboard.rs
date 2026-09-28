@@ -31,6 +31,8 @@ pub fn handle_key(
             }
             return true;
         }
+        // Escape closes the topmost popup first (menus, dialogs), then clears focus.
+        Key::Named(NamedKey::Escape) if tree.dismiss_popup() => return true,
         Key::Named(NamedKey::Escape) if tree.focused().is_some() => {
             tree.set_focus(None);
             return true;
@@ -184,6 +186,35 @@ mod tests {
         let values = seen.lock().unwrap().clone();
         assert_eq!(values.len(), 3, "the press against the max stop fires nothing: {values:?}");
         assert!((values[0] - 1.02).abs() < 1e-5 && (values[1] - 0.82).abs() < 1e-5 && values[2] == 2.0);
+    }
+
+    #[test]
+    fn escape_closes_the_popup_before_clearing_focus() {
+        use fastgui_core::widget::{PopupAnchor, PopupSide};
+        let (mut tree, ids) = tree_with(vec![slider(0.0, None)]);
+        tree.set_focus(Some(ids[0]));
+        let popup_kind = WidgetKind::Popup {
+            anchor: PopupAnchor::Widget(ids[0], PopupSide::Below),
+            modal: false,
+            background: Color::TRANSPARENT,
+            border: Color::TRANSPARENT,
+            on_dismiss: None,
+            restore_focus: None,
+            open: None,
+        };
+        let inner = std::cell::Cell::new(None);
+        tree.open_popup(popup_kind, |tree, popup| {
+            let s = tree.new_node(fixed(80.0, 20.0), slider(0.0, None));
+            tree.add_child(popup, s);
+            inner.set(Some(s));
+        });
+        tree.compute_layout(300.0, 300.0);
+        assert_eq!(tree.focused(), inner.get(), "focus moves into the popup");
+        assert!(press(&mut tree, Key::Named(NamedKey::Escape), false));
+        assert!(tree.topmost_popup().is_none());
+        assert_eq!(tree.focused(), Some(ids[0]), "focus comes back to where it was");
+        assert!(press(&mut tree, Key::Named(NamedKey::Escape), false));
+        assert_eq!(tree.focused(), None, "a second Escape clears focus");
     }
 
     #[test]

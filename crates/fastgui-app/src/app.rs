@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use fastgui_chrome::ChromeRenderer;
-use fastgui_core::widget::{DropZone, Rect, WidgetId, WidgetKind, WidgetTree, SPLITTER_HIT_SLOP};
+use fastgui_core::widget::{DropZone, PopupPress, Rect, WidgetId, WidgetKind, WidgetTree, SPLITTER_HIT_SLOP};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -552,6 +552,10 @@ impl<B: SurfaceBackend> App<B> {
     }
 
     fn handle_mouse_press(&mut self) {
+        // An outside click closes the open popup (or hits a modal one's backdrop) and stops here.
+        if self.widget_tree.popup_press(self.cursor.0, self.cursor.1) == PopupPress::Consumed {
+            return;
+        }
         if let Some(drag) = grab_scrollbar(&self.widget_tree, self.cursor) {
             self.dragging_scrollbar = Some(drag);
             return;
@@ -646,6 +650,7 @@ impl<B: SurfaceBackend> App<B> {
             WidgetKind::Container { .. }
             | WidgetKind::Label { .. }
             | WidgetKind::ScrollArea { .. }
+            | WidgetKind::Popup { .. }
             | WidgetKind::Viewport { .. } => {}
         }
     }
@@ -671,6 +676,12 @@ impl<B: SurfaceBackend> App<B> {
             });
             return;
         }
+        if let Some(floater) = self.floating.get_mut(&window_id) {
+            if floater.widget_tree.popup_press(cursor.0, cursor.1) == PopupPress::Consumed {
+                return;
+            }
+        }
+        let Some(floater) = self.floating.get(&window_id) else { return };
         if let Some(drag) = grab_scrollbar(&floater.widget_tree, cursor) {
             if let Some(floater) = self.floating.get_mut(&window_id) {
                 floater.dragging_scrollbar = Some(drag);
@@ -766,6 +777,7 @@ impl<B: SurfaceBackend> App<B> {
             WidgetKind::Container { .. }
             | WidgetKind::Label { .. }
             | WidgetKind::ScrollArea { .. }
+            | WidgetKind::Popup { .. }
             | WidgetKind::Viewport { .. } => {}
         }
     }

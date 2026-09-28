@@ -62,6 +62,10 @@ fn scene() -> (WidgetTree, fastgui_core::widget::WidgetId, fastgui_core::widget:
 
 /// A scroll area over a column of labels ending in a slider, so scrolling it clips text and the
 /// slider thumb (the clipped-circle quad kind). Returns (tree, area, slider).
+fn text() -> Color {
+    Color([0.9, 0.9, 0.92, 1.0])
+}
+
 fn scroll_scene() -> (WidgetTree, fastgui_core::widget::WidgetId, fastgui_core::widget::WidgetId) {
     let mut tree = WidgetTree::new();
     let text = Color([0.9, 0.9, 0.92, 1.0]);
@@ -190,5 +194,26 @@ pub fn check_gpu_backend<G>(
         check(&mut scrolled, None, "scroll area clipping text and the slider thumb");
         scrolled.set_scroll_offset(area, 0.0, offset + 7.5);
         check(&mut scrolled, None, "scrolled a fractional step further");
+
+        // A modal popup over it all: drawn as the overlay range (after viewports, in the app).
+        scrolled.open_popup(
+            WidgetKind::Popup {
+                anchor: fastgui_core::widget::PopupAnchor::Center,
+                modal: true,
+                background: Color([0.14, 0.15, 0.18, 1.0]),
+                border: Color([0.32, 0.35, 0.42, 1.0]),
+                on_dismiss: None,
+                restore_focus: None,
+                open: None,
+            },
+            |tree, popup| {
+                let label = tree.new_node(
+                    Style::default(),
+                    WidgetKind::Label { text: "Popup over everything".into(), font_size: 13.0, color: text() },
+                );
+                tree.add_child(popup, label);
+            },
+        );
+        check(&mut scrolled, None, "modal popup in the overlay range");
     }
 }

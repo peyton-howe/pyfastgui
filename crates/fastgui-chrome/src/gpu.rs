@@ -83,6 +83,8 @@ impl Atlas {
 pub(crate) struct GpuState {
     pub(crate) atlas: Atlas,
     pub(crate) quads: Vec<ChromeQuad>,
+    /// First overlay (popup) quad in `quads`.
+    pub(crate) overlay_start: usize,
     uploads: Vec<(PixelRect, Arc<Sprite>)>,
     /// Physical size of the last emitted frame.
     size: Option<(u32, u32)>,
@@ -107,10 +109,18 @@ impl GpuState {
         true
     }
 
-    fn emit(&mut self, items: &[Item], width: u32, height: u32) {
+    /// Quads for `items`; those from item `overlay_items` on are the overlay range.
+    fn emit(&mut self, items: &[Item], overlay_items: usize, width: u32, height: u32) {
         self.quads.clear();
         self.quads.push(solid([0.0, 0.0, width as f32, height as f32], BACKGROUND));
-        for item in items.iter().filter(|item| !item.bounds.is_empty()) {
+        self.overlay_start = usize::MAX;
+        for (index, item) in items.iter().enumerate() {
+            if index == overlay_items {
+                self.overlay_start = self.quads.len();
+            }
+            if item.bounds.is_empty() {
+                continue;
+            }
             for op in &item.ops {
                 match op {
                     Op::Fill { left, top, right, bottom, color } => {
@@ -232,12 +242,14 @@ impl super::ChromeRenderer {
                 size *= 2;
             }
         }
-        gpu.emit(&self.items, width, height);
+        gpu.emit(&self.items, self.overlay_items, width, height);
+        gpu.overlay_start = gpu.overlay_start.min(gpu.quads.len());
 
         Some(ChromeQuads {
             width,
             height,
             quads: &gpu.quads,
+            overlay_start: gpu.overlay_start,
             atlas_size: gpu.atlas.size,
             atlas_repacked: repacked,
             atlas_uploads: gpu
