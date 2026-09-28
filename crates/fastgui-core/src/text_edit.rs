@@ -25,7 +25,7 @@ enum EditKind {
     Deleting,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TextEdit {
     text: String,
     /// Where the caret is. The selection runs between `anchor` and `caret` (either order);
@@ -39,20 +39,6 @@ pub struct TextEdit {
     /// The kind of the last edit, while consecutive edits of that kind still merge into one
     /// undo step (typing a word undoes as a whole). Any caret move ends the run.
     run: Option<EditKind>,
-}
-
-impl Default for TextEdit {
-    fn default() -> Self {
-        Self {
-            text: String::new(),
-            caret: 0,
-            anchor: 0,
-            multiline: false,
-            undo: Vec::new(),
-            redo: Vec::new(),
-            run: None,
-        }
-    }
 }
 
 impl TextEdit {
