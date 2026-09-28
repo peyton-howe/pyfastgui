@@ -1291,7 +1291,13 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
    theme at describe time; chrome's own colors (background, focus ring/caret, scrim, drop
    preview, list scrollbar) moved from constants to `fastgui_core::theme`. Demo:
    `theme_demo.py` (light = grey buttons, dark = blue, orange accent recolors buttons too);
-   Python tests in `python/tests/test_theme.py`. **Not yet:** font and spacing tokens; floating panels restyle on their next
+   Python tests in `python/tests/test_theme.py`. **Font + spacing tokens done (2026-09-28):**
+   `font_family` (shaped by chrome; part of text cache keys; unknown names fall back),
+   `font_size_small/font_size/font_size_large` (14/16/22) and `spacing_small/spacing/
+   spacing_large` (4/8/16). Every `font_size` argument takes points or `"small"|"body"|"large"`
+   and defaults by role (body text 16, lists/tabs/panel titles 14 — unchanged); `Box(gap=,
+   padding=)` and `Popup(padding=)` take units or `"small"|"medium"|"large"` (numeric
+   defaults unchanged). Bad names/values raise at construction. **Not yet:** floating panels restyle on their next
    rebuild rather than immediately; the 7B widgets added concurrently still take explicit
    colors and should adopt `palette()` the same way.
 

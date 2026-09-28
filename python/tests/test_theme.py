@@ -44,5 +44,33 @@ class ThemeTests(unittest.TestCase):
         fg.ListView(["a"])
 
 
+    def test_font_and_spacing_tokens(self):
+        dark = fg.Theme.dark()
+        self.assertEqual((dark.font_size_small, dark.font_size, dark.font_size_large), (14.0, 16.0, 22.0))
+        self.assertEqual((dark.spacing_small, dark.spacing, dark.spacing_large), (4.0, 8.0, 16.0))
+        self.assertIsNone(dark.font_family)
+        big = dark.replace(font_size=20, spacing_large=24, font_family="Menlo")
+        self.assertEqual((big.font_size, big.spacing_large, big.font_family), (20.0, 24.0, "Menlo"))
+        self.assertEqual(fg.Theme.light().font_size, dark.font_size, "light shares dark's sizes")
+        with self.assertRaises(ValueError):
+            dark.replace(font_size=0)
+        with self.assertRaises(ValueError):
+            dark.replace(spacing=-1)
+
+    def test_widgets_take_named_sizes_and_reject_unknown_names(self):
+        fg.Label("heading", font_size="large")
+        fg.Button("small", font_size="small")
+        fg.Label("points", font_size=12.5)
+        fg.Box(children=[], gap="medium", padding="large")
+        fg.Box(children=[], gap=3.0)
+        fg.Popup(fg.Label("x"), padding="small")
+        with self.assertRaises(ValueError):
+            fg.Label("bad", font_size="huge")
+        with self.assertRaises(ValueError):
+            fg.Box(children=[], gap="wide")
+        with self.assertRaises(ValueError):
+            fg.Label("bad", font_size=-2)
+
+
 if __name__ == "__main__":
     unittest.main()

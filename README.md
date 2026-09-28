@@ -126,7 +126,9 @@ All under [`python/examples/`](python/examples/), runnable directly once install
   dialogs — anchored overlays drawn above everything).
 - **Data views**: `ListView` (virtualized: only visible rows are laid out and drawn).
 - **Theming**: `Theme` (`dark()`, `light()`, `replace(...)`), `set_theme` / `get_theme`,
-  `Window.set_theme`. Widget color arguments default to the current theme.
+  `Window.set_theme`. Colors, font sizes and the font family default to the current theme;
+  `font_size="small"|"body"|"large"` and `gap=`/`padding="small"|"medium"|"large"`
+  name theme tokens.
 - **Content**: `Label`, `Button`, `Slider`, `TextInput`, `Viewport` (arbitrary CPU/GPU frame content).
 - **Docking**: `Panel` (titled, draggable container), `Tabs` (several `Panel`s sharing one
   region), `DockArea` (a split-tree of panels/tabs with full drag-to-rearrange — split, tab-merge

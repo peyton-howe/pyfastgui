@@ -189,11 +189,14 @@ calls. `Viewport` layers inside a scroll area keep their full-size GPU viewport 
 the scissor (`ViewportDraw::viewport_and_scissor`), so a partly scrolled-out frame is cut off,
 not squashed. Scrollbars are overlay thumbs drawn as extra items after all content.
 
-**Theming.** Widget colors are resolved in Python-facing `describe` (a color argument left as
-`None` takes the current `fg.Theme` token), so themes cost nothing at draw time and need no
-per-frame lookups. Colors chrome draws on its own — window background, focus ring/caret, modal
-scrim, drop preview, list scrollbars — come from `fastgui_core::theme::chrome_theme()`, set by
-the same `fg.set_theme`. `Window.set_theme` re-runs `set_content` so a live window restyles.
+**Theming.** Widget colors and font sizes are resolved in Python-facing `describe` (an argument
+left as `None`, or a size named like `"large"` / a spacing like `"medium"`, takes the current
+`fg.Theme` token), so themes cost nothing at draw time and need no per-frame lookups. What
+chrome draws on its own — window background, focus ring/caret, modal scrim, drop preview, list
+scrollbars — and the font family all text is shaped in come from
+`fastgui_core::theme::chrome_theme()`, set by the same `fg.set_theme`. The family is part of
+the text-run and caret-stop cache keys, so a font switch never reuses runs shaped in the old
+one. `Window.set_theme` re-runs `set_content` so a live window restyles.
 
 **Virtualization (`ListView`).** A list is one widget node holding plain row data, not a node
 per row: chrome asks `WidgetTree::list_visible_rows` for the handful of rows in view and shapes

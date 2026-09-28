@@ -721,3 +721,25 @@ fn list_view_shapes_only_visible_rows_and_matches_cpu_painter() {
         }
     }
 }
+
+#[test]
+fn font_family_is_part_of_text_cache_keys_and_falls_back() {
+    let mut chrome = ChromeRenderer::new();
+    let rect = WidgetRect { x: 0.0, y: 0.0, width: 200.0, height: 24.0 };
+    let color = Color([1.0; 4]);
+    let run = |chrome: &mut ChromeRenderer| {
+        let mut ops = Vec::new();
+        chrome.push_text(&mut ops, rect, "Family", 16.0, color);
+        match ops.pop() {
+            Some(Op::Text { run, .. }) => run,
+            _ => panic!("expected a text run"),
+        }
+    };
+    let default = run(&mut chrome);
+    chrome.text_cache.family = Some("No Such Font Family 123".into());
+    let unknown = run(&mut chrome);
+    assert!(!Arc::ptr_eq(&default, &unknown), "a different family is a different cache entry");
+    assert!(unknown.width > 0, "an unknown family falls back to the default font");
+    chrome.text_cache.family = None;
+    assert!(Arc::ptr_eq(&default, &run(&mut chrome)), "switching back reuses the original run");
+}

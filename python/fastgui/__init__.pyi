@@ -1,6 +1,10 @@
-from typing import Any, Callable, Sequence, Union
+from typing import Any, Callable, Literal, Sequence, Union
 
 RGBA = tuple[float, float, float, float]
+# A font size in points, or a theme size by name.
+FontSize = Union[float, Literal["small", "body", "large"]]
+# A gap/padding in layout units, or a theme spacing by name.
+Spacing = Union[float, Literal["small", "medium", "large"]]
 
 class CudaSurface:
     """Unverified: see Viewport.create_cuda_surface."""
@@ -29,7 +33,7 @@ class Viewport:
         ...
 
 class Label:
-    def __init__(self, text: str, font_size: float = 16.0, color: RGBA | None = None) -> None: ...
+    def __init__(self, text: str, font_size: FontSize | None = None, color: RGBA | None = None) -> None: ...
     def set_text(self, text: str) -> None: ...
 
 class Button:
@@ -37,7 +41,7 @@ class Button:
         self,
         text: str,
         on_click: Callable[[], None] | None = None,
-        font_size: float = 16.0,
+        font_size: FontSize | None = None,
         text_color: RGBA | None = None,
         background: RGBA | None = None,
     ) -> None: ...
@@ -64,7 +68,7 @@ class TextInput:
         placeholder: str = "",
         on_change: Callable[[str], None] | None = None,
         on_submit: Callable[[str], None] | None = None,
-        font_size: float = 16.0,
+        font_size: FontSize | None = None,
         width: float | None = None,
         flex_grow: float = 0.0,
         text_color: RGBA | None = None,
@@ -95,9 +99,10 @@ class ScrollArea:
         """Scroll so content point `(x, y)` is at the top-left (clamped)."""
 
 class Theme:
-    """Named colors that widgets use when their own color arguments are left out, plus the
-    colors chrome draws itself (window background, focus ring, scrollbars, modal dimming, dock
-    drop preview). `Theme()` is the dark default with any keyword colors replaced."""
+    """Named colors, font sizes and spacings. Widgets use them when their own arguments are left
+    out (colors, font sizes) or given by name (`font_size="large"`, `gap="medium"`), and chrome
+    draws its own colors and all text with them. `Theme()` is the dark default with any keyword
+    tokens replaced."""
     background: RGBA
     surface: RGBA
     surface_alt: RGBA
@@ -114,13 +119,20 @@ class Theme:
     scrollbar: RGBA
     scrim: RGBA
     drop_indicator: RGBA
-    def __init__(self, **colors: RGBA) -> None: ...
+    font_family: str | None
+    font_size_small: float
+    font_size: float
+    font_size_large: float
+    spacing_small: float
+    spacing: float
+    spacing_large: float
+    def __init__(self, **tokens: Any) -> None: ...
     @staticmethod
     def dark() -> Theme: ...
     @staticmethod
     def light() -> Theme: ...
-    def replace(self, **colors: RGBA) -> Theme:
-        """A copy with the given colors changed."""
+    def replace(self, **tokens: Any) -> Theme:
+        """A copy with the given tokens changed (colors, font sizes/family, spacings)."""
 
 def set_theme(theme: Theme) -> None:
     """Make `theme` current for widgets described from now on (and chrome's next rebuild).
@@ -138,7 +150,7 @@ class ListView:
         on_select: Callable[[int], None] | None = None,
         on_activate: Callable[[int], None] | None = None,
         row_height: float = 24.0,
-        font_size: float = 14.0,
+        font_size: FontSize | None = None,
         flex_grow: float = 1.0,
         width: float | None = None,
         height: float | None = None,
@@ -165,7 +177,7 @@ class Popup:
         content: Widget,
         modal: bool = False,
         on_dismiss: Callable[[], None] | None = None,
-        padding: float = 6.0,
+        padding: Spacing = 6.0,
         background: RGBA | None = None,
         border: RGBA | None = None,
     ) -> None: ...
@@ -184,8 +196,8 @@ class Box:
         self,
         children: Sequence[Widget],
         direction: str = "column",
-        gap: float = 0.0,
-        padding: float = 0.0,
+        gap: Spacing = 0.0,
+        padding: Spacing = 0.0,
         flex_grow: float = 0.0,
         width: float | None = None,
         height: float | None = None,
@@ -216,7 +228,7 @@ class Panel:
         self,
         title: str,
         content: Widget,
-        title_font_size: float = 14.0,
+        title_font_size: FontSize | None = None,
         title_color: RGBA | None = None,
         title_background: RGBA | None = None,
         background: RGBA | None = None,
@@ -244,7 +256,7 @@ class Tabs:
         self,
         panels: Sequence[Panel],
         active: int = 0,
-        font_size: float = 14.0,
+        font_size: FontSize | None = None,
         text_color: RGBA | None = None,
         active_color: RGBA | None = None,
         inactive_color: RGBA | None = None,

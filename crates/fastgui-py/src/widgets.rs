@@ -8,6 +8,8 @@ use fastgui_core::widget::{
     IndexCallback, PopupAnchor, PopupSide, TextCallback, WidgetId, WidgetKind, WidgetTree,
 };
 use fastgui_core::text_edit::TextEdit;
+
+use crate::theme::{FontSize, Spacing};
 use fastgui_core::Readback;
 use crate::backend::{Command, CommandDispatch};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -534,15 +536,15 @@ pub(crate) struct Label {
     id: IdCell,
     sender: SenderCell,
     text: String,
-    font_size: f32,
+    font_size: Option<FontSize>,
     color: Option<(f32, f32, f32, f32)>,
 }
 
 #[pymethods]
 impl Label {
     #[new]
-    #[pyo3(signature = (text, font_size=16.0, color=None))]
-    fn new(text: String, font_size: f32, color: Option<(f32, f32, f32, f32)>) -> Self {
+    #[pyo3(signature = (text, font_size=None, color=None))]
+    fn new(text: String, font_size: Option<FontSize>, color: Option<(f32, f32, f32, f32)>) -> Self {
         Self { id: Arc::new(Mutex::new(None)), sender: Arc::new(Mutex::new(None)), text, font_size, color }
     }
 
@@ -561,7 +563,7 @@ impl Label {
     fn describe(&self) -> DescribedWidget {
         DescribedWidget {
             style: StyleParams::leaf(0.0, None, None),
-            kind: WidgetKind::Label { text: self.text.clone(), font_size: self.font_size, color: rgba(self.color.unwrap_or(crate::theme::palette().text)) },
+            kind: WidgetKind::Label { text: self.text.clone(), font_size: self.font_size.unwrap_or(FontSize::Body).resolve(), color: rgba(self.color.unwrap_or(crate::theme::palette().text)) },
             id_cell: self.id.clone(),
             sender_cell: self.sender.clone(),
             children: Vec::new(),
@@ -577,7 +579,7 @@ pub(crate) struct Button {
     id: IdCell,
     sender: SenderCell,
     text: String,
-    font_size: f32,
+    font_size: Option<FontSize>,
     text_color: Option<(f32, f32, f32, f32)>,
     background: Option<(f32, f32, f32, f32)>,
     on_click: Option<Py<PyAny>>,
@@ -586,11 +588,11 @@ pub(crate) struct Button {
 #[pymethods]
 impl Button {
     #[new]
-    #[pyo3(signature = (text, on_click=None, font_size=16.0, text_color=None, background=None))]
+    #[pyo3(signature = (text, on_click=None, font_size=None, text_color=None, background=None))]
     fn new(
         text: String,
         on_click: Option<Py<PyAny>>,
-        font_size: f32,
+        font_size: Option<FontSize>,
         text_color: Option<(f32, f32, f32, f32)>,
         background: Option<(f32, f32, f32, f32)>,
     ) -> Self {
@@ -621,7 +623,7 @@ impl Button {
             style: StyleParams::leaf(0.0, None, None),
             kind: WidgetKind::Button {
                 text: self.text.clone(),
-                font_size: self.font_size,
+                font_size: self.font_size.unwrap_or(FontSize::Body).resolve(),
                 text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().button_text)),
                 background: rgba(self.background.unwrap_or(crate::theme::palette().button)),
                 on_click: on_click.map(wrap_callback0),
@@ -722,7 +724,7 @@ pub(crate) struct TextInput {
     /// rebuild (e.g. a `DockArea` rearrange).
     text: Readback<String>,
     placeholder: String,
-    font_size: f32,
+    font_size: Option<FontSize>,
     width: Option<f32>,
     flex_grow: f32,
     text_color: Option<(f32, f32, f32, f32)>,
@@ -741,7 +743,7 @@ impl TextInput {
         placeholder="",
         on_change=None,
         on_submit=None,
-        font_size=16.0,
+        font_size=None,
         width=None,
         flex_grow=0.0,
         text_color=None,
@@ -755,7 +757,7 @@ impl TextInput {
         placeholder: &str,
         on_change: Option<Py<PyAny>>,
         on_submit: Option<Py<PyAny>>,
-        font_size: f32,
+        font_size: Option<FontSize>,
         width: Option<f32>,
         flex_grow: f32,
         text_color: Option<(f32, f32, f32, f32)>,
@@ -817,7 +819,7 @@ impl TextInput {
             kind: WidgetKind::TextInput {
                 edit: TextEdit::new(&self.text.get()),
                 placeholder: self.placeholder.clone(),
-                font_size: self.font_size,
+                font_size: self.font_size.unwrap_or(FontSize::Body).resolve(),
                 text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
                 placeholder_color: rgba(self.placeholder_color.unwrap_or(crate::theme::palette().text_muted)),
                 background: rgba(self.background.unwrap_or(crate::theme::palette().surface_alt)),
@@ -846,7 +848,7 @@ pub(crate) struct ListView {
     items: Arc<Mutex<Arc<Vec<String>>>>,
     selected: Readback<Option<usize>>,
     row_height: f32,
-    font_size: f32,
+    font_size: Option<FontSize>,
     flex_grow: f32,
     width: Option<f32>,
     height: Option<f32>,
@@ -875,7 +877,7 @@ impl ListView {
         on_select=None,
         on_activate=None,
         row_height=24.0,
-        font_size=14.0,
+        font_size=None,
         flex_grow=1.0,
         width=None,
         height=None,
@@ -889,7 +891,7 @@ impl ListView {
         on_select: Option<Py<PyAny>>,
         on_activate: Option<Py<PyAny>>,
         row_height: f32,
-        font_size: f32,
+        font_size: Option<FontSize>,
         flex_grow: f32,
         width: Option<f32>,
         height: Option<f32>,
@@ -973,7 +975,7 @@ impl ListView {
             kind: WidgetKind::ListView {
                 items,
                 row_height: self.row_height,
-                font_size: self.font_size,
+                font_size: self.font_size.unwrap_or(FontSize::Small).resolve(),
                 scroll: 0.0,
                 selected,
                 text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
@@ -1000,7 +1002,7 @@ impl ListView {
 pub(crate) struct Popup {
     content: Py<PyAny>,
     modal: bool,
-    padding: f32,
+    padding: Spacing,
     background: Option<(f32, f32, f32, f32)>,
     border: Option<(f32, f32, f32, f32)>,
     on_dismiss: Option<Py<PyAny>>,
@@ -1017,7 +1019,7 @@ impl Popup {
         content,
         modal=false,
         on_dismiss=None,
-        padding=6.0,
+        padding=Spacing::Units(6.0),
         background=None,
         border=None,
     ))]
@@ -1025,7 +1027,7 @@ impl Popup {
         content: Py<PyAny>,
         modal: bool,
         on_dismiss: Option<Py<PyAny>>,
-        padding: f32,
+        padding: Spacing,
         background: Option<(f32, f32, f32, f32)>,
         border: Option<(f32, f32, f32, f32)>,
     ) -> Self {
@@ -1092,7 +1094,7 @@ impl Popup {
         })?;
         // The content sits in a padded column inside the popup node.
         let wrapper = DescribedWidget {
-            style: StyleParams { padding: self.padding, ..StyleParams::leaf(0.0, None, None) },
+            style: StyleParams { padding: self.padding.resolve(), ..StyleParams::leaf(0.0, None, None) },
             kind: WidgetKind::Container { background: transparent(), region_id: None },
             id_cell: Arc::new(Mutex::new(None)),
             sender_cell: Arc::new(Mutex::new(None)),
@@ -1214,8 +1216,8 @@ pub(crate) struct BoxWidget {
     id: IdCell,
     sender: SenderCell,
     direction: FlexDirection,
-    gap: f32,
-    padding: f32,
+    gap: Spacing,
+    padding: Spacing,
     flex_grow: f32,
     width: Option<f32>,
     height: Option<f32>,
@@ -1229,8 +1231,8 @@ impl BoxWidget {
     #[pyo3(signature = (
         children,
         direction="column",
-        gap=0.0,
-        padding=0.0,
+        gap=Spacing::Units(0.0),
+        padding=Spacing::Units(0.0),
         flex_grow=0.0,
         width=None,
         height=None,
@@ -1240,8 +1242,8 @@ impl BoxWidget {
     fn new(
         children: Py<PyList>,
         direction: &str,
-        gap: f32,
-        padding: f32,
+        gap: Spacing,
+        padding: Spacing,
         flex_grow: f32,
         width: Option<f32>,
         height: Option<f32>,
@@ -1274,7 +1276,7 @@ impl BoxWidget {
 impl BoxWidget {
     fn describe(&self) -> PyResult<DescribedWidget> {
         let style =
-            StyleParams { direction: self.direction, gap: self.gap, padding: self.padding, flex_grow: self.flex_grow, width: self.width, height: self.height, fill: false, align_items: None, absolute: None };
+            StyleParams { direction: self.direction, gap: self.gap.resolve(), padding: self.padding.resolve(), flex_grow: self.flex_grow, width: self.width, height: self.height, fill: false, align_items: None, absolute: None };
 
         let children = Python::attach(|py| -> PyResult<Vec<DescribedWidget>> {
             self.children.bind(py).iter().map(|child| describe(&child)).collect()
@@ -1411,7 +1413,7 @@ pub(crate) struct Panel {
     floating: Arc<std::sync::atomic::AtomicBool>,
     title: String,
     content: Py<PyAny>,
-    title_font_size: f32,
+    title_font_size: Option<FontSize>,
     title_color: Option<(f32, f32, f32, f32)>,
     title_background: Option<(f32, f32, f32, f32)>,
     background: Option<(f32, f32, f32, f32)>,
@@ -1424,7 +1426,7 @@ impl Panel {
     #[pyo3(signature = (
         title,
         content,
-        title_font_size=14.0,
+        title_font_size=None,
         title_color=None,
         title_background=None,
         background=None,
@@ -1434,7 +1436,7 @@ impl Panel {
     fn new(
         title: String,
         content: Py<PyAny>,
-        title_font_size: f32,
+        title_font_size: Option<FontSize>,
         title_color: Option<(f32, f32, f32, f32)>,
         title_background: Option<(f32, f32, f32, f32)>,
         background: Option<(f32, f32, f32, f32)>,
@@ -1580,7 +1582,7 @@ impl Panel {
             kind: WidgetKind::PanelTitleBar {
                 panel_id: self.region_id,
                 title: self.title.clone(),
-                font_size: self.title_font_size,
+                font_size: self.title_font_size.unwrap_or(FontSize::Small).resolve(),
                 text_color: rgba(self.title_color.unwrap_or(crate::theme::palette().text)),
                 background: rgba(self.title_background.unwrap_or(crate::theme::palette().surface_alt)),
                 on_drop: on_drop.map(wrap_panel_drop_callback),
@@ -1632,7 +1634,7 @@ pub(crate) struct Tabs {
     region_id: u64,
     panels: Py<PyList>,
     active: usize,
-    font_size: f32,
+    font_size: Option<FontSize>,
     text_color: Option<(f32, f32, f32, f32)>,
     active_color: Option<(f32, f32, f32, f32)>,
     inactive_color: Option<(f32, f32, f32, f32)>,
@@ -1646,7 +1648,7 @@ impl Tabs {
     #[pyo3(signature = (
         panels,
         active=0,
-        font_size=14.0,
+        font_size=None,
         text_color=None,
         active_color=None,
         inactive_color=None,
@@ -1657,7 +1659,7 @@ impl Tabs {
     fn new(
         panels: Py<PyList>,
         active: usize,
-        font_size: f32,
+        font_size: Option<FontSize>,
         text_color: Option<(f32, f32, f32, f32)>,
         active_color: Option<(f32, f32, f32, f32)>,
         inactive_color: Option<(f32, f32, f32, f32)>,
@@ -1760,7 +1762,7 @@ impl Tabs {
             tab_bar: Some(TabBarSpec {
                 titles,
                 active,
-                font_size: self.font_size,
+                font_size: self.font_size.unwrap_or(FontSize::Small).resolve(),
                 text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
                 active_color: rgba(self.active_color.unwrap_or(crate::theme::palette().surface_active)),
                 inactive_color: rgba(self.inactive_color.unwrap_or(crate::theme::palette().surface_alt)),

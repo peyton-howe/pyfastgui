@@ -24,7 +24,7 @@ mod gpu;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-use cosmic_text::{Attrs, Buffer, Color as CosmicColor, FontSystem, Metrics, Shaping, SwashCache, Wrap};
+use cosmic_text::{Attrs, Buffer, Color as CosmicColor, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
 use fastgui_core::text_edit::{TextEdit, TextMeasure};
 use fastgui_core::theme::chrome_theme;
 use fastgui_core::widget::{Color, DropZone, WidgetKind, WidgetTree, TEXT_INPUT_PADDING};
@@ -88,7 +88,7 @@ pub struct ChromeRenderer {
     /// State of the GPU path (`build_quads`); the CPU path (`rasterize`) doesn't touch it.
     gpu: gpu::GpuState,
     /// Caret stops of recently measured single lines, keyed by (text, font size bits).
-    line_cache: HashMap<(String, u32), CaretStops>,
+    line_cache: HashMap<(String, u32, Option<Arc<str>>), CaretStops>,
     /// Index of the first popup (overlay) item in the last `build_items` list.
     overlay_items: usize,
 }
@@ -194,6 +194,7 @@ impl ChromeRenderer {
         window: PixelRect,
     ) -> Vec<Item> {
         let theme = chrome_theme();
+        self.text_cache.family = theme.font_family.clone();
         let mut items = Vec::new();
         // Popups are the root's last children, so once the walk reaches one, everything after
         // it is overlay content; it's collected separately and appended after the drop
@@ -443,14 +444,15 @@ impl ChromeRenderer {
     /// `(byte index, x)` caret stops for `text` shaped as one unwrapped line at `font_size`:
     /// one per glyph cluster, in byte order, ending with `(text.len(), line width)`.
     fn line_stops(&mut self, text: &str, font_size: f32) -> CaretStops {
-        let key = (text.to_owned(), font_size.to_bits());
+        let family = self.text_cache.family.clone();
+        let key = (text.to_owned(), font_size.to_bits(), family.clone());
         if let Some(stops) = self.line_cache.get(&key) {
             return stops.clone();
         }
         if self.line_cache.len() >= LINE_CACHE_LIMIT {
             self.line_cache.clear();
         }
-        let buffer = shape_line(&mut self.font_system, text, font_size, None);
+        let buffer = shape_line(&mut self.font_system, text, font_size, None, family.as_deref());
         let mut stops: Vec<(usize, f32)> = Vec::new();
         let mut width: f32 = 0.0;
         for run in buffer.layout_runs() {
@@ -545,10 +547,12 @@ impl ChromeRenderer {
 
 impl TextMeasure for ChromeRenderer {
     fn caret_x(&mut self, text: &str, font_size: f32, index: usize) -> f32 {
+        self.text_cache.family = chrome_theme().font_family;
         stop_x(&self.line_stops(text, font_size), index)
     }
 
     fn index_at(&mut self, text: &str, font_size: f32, x: f32) -> usize {
+        self.text_cache.family = chrome_theme().font_family;
         let stops = self.line_stops(text, font_size);
         stops
             .iter()
@@ -580,12 +584,20 @@ fn stop_x(stops: &[(usize, f32)], index: usize) -> f32 {
 
 /// A cosmic-text buffer holding `text` as lines laid out in a `width`-wide box (`None`: one
 /// unwrapped line).
-fn shape_line(font_system: &mut FontSystem, text: &str, font_size: f32, height: Option<f32>) -> Buffer {
+fn shape_line(font_system: &mut FontSystem, text: &str, font_size: f32, height: Option<f32>, family: Option<&str>) -> Buffer {
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, font_size * LINE_HEIGHT_RATIO));
     buffer.set_wrap(font_system, Wrap::None);
     buffer.set_size(font_system, None, height);
-    buffer.set_text(font_system, text, &Attrs::new(), Shaping::Advanced);
+    buffer.set_text(font_system, text, &attrs(family), Shaping::Advanced);
     buffer
+}
+
+/// Text attributes for `family` (`None`: cosmic-text's default sans-serif).
+fn attrs(family: Option<&str>) -> Attrs<'_> {
+    match family {
+        Some(name) => Attrs::new().family(Family::Name(name)),
+        None => Attrs::new(),
+    }
 }
 
 impl Default for ChromeRenderer {
@@ -869,7 +881,9 @@ impl Sprite {
     }
 
     /// `line_scroll: Some(px)` lays `text` out as one unwrapped line shifted left by `px` and
-    /// clips it to `rect` (a text field); `None` wraps it in `rect` (a label).
+    /// clips it to `rect` (a text field); `None` wraps it in `rect` (a label). `family` is the
+    /// theme's font (`None`: the default sans-serif).
+    #[allow(clippy::too_many_arguments)]
     fn shape(
         font_system: &mut FontSystem,
         swash_cache: &mut SwashCache,
@@ -878,14 +892,15 @@ impl Sprite {
         rect: WidgetRect,
         color: CosmicColor,
         line_scroll: Option<f32>,
+        family: Option<&str>,
     ) -> Self {
         let buffer = match line_scroll {
-            Some(_) => shape_line(font_system, text, font_size, Some(rect.height)),
+            Some(_) => shape_line(font_system, text, font_size, Some(rect.height), family),
             None => {
                 let metrics = Metrics::new(font_size, font_size * LINE_HEIGHT_RATIO);
                 let mut buffer = Buffer::new(font_system, metrics);
                 buffer.set_size(font_system, Some(rect.width), Some(rect.height));
-                buffer.set_text(font_system, text, &Attrs::new(), Shaping::Advanced);
+                buffer.set_text(font_system, text, &attrs(family), Shaping::Advanced);
                 buffer
             }
         };
@@ -929,7 +944,7 @@ impl Sprite {
 }
 
 /// Everything but the string itself, so lookups can borrow the `&str` without allocating.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct TextParams {
     font_size: u32,
     width: u32,
@@ -937,6 +952,7 @@ struct TextParams {
     color: [u8; 4],
     /// `Some(scroll bits)` for a clipped single line (see `Sprite::shape`).
     line_scroll: Option<u32>,
+    family: Option<Arc<str>>,
 }
 
 struct CachedRun {
@@ -949,6 +965,9 @@ struct TextCache {
     runs: HashMap<TextParams, HashMap<String, CachedRun>>,
     /// Bumped once per `rasterize`; entries remember the generation they were last drawn in.
     generation: u64,
+    /// The theme's font family, refreshed at each build (and before measuring): part of every
+    /// run's key, so switching fonts never reuses a run shaped in the old one.
+    family: Option<Arc<str>>,
 }
 
 impl TextCache {
@@ -970,6 +989,7 @@ impl TextCache {
             height: rect.height.to_bits(),
             color: [color.r(), color.g(), color.b(), color.a()],
             line_scroll: line_scroll.map(f32::to_bits),
+            family: self.family.clone(),
         };
         let generation = self.generation;
         let by_text = self.runs.entry(params).or_default();
@@ -977,7 +997,8 @@ impl TextCache {
             cached.last_used = generation;
             return cached.run.clone();
         }
-        let run = Arc::new(Sprite::shape(font_system, swash_cache, text, font_size, rect, color, line_scroll));
+        let family = self.family.as_deref();
+        let run = Arc::new(Sprite::shape(font_system, swash_cache, text, font_size, rect, color, line_scroll, family));
         by_text.insert(text.to_owned(), CachedRun { run: run.clone(), last_used: generation });
         run
     }
