@@ -344,9 +344,90 @@ impl ChromeRenderer {
                     };
                     self.push_text_field(&mut ops, logical_rect, scale, &field);
                 }
-                WidgetKind::Viewport { .. } => {
+                WidgetKind::Viewport { .. } | WidgetKind::Image { .. } => {
                     // Placeholder only — the GPU draws the real frame in this rect after chrome.
                     push_fill(&mut ops, rect, Color([0.05, 0.06, 0.08, 1.0]));
+                }
+                WidgetKind::Checkbox {
+                    checked,
+                    label,
+                    font_size,
+                    text_color,
+                    box_color,
+                    check_color,
+                    ..
+                } => {
+                    self.push_checkbox(
+                        &mut ops,
+                        logical_rect,
+                        scale,
+                        *checked,
+                        label,
+                        *font_size,
+                        *text_color,
+                        *box_color,
+                        *check_color,
+                    );
+                }
+                WidgetKind::Radio {
+                    selected,
+                    label,
+                    font_size,
+                    text_color,
+                    box_color,
+                    dot_color,
+                    ..
+                } => {
+                    self.push_radio(
+                        &mut ops,
+                        logical_rect,
+                        scale,
+                        *selected,
+                        label,
+                        *font_size,
+                        *text_color,
+                        *box_color,
+                        *dot_color,
+                    );
+                }
+                WidgetKind::Toggle { checked, track_off, track_on, thumb_color, .. } => {
+                    push_toggle(&mut ops, rect, *checked, *track_off, *track_on, *thumb_color, scale);
+                }
+                WidgetKind::SpinBox {
+                    value,
+                    decimals,
+                    font_size,
+                    text_color,
+                    background,
+                    button_color,
+                    ..
+                } => {
+                    self.push_spin_box(
+                        &mut ops,
+                        logical_rect,
+                        scale,
+                        *value,
+                        *decimals,
+                        *font_size,
+                        *text_color,
+                        *background,
+                        *button_color,
+                    );
+                }
+                WidgetKind::NumericScrub {
+                    value,
+                    decimals,
+                    font_size,
+                    text_color,
+                    background,
+                    ..
+                } => {
+                    push_fill(&mut ops, rect, *background);
+                    let text = fastgui_core::widget::format_decimal(*value, *decimals);
+                    self.push_centered_text(&mut ops, rect, &text, *font_size * scale, *text_color);
+                }
+                WidgetKind::ProgressBar { value, min, max, track_color, fill_color, .. } => {
+                    push_progress(&mut ops, rect, *value, *min, *max, *track_color, *fill_color, scale);
                 }
             }
             if tree.focused() == Some(id) {
@@ -508,15 +589,144 @@ impl ChromeRenderer {
     /// closes. Uses the same rough advance/line-height ratios as layout's `measure_text`, which
     /// is plenty for a single glyph.
     fn push_close_glyph(&mut self, ops: &mut Vec<Op>, rect: WidgetRect, font_size: f32, color: Color) {
-        let glyph_width = font_size * 0.55;
+        self.push_centered_text(ops, rect, "×", font_size, color);
+    }
+
+    /// Centre `text` in `rect` using the same advance/line-height heuristics as layout measure.
+    fn push_centered_text(&mut self, ops: &mut Vec<Op>, rect: WidgetRect, text: &str, font_size: f32, color: Color) {
+        if text.is_empty() || rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+        let glyph_width = font_size * 0.55 * text.chars().count() as f32;
         let line_height = font_size * 1.25;
         let inset = WidgetRect {
             x: rect.x + ((rect.width - glyph_width) * 0.5).max(0.0),
             y: rect.y + ((rect.height - line_height) * 0.5).max(0.0),
-            width: rect.width.min(glyph_width * 2.0),
+            width: rect.width.min(glyph_width * 1.5).max(rect.width * 0.5),
             height: rect.height.max(line_height),
         };
-        self.push_text(ops, inset, "×", font_size, color);
+        self.push_text(ops, inset, text, font_size, color);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_checkbox(
+        &mut self,
+        ops: &mut Vec<Op>,
+        logical_rect: WidgetRect,
+        scale: f32,
+        checked: bool,
+        label: &str,
+        font_size: f32,
+        text_color: Color,
+        box_color: Color,
+        check_color: Color,
+    ) {
+        let box_logical = fastgui_core::widget::check_indicator_rect(logical_rect);
+        let box_rect = scale_rect(box_logical, scale);
+        push_fill(ops, box_rect, box_color);
+        push_outline(ops, box_rect, (1.5 * scale).max(1.0), check_color);
+        if checked {
+            let inset = WidgetRect {
+                x: box_rect.x + box_rect.width * 0.2,
+                y: box_rect.y + box_rect.height * 0.2,
+                width: box_rect.width * 0.6,
+                height: box_rect.height * 0.6,
+            };
+            push_fill(ops, inset, check_color);
+        }
+        let label_x = box_logical.x + box_logical.width + fastgui_core::widget::CHECK_LABEL_GAP;
+        let label_rect = scale_rect(
+            WidgetRect {
+                x: label_x,
+                y: logical_rect.y,
+                width: (logical_rect.x + logical_rect.width - label_x).max(0.0),
+                height: logical_rect.height,
+            },
+            scale,
+        );
+        self.push_text(ops, label_rect, label, font_size * scale, text_color);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_radio(
+        &mut self,
+        ops: &mut Vec<Op>,
+        logical_rect: WidgetRect,
+        scale: f32,
+        selected: bool,
+        label: &str,
+        font_size: f32,
+        text_color: Color,
+        box_color: Color,
+        dot_color: Color,
+    ) {
+        let box_logical = fastgui_core::widget::check_indicator_rect(logical_rect);
+        let cx = (box_logical.x + box_logical.width * 0.5) * scale;
+        let cy = (box_logical.y + box_logical.height * 0.5) * scale;
+        let radius = (box_logical.width * 0.5) * scale;
+        ops.push(Op::Circle { cx, cy, radius, color: box_color, sprite: OnceLock::new(), clip: None });
+        // Thin ring so an unchecked radio still reads as a control against dark chrome.
+        ops.push(Op::Circle {
+            cx,
+            cy,
+            radius: (radius - (1.5 * scale).max(1.0)).max(1.0),
+            color: Color([0.10, 0.11, 0.13, 1.0]),
+            sprite: OnceLock::new(),
+            clip: None,
+        });
+        if selected {
+            ops.push(Op::Circle {
+                cx,
+                cy,
+                radius: radius * 0.45,
+                color: dot_color,
+                sprite: OnceLock::new(),
+                clip: None,
+            });
+        }
+        let label_x = box_logical.x + box_logical.width + fastgui_core::widget::CHECK_LABEL_GAP;
+        let label_rect = scale_rect(
+            WidgetRect {
+                x: label_x,
+                y: logical_rect.y,
+                width: (logical_rect.x + logical_rect.width - label_x).max(0.0),
+                height: logical_rect.height,
+            },
+            scale,
+        );
+        self.push_text(ops, label_rect, label, font_size * scale, text_color);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_spin_box(
+        &mut self,
+        ops: &mut Vec<Op>,
+        logical_rect: WidgetRect,
+        scale: f32,
+        value: f32,
+        decimals: u32,
+        font_size: f32,
+        text_color: Color,
+        background: Color,
+        button_color: Color,
+    ) {
+        let rect = scale_rect(logical_rect, scale);
+        push_fill(ops, rect, background);
+        let value_rect = scale_rect(fastgui_core::widget::spin_value_rect(logical_rect), scale);
+        let buttons = scale_rect(fastgui_core::widget::spin_buttons_rect(logical_rect), scale);
+        let up = scale_rect(fastgui_core::widget::spin_up_rect(logical_rect), scale);
+        let down = scale_rect(fastgui_core::widget::spin_down_rect(logical_rect), scale);
+        push_fill(ops, buttons, button_color);
+        let divider = (1.0 * scale).max(1.0);
+        push_fill(
+            ops,
+            WidgetRect { x: buttons.x, y: buttons.y + buttons.height * 0.5 - divider * 0.5, width: buttons.width, height: divider },
+            text_color,
+        );
+        let text = fastgui_core::widget::format_decimal(value, decimals);
+        self.push_centered_text(ops, value_rect, &text, font_size * scale, text_color);
+        self.push_centered_text(ops, up, "▴", font_size * scale * 0.7, text_color);
+        self.push_centered_text(ops, down, "▾", font_size * scale * 0.7, text_color);
     }
 
     /// Bakes its own header segments (equal-width, one per title) directly rather than composing
@@ -1058,6 +1268,79 @@ fn push_slider(
     let fraction = if max > min { ((value - min) / (max - min)).clamp(0.0, 1.0) } else { 0.0 };
     let (cx, cy, radius) = (rect.x + fraction * rect.width, rect.y + rect.height / 2.0, SLIDER_THUMB_RADIUS * scale);
     ops.push(Op::Circle { cx, cy, radius, color: thumb_color, sprite: OnceLock::new(), clip: None });
+}
+
+fn push_toggle(
+    ops: &mut Vec<Op>,
+    rect: WidgetRect,
+    checked: bool,
+    track_off: Color,
+    track_on: Color,
+    thumb_color: Color,
+    scale: f32,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let radius = rect.height * 0.5;
+    let track = if checked { track_on } else { track_off };
+    // Pill: circles at each end + a fill between their centres.
+    ops.push(Op::Circle {
+        cx: rect.x + radius,
+        cy: rect.y + radius,
+        radius,
+        color: track,
+        sprite: OnceLock::new(),
+        clip: None,
+    });
+    ops.push(Op::Circle {
+        cx: rect.x + rect.width - radius,
+        cy: rect.y + radius,
+        radius,
+        color: track,
+        sprite: OnceLock::new(),
+        clip: None,
+    });
+    push_fill(
+        ops,
+        WidgetRect { x: rect.x + radius, y: rect.y, width: (rect.width - 2.0 * radius).max(0.0), height: rect.height },
+        track,
+    );
+    let pad = 2.0 * scale;
+    let thumb_r = (radius - pad).max(1.0);
+    let thumb_cx = if checked { rect.x + rect.width - radius } else { rect.x + radius };
+    ops.push(Op::Circle {
+        cx: thumb_cx,
+        cy: rect.y + radius,
+        radius: thumb_r,
+        color: thumb_color,
+        sprite: OnceLock::new(),
+        clip: None,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_progress(
+    ops: &mut Vec<Op>,
+    rect: WidgetRect,
+    value: f32,
+    min: f32,
+    max: f32,
+    track_color: Color,
+    fill_color: Color,
+    scale: f32,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let track_height = rect.height.max(4.0 * scale);
+    let track_y = rect.y + (rect.height - track_height) / 2.0;
+    let track = WidgetRect { x: rect.x, y: track_y, width: rect.width, height: track_height };
+    push_fill(ops, track, track_color);
+    let fraction = if max > min { ((value - min) / (max - min)).clamp(0.0, 1.0) } else { 0.0 };
+    if fraction > 0.0 {
+        push_fill(ops, WidgetRect { width: track.width * fraction, ..track }, fill_color);
+    }
 }
 
 /// A `width`-thick border along the inside of `rect`, as four fills.

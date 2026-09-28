@@ -821,3 +821,138 @@ fn estimated_label_widths_did_truncate() {
     // text — for wide letters more than the drawing margin can absorb.
     assert!(check_labels_draw_in_full(false).is_err());
 }
+
+#[test]
+fn form_controls_rasterize_without_panicking() {
+    use fastgui_core::widget::{CHECK_SIZE, PROGRESS_HEIGHT, TOGGLE_HEIGHT, TOGGLE_WIDTH};
+
+    let mut tree = WidgetTree::new();
+    let root = tree.root();
+    let column = tree.new_node(
+        Style {
+            flex_direction: FlexDirection::Column,
+            gap: Size { width: LengthPercentage::length(8.0), height: LengthPercentage::length(8.0) },
+            padding: fastgui_core::taffy::prelude::Rect {
+                left: LengthPercentage::length(12.0),
+                right: LengthPercentage::length(12.0),
+                top: LengthPercentage::length(12.0),
+                bottom: LengthPercentage::length(12.0),
+            },
+            size: Size { width: Dimension::percent(1.0), height: Dimension::percent(1.0) },
+            ..Default::default()
+        },
+        WidgetKind::Container { background: Color([0.10, 0.11, 0.13, 1.0]), region_id: None },
+    );
+    tree.add_child(root, column);
+
+    let accent = Color([0.4, 0.7, 1.0, 1.0]);
+    let text = Color([0.92, 0.93, 0.95, 1.0]);
+    let bg = Color([0.16, 0.17, 0.2, 1.0]);
+    let add = |tree: &mut WidgetTree, parent: WidgetId, style: Style, kind: WidgetKind| {
+        let id = tree.new_node(style, kind);
+        tree.add_child(parent, id);
+        id
+    };
+    add(
+        &mut tree,
+        column,
+        Style::default(),
+        WidgetKind::Checkbox {
+            checked: true,
+            label: "Notify".into(),
+            font_size: 14.0,
+            text_color: text,
+            box_color: bg,
+            check_color: accent,
+            on_change: None,
+        },
+    );
+    add(
+        &mut tree,
+        column,
+        Style::default(),
+        WidgetKind::Radio {
+            selected: true,
+            label: "One".into(),
+            group_id: 1,
+            font_size: 14.0,
+            text_color: text,
+            box_color: bg,
+            dot_color: accent,
+            on_select: None,
+        },
+    );
+    add(
+        &mut tree,
+        column,
+        Style { size: Size { width: Dimension::length(TOGGLE_WIDTH), height: Dimension::length(TOGGLE_HEIGHT) }, ..Default::default() },
+        WidgetKind::Toggle {
+            checked: true,
+            track_off: Color([0.3, 0.3, 0.35, 1.0]),
+            track_on: Color([0.25, 0.45, 0.85, 1.0]),
+            thumb_color: text,
+            on_change: None,
+        },
+    );
+    add(
+        &mut tree,
+        column,
+        Style { size: Size { width: Dimension::length(120.0), height: Dimension::length(28.0) }, ..Default::default() },
+        WidgetKind::SpinBox {
+            value: 42.0,
+            min: 0.0,
+            max: 100.0,
+            step: 1.0,
+            decimals: 0,
+            font_size: 14.0,
+            text_color: text,
+            background: bg,
+            button_color: Color([0.22, 0.23, 0.26, 1.0]),
+            on_change: None,
+            mirror: None,
+        },
+    );
+    add(
+        &mut tree,
+        column,
+        Style { size: Size { width: Dimension::length(100.0), height: Dimension::length(28.0) }, ..Default::default() },
+        WidgetKind::NumericScrub {
+            value: 3.5,
+            min: 0.0,
+            max: 10.0,
+            speed: 0.1,
+            decimals: 1,
+            font_size: 14.0,
+            text_color: text,
+            background: bg,
+            on_change: None,
+            mirror: None,
+        },
+    );
+    add(
+        &mut tree,
+        column,
+        Style { size: Size { width: Dimension::length(200.0), height: Dimension::length(PROGRESS_HEIGHT) }, ..Default::default() },
+        WidgetKind::ProgressBar {
+            value: 0.6,
+            min: 0.0,
+            max: 1.0,
+            track_color: Color([0.3, 0.3, 0.35, 1.0]),
+            fill_color: accent,
+        },
+    );
+    add(
+        &mut tree,
+        column,
+        Style { size: Size { width: Dimension::length(80.0), height: Dimension::length(48.0) }, ..Default::default() },
+        WidgetKind::Image { image_id: 99, frames: fastgui_core::FrameSlot::new() },
+    );
+
+    tree.compute_layout(320.0, 360.0);
+    let mut chrome = ChromeRenderer::new();
+    let frame = chrome.rasterize(&tree, 320, 360, None, 1.0).expect("form controls paint");
+    assert_eq!((frame.width, frame.height), (320, 360));
+    let drawn = frame.data.chunks_exact(4).filter(|px| px != &[0, 0, 0, 0]).count();
+    assert!(drawn > 500, "expected painted chrome, only {drawn} non-zero pixels");
+    let _ = CHECK_SIZE; // keep the shared constant import intentional
+}
