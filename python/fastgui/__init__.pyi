@@ -29,7 +29,7 @@ class Viewport:
         ...
 
 class Label:
-    def __init__(self, text: str, font_size: float = 16.0, color: RGBA = (1.0, 1.0, 1.0, 1.0)) -> None: ...
+    def __init__(self, text: str, font_size: float = 16.0, color: RGBA | None = None) -> None: ...
     def set_text(self, text: str) -> None: ...
 
 class Button:
@@ -38,8 +38,8 @@ class Button:
         text: str,
         on_click: Callable[[], None] | None = None,
         font_size: float = 16.0,
-        text_color: RGBA = (1.0, 1.0, 1.0, 1.0),
-        background: RGBA = (0.25, 0.35, 0.85, 1.0),
+        text_color: RGBA | None = None,
+        background: RGBA | None = None,
     ) -> None: ...
     def set_text(self, text: str) -> None: ...
 
@@ -50,8 +50,8 @@ class Slider:
         min: float = 0.0,
         max: float = 1.0,
         on_change: Callable[[float], None] | None = None,
-        track_color: RGBA = (0.3, 0.3, 0.35, 1.0),
-        thumb_color: RGBA = (0.4, 0.7, 1.0, 1.0),
+        track_color: RGBA | None = None,
+        thumb_color: RGBA | None = None,
     ) -> None: ...
     def set_value(self, value: float) -> None: ...
 
@@ -67,10 +67,10 @@ class TextInput:
         font_size: float = 16.0,
         width: float | None = None,
         flex_grow: float = 0.0,
-        text_color: RGBA = (0.92, 0.93, 0.95, 1.0),
-        placeholder_color: RGBA = (0.5, 0.52, 0.56, 1.0),
-        background: RGBA = (0.16, 0.17, 0.2, 1.0),
-        selection_color: RGBA = (0.25, 0.45, 0.8, 0.6),
+        text_color: RGBA | None = None,
+        placeholder_color: RGBA | None = None,
+        background: RGBA | None = None,
+        selection_color: RGBA | None = None,
     ) -> None: ...
     @property
     def text(self) -> str:
@@ -89,10 +89,44 @@ class ScrollArea:
         width: float | None = None,
         height: float | None = None,
         background: RGBA = (0.0, 0.0, 0.0, 0.0),
-        bar_color: RGBA = (1.0, 1.0, 1.0, 0.35),
+        bar_color: RGBA | None = None,
     ) -> None: ...
     def scroll_to(self, x: float, y: float) -> None:
         """Scroll so content point `(x, y)` is at the top-left (clamped)."""
+
+class Theme:
+    """Named colors that widgets use when their own color arguments are left out, plus the
+    colors chrome draws itself (window background, focus ring, scrollbars, modal dimming, dock
+    drop preview). `Theme()` is the dark default with any keyword colors replaced."""
+    background: RGBA
+    surface: RGBA
+    surface_alt: RGBA
+    surface_active: RGBA
+    border: RGBA
+    divider: RGBA
+    track: RGBA
+    text: RGBA
+    text_muted: RGBA
+    accent: RGBA
+    button: RGBA
+    button_text: RGBA
+    selection: RGBA
+    scrollbar: RGBA
+    scrim: RGBA
+    drop_indicator: RGBA
+    def __init__(self, **colors: RGBA) -> None: ...
+    @staticmethod
+    def dark() -> Theme: ...
+    @staticmethod
+    def light() -> Theme: ...
+    def replace(self, **colors: RGBA) -> Theme:
+        """A copy with the given colors changed."""
+
+def set_theme(theme: Theme) -> None:
+    """Make `theme` current for widgets described from now on (and chrome's next rebuild).
+    Use `Window.set_theme` to restyle a window that's already showing."""
+
+def get_theme() -> Theme: ...
 
 class ListView:
     """A virtualized list of text rows: only the rows in view are drawn, so it handles millions.
@@ -108,9 +142,9 @@ class ListView:
         flex_grow: float = 1.0,
         width: float | None = None,
         height: float | None = None,
-        text_color: RGBA = (0.9, 0.91, 0.94, 1.0),
-        background: RGBA = (0.13, 0.14, 0.17, 1.0),
-        selection_color: RGBA = (0.25, 0.45, 0.8, 0.6),
+        text_color: RGBA | None = None,
+        background: RGBA | None = None,
+        selection_color: RGBA | None = None,
     ) -> None: ...
     def set_items(self, items: Sequence[str]) -> None:
         """Replace the rows (clears the selection). Works before attaching."""
@@ -132,8 +166,8 @@ class Popup:
         modal: bool = False,
         on_dismiss: Callable[[], None] | None = None,
         padding: float = 6.0,
-        background: RGBA = (0.14, 0.15, 0.18, 1.0),
-        border: RGBA = (0.32, 0.35, 0.42, 1.0),
+        background: RGBA | None = None,
+        border: RGBA | None = None,
     ) -> None: ...
     def show(self, anchor: Widget, side: str = "below") -> None:
         """Open next to `anchor` (already shown in a window): "below", "above", "right" or "left",
@@ -168,7 +202,7 @@ class Splitter:
         second: Widget,
         direction: str = "row",
         ratio: float = 0.5,
-        bar_color: RGBA = (0.2, 0.21, 0.24, 1.0),
+        bar_color: RGBA | None = None,
         thickness: float = 6.0,
     ) -> None: ...
 
@@ -183,9 +217,9 @@ class Panel:
         title: str,
         content: Widget,
         title_font_size: float = 14.0,
-        title_color: RGBA = (0.92, 0.93, 0.95, 1.0),
-        title_background: RGBA = (0.16, 0.17, 0.20, 1.0),
-        background: RGBA = (0.12, 0.13, 0.15, 1.0),
+        title_color: RGBA | None = None,
+        title_background: RGBA | None = None,
+        background: RGBA | None = None,
         title_height: float = 28.0,
     ) -> None: ...
     @property
@@ -211,9 +245,9 @@ class Tabs:
         panels: Sequence[Panel],
         active: int = 0,
         font_size: float = 14.0,
-        text_color: RGBA = (0.92, 0.93, 0.95, 1.0),
-        active_color: RGBA = (0.20, 0.22, 0.26, 1.0),
-        inactive_color: RGBA = (0.14, 0.15, 0.18, 1.0),
+        text_color: RGBA | None = None,
+        active_color: RGBA | None = None,
+        inactive_color: RGBA | None = None,
         height: float = 28.0,
         on_select: Callable[[int], None] | None = None,
     ) -> None: ...
@@ -245,6 +279,8 @@ class Window:
     def set_clear_color(self, r: float, g: float, b: float, a: float) -> None: ...
     def set_viewport(self, viewport: Viewport) -> None: ...
     def set_content(self, widget: Widget) -> None: ...
+    def set_theme(self, theme: Theme) -> None:
+        """Make `theme` current and rebuild this window's content so it shows at once."""
     def show_popup(self, popup: Popup, x: float | None = None, y: float | None = None) -> None:
         """Open `popup` with its top-left at `(x, y)`, or centered when both are omitted."""
     def add_floating_panel(self, panel: Panel, x: float, y: float, width: float, height: float) -> None:

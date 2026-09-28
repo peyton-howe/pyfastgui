@@ -26,19 +26,12 @@ pub mod testing;
 
 use cosmic_text::{Attrs, Buffer, Color as CosmicColor, FontSystem, Metrics, Shaping, SwashCache, Wrap};
 use fastgui_core::text_edit::{TextEdit, TextMeasure};
+use fastgui_core::theme::chrome_theme;
 use fastgui_core::widget::{Color, DropZone, WidgetKind, WidgetTree, TEXT_INPUT_PADDING};
 use fastgui_core::{ChromeFrame, PixelRect};
 use tiny_skia::{Paint, Pixmap, Rect, Transform};
 
 type WidgetRect = fastgui_core::widget::Rect;
-
-/// The window background color chrome fills the whole pixmap with before drawing widgets on
-/// top — a `Container` with a transparent background just lets this show through.
-const BACKGROUND: Color = Color([0.10, 0.11, 0.13, 1.0]);
-
-/// Drawn as the last step, on top of everything, while a `Panel` title bar is being dragged over
-/// a drop-eligible region — see `rasterize`'s `drop_indicator` parameter.
-const DROP_INDICATOR_COLOR: Color = Color([0.40, 0.65, 1.0, 0.35]);
 
 /// `Item::key` for the drop indicator (widget keys are taffy node ids, which never reach this).
 const DROP_INDICATOR_KEY: u64 = u64::MAX;
@@ -66,13 +59,8 @@ const SLIDER_THUMB_RADIUS: f32 = 8.0;
 
 /// Left/right text inset inside a `ListView` row (points).
 const LIST_TEXT_INSET: f32 = 8.0;
-const LIST_BAR_COLOR: Color = Color([1.0, 1.0, 1.0, 0.35]);
-
-/// Dims everything behind a modal popup.
-const MODAL_SCRIM: Color = Color([0.0, 0.0, 0.0, 0.45]);
 
 /// Keyboard-focus outline, drawn just inside the focused widget's rect (points, before scale).
-const FOCUS_RING_COLOR: Color = Color([0.4, 0.7, 1.0, 1.0]);
 const FOCUS_RING_WIDTH: f32 = 2.0;
 
 /// `(byte index, x)` caret positions along one shaped line; see `ChromeRenderer::line_stops`.
@@ -205,6 +193,7 @@ impl ChromeRenderer {
         scale: f32,
         window: PixelRect,
     ) -> Vec<Item> {
+        let theme = chrome_theme();
         let mut items = Vec::new();
         // Popups are the root's last children, so once the walk reaches one, everything after
         // it is overlay content; it's collected separately and appended after the drop
@@ -264,7 +253,7 @@ impl ChromeRenderer {
                 WidgetKind::Popup { modal, background, border, .. } => {
                     if *modal {
                         let screen = WidgetRect { x: 0.0, y: 0.0, width: window.width as f32, height: window.height as f32 };
-                        push_fill(&mut ops, screen, MODAL_SCRIM);
+                        push_fill(&mut ops, screen, theme.scrim);
                     }
                     push_fill(&mut ops, rect, *background);
                     push_outline(&mut ops, rect, scale.max(1.0), *border);
@@ -327,7 +316,7 @@ impl ChromeRenderer {
                         text_color: *text_color,
                         placeholder_color: *placeholder_color,
                         selection_color: *selection_color,
-                        caret_color: FOCUS_RING_COLOR,
+                        caret_color: theme.accent,
                         scroll: *scroll,
                     };
                     self.push_text_field(&mut ops, logical_rect, scale, &field);
@@ -338,7 +327,7 @@ impl ChromeRenderer {
                 }
             }
             if tree.focused() == Some(id) {
-                push_outline(&mut ops, rect, FOCUS_RING_WIDTH * scale, FOCUS_RING_COLOR);
+                push_outline(&mut ops, rect, FOCUS_RING_WIDTH * scale, theme.accent);
             }
             if let Some(clip) = tree.clip_rect(id) {
                 ops = clip_ops(ops, Clip::from_rect(scale_rect(clip, scale)));
@@ -353,7 +342,7 @@ impl ChromeRenderer {
             in_overlay |= popups.contains(&id);
             let bar_color = match tree.kind(id) {
                 Some(WidgetKind::ScrollArea { bar_color, .. }) => bar_color,
-                Some(WidgetKind::ListView { .. }) => &LIST_BAR_COLOR,
+                Some(WidgetKind::ListView { .. }) => &theme.scrollbar,
                 _ => continue,
             };
             let mut ops = Vec::new();
@@ -373,7 +362,7 @@ impl ChromeRenderer {
         // present (empty without a drag) so showing/hiding it doesn't change the key sequence.
         let mut ops = Vec::new();
         if let Some((region_rect, zone)) = drop_indicator {
-            push_fill(&mut ops, scale_rect(zone.preview_rect(region_rect), scale), DROP_INDICATOR_COLOR);
+            push_fill(&mut ops, scale_rect(zone.preview_rect(region_rect), scale), theme.drop_indicator);
         }
         items.push(Item::new(DROP_INDICATOR_KEY, ops, window));
         self.overlay_items = items.len();
@@ -812,7 +801,7 @@ fn merge_damage(mut rects: Vec<PixelRect>, window: PixelRect) -> Option<Vec<Pixe
 /// size of the damage rect, or the whole frame). Ops are translated by whole pixels, so a patch
 /// gets exactly the pixels a full repaint would.
 fn paint(target: &mut Pixmap, items: &[Item], clip: PixelRect) {
-    target.fill(to_tiny_skia_color(BACKGROUND));
+    target.fill(to_tiny_skia_color(chrome_theme().background));
     let (dx, dy) = (clip.x as f32, clip.y as f32);
     let (ox, oy) = (clip.x as i32, clip.y as i32);
     for item in items.iter().filter(|item| item.bounds.intersects(&clip)) {

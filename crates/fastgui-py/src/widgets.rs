@@ -535,14 +535,14 @@ pub(crate) struct Label {
     sender: SenderCell,
     text: String,
     font_size: f32,
-    color: (f32, f32, f32, f32),
+    color: Option<(f32, f32, f32, f32)>,
 }
 
 #[pymethods]
 impl Label {
     #[new]
-    #[pyo3(signature = (text, font_size=16.0, color=(1.0, 1.0, 1.0, 1.0)))]
-    fn new(text: String, font_size: f32, color: (f32, f32, f32, f32)) -> Self {
+    #[pyo3(signature = (text, font_size=16.0, color=None))]
+    fn new(text: String, font_size: f32, color: Option<(f32, f32, f32, f32)>) -> Self {
         Self { id: Arc::new(Mutex::new(None)), sender: Arc::new(Mutex::new(None)), text, font_size, color }
     }
 
@@ -561,7 +561,7 @@ impl Label {
     fn describe(&self) -> DescribedWidget {
         DescribedWidget {
             style: StyleParams::leaf(0.0, None, None),
-            kind: WidgetKind::Label { text: self.text.clone(), font_size: self.font_size, color: rgba(self.color) },
+            kind: WidgetKind::Label { text: self.text.clone(), font_size: self.font_size, color: rgba(self.color.unwrap_or(crate::theme::palette().text)) },
             id_cell: self.id.clone(),
             sender_cell: self.sender.clone(),
             children: Vec::new(),
@@ -578,21 +578,21 @@ pub(crate) struct Button {
     sender: SenderCell,
     text: String,
     font_size: f32,
-    text_color: (f32, f32, f32, f32),
-    background: (f32, f32, f32, f32),
+    text_color: Option<(f32, f32, f32, f32)>,
+    background: Option<(f32, f32, f32, f32)>,
     on_click: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl Button {
     #[new]
-    #[pyo3(signature = (text, on_click=None, font_size=16.0, text_color=(1.0, 1.0, 1.0, 1.0), background=(0.25, 0.35, 0.85, 1.0)))]
+    #[pyo3(signature = (text, on_click=None, font_size=16.0, text_color=None, background=None))]
     fn new(
         text: String,
         on_click: Option<Py<PyAny>>,
         font_size: f32,
-        text_color: (f32, f32, f32, f32),
-        background: (f32, f32, f32, f32),
+        text_color: Option<(f32, f32, f32, f32)>,
+        background: Option<(f32, f32, f32, f32)>,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
@@ -622,8 +622,8 @@ impl Button {
             kind: WidgetKind::Button {
                 text: self.text.clone(),
                 font_size: self.font_size,
-                text_color: rgba(self.text_color),
-                background: rgba(self.background),
+                text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().button_text)),
+                background: rgba(self.background.unwrap_or(crate::theme::palette().button)),
                 on_click: on_click.map(wrap_callback0),
             },
             id_cell: self.id.clone(),
@@ -643,8 +643,8 @@ pub(crate) struct Slider {
     value: f32,
     min: f32,
     max: f32,
-    track_color: (f32, f32, f32, f32),
-    thumb_color: (f32, f32, f32, f32),
+    track_color: Option<(f32, f32, f32, f32)>,
+    thumb_color: Option<(f32, f32, f32, f32)>,
     on_change: Option<Py<PyAny>>,
 }
 
@@ -656,16 +656,16 @@ impl Slider {
         min=0.0,
         max=1.0,
         on_change=None,
-        track_color=(0.3, 0.3, 0.35, 1.0),
-        thumb_color=(0.4, 0.7, 1.0, 1.0),
+        track_color=None,
+        thumb_color=None,
     ))]
     fn new(
         value: f32,
         min: f32,
         max: f32,
         on_change: Option<Py<PyAny>>,
-        track_color: (f32, f32, f32, f32),
-        thumb_color: (f32, f32, f32, f32),
+        track_color: Option<(f32, f32, f32, f32)>,
+        thumb_color: Option<(f32, f32, f32, f32)>,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
@@ -699,8 +699,8 @@ impl Slider {
                 value: self.value,
                 min: self.min,
                 max: self.max,
-                track_color: rgba(self.track_color),
-                thumb_color: rgba(self.thumb_color),
+                track_color: rgba(self.track_color.unwrap_or(crate::theme::palette().track)),
+                thumb_color: rgba(self.thumb_color.unwrap_or(crate::theme::palette().accent)),
                 on_change: on_change.map(wrap_callback1),
             },
             id_cell: self.id.clone(),
@@ -725,10 +725,10 @@ pub(crate) struct TextInput {
     font_size: f32,
     width: Option<f32>,
     flex_grow: f32,
-    text_color: (f32, f32, f32, f32),
-    placeholder_color: (f32, f32, f32, f32),
-    background: (f32, f32, f32, f32),
-    selection_color: (f32, f32, f32, f32),
+    text_color: Option<(f32, f32, f32, f32)>,
+    placeholder_color: Option<(f32, f32, f32, f32)>,
+    background: Option<(f32, f32, f32, f32)>,
+    selection_color: Option<(f32, f32, f32, f32)>,
     on_change: Option<Py<PyAny>>,
     on_submit: Option<Py<PyAny>>,
 }
@@ -744,10 +744,10 @@ impl TextInput {
         font_size=16.0,
         width=None,
         flex_grow=0.0,
-        text_color=(0.92, 0.93, 0.95, 1.0),
-        placeholder_color=(0.5, 0.52, 0.56, 1.0),
-        background=(0.16, 0.17, 0.2, 1.0),
-        selection_color=(0.25, 0.45, 0.8, 0.6),
+        text_color=None,
+        placeholder_color=None,
+        background=None,
+        selection_color=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -758,10 +758,10 @@ impl TextInput {
         font_size: f32,
         width: Option<f32>,
         flex_grow: f32,
-        text_color: (f32, f32, f32, f32),
-        placeholder_color: (f32, f32, f32, f32),
-        background: (f32, f32, f32, f32),
-        selection_color: (f32, f32, f32, f32),
+        text_color: Option<(f32, f32, f32, f32)>,
+        placeholder_color: Option<(f32, f32, f32, f32)>,
+        background: Option<(f32, f32, f32, f32)>,
+        selection_color: Option<(f32, f32, f32, f32)>,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
@@ -818,10 +818,10 @@ impl TextInput {
                 edit: TextEdit::new(&self.text.get()),
                 placeholder: self.placeholder.clone(),
                 font_size: self.font_size,
-                text_color: rgba(self.text_color),
-                placeholder_color: rgba(self.placeholder_color),
-                background: rgba(self.background),
-                selection_color: rgba(self.selection_color),
+                text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
+                placeholder_color: rgba(self.placeholder_color.unwrap_or(crate::theme::palette().text_muted)),
+                background: rgba(self.background.unwrap_or(crate::theme::palette().surface_alt)),
+                selection_color: rgba(self.selection_color.unwrap_or(crate::theme::palette().selection)),
                 scroll: 0.0,
                 preedit: None,
                 on_change: on_change.map(wrap_callback_text),
@@ -850,9 +850,9 @@ pub(crate) struct ListView {
     flex_grow: f32,
     width: Option<f32>,
     height: Option<f32>,
-    text_color: (f32, f32, f32, f32),
-    background: (f32, f32, f32, f32),
-    selection_color: (f32, f32, f32, f32),
+    text_color: Option<(f32, f32, f32, f32)>,
+    background: Option<(f32, f32, f32, f32)>,
+    selection_color: Option<(f32, f32, f32, f32)>,
     on_select: Option<Py<PyAny>>,
     on_activate: Option<Py<PyAny>>,
 }
@@ -879,9 +879,9 @@ impl ListView {
         flex_grow=1.0,
         width=None,
         height=None,
-        text_color=(0.9, 0.91, 0.94, 1.0),
-        background=(0.13, 0.14, 0.17, 1.0),
-        selection_color=(0.25, 0.45, 0.8, 0.6),
+        text_color=None,
+        background=None,
+        selection_color=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -893,9 +893,9 @@ impl ListView {
         flex_grow: f32,
         width: Option<f32>,
         height: Option<f32>,
-        text_color: (f32, f32, f32, f32),
-        background: (f32, f32, f32, f32),
-        selection_color: (f32, f32, f32, f32),
+        text_color: Option<(f32, f32, f32, f32)>,
+        background: Option<(f32, f32, f32, f32)>,
+        selection_color: Option<(f32, f32, f32, f32)>,
     ) -> PyResult<Self> {
         if row_height <= 0.0 {
             return Err(PyValueError::new_err("row_height must be positive"));
@@ -976,9 +976,9 @@ impl ListView {
                 font_size: self.font_size,
                 scroll: 0.0,
                 selected,
-                text_color: rgba(self.text_color),
-                background: rgba(self.background),
-                selection_color: rgba(self.selection_color),
+                text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
+                background: rgba(self.background.unwrap_or(crate::theme::palette().surface)),
+                selection_color: rgba(self.selection_color.unwrap_or(crate::theme::palette().selection)),
                 on_select: on_select.map(wrap_index_callback),
                 on_activate: on_activate.map(wrap_index_callback),
                 mirror: Some(self.selected.clone()),
@@ -1001,8 +1001,8 @@ pub(crate) struct Popup {
     content: Py<PyAny>,
     modal: bool,
     padding: f32,
-    background: (f32, f32, f32, f32),
-    border: (f32, f32, f32, f32),
+    background: Option<(f32, f32, f32, f32)>,
+    border: Option<(f32, f32, f32, f32)>,
     on_dismiss: Option<Py<PyAny>>,
     /// The open popup node, and the window it's in.
     id: IdCell,
@@ -1018,16 +1018,16 @@ impl Popup {
         modal=false,
         on_dismiss=None,
         padding=6.0,
-        background=(0.14, 0.15, 0.18, 1.0),
-        border=(0.32, 0.35, 0.42, 1.0),
+        background=None,
+        border=None,
     ))]
     fn new(
         content: Py<PyAny>,
         modal: bool,
         on_dismiss: Option<Py<PyAny>>,
         padding: f32,
-        background: (f32, f32, f32, f32),
-        border: (f32, f32, f32, f32),
+        background: Option<(f32, f32, f32, f32)>,
+        border: Option<(f32, f32, f32, f32)>,
     ) -> Self {
         Self {
             content,
@@ -1103,8 +1103,8 @@ impl Popup {
         let kind = WidgetKind::Popup {
             anchor,
             modal: self.modal,
-            background: rgba(self.background),
-            border: rgba(self.border),
+            background: rgba(self.background.unwrap_or(crate::theme::palette().surface_alt)),
+            border: rgba(self.border.unwrap_or(crate::theme::palette().border)),
             on_dismiss: on_dismiss.map(wrap_callback0),
             restore_focus: None,
             open: Some(self.open.clone()),
@@ -1143,7 +1143,7 @@ pub(crate) struct ScrollArea {
     width: Option<f32>,
     height: Option<f32>,
     background: (f32, f32, f32, f32),
-    bar_color: (f32, f32, f32, f32),
+    bar_color: Option<(f32, f32, f32, f32)>,
 }
 
 #[pymethods]
@@ -1155,7 +1155,7 @@ impl ScrollArea {
         width=None,
         height=None,
         background=(0.0, 0.0, 0.0, 0.0),
-        bar_color=(1.0, 1.0, 1.0, 0.35),
+        bar_color=None,
     ))]
     fn new(
         content: Py<PyAny>,
@@ -1163,7 +1163,7 @@ impl ScrollArea {
         width: Option<f32>,
         height: Option<f32>,
         background: (f32, f32, f32, f32),
-        bar_color: (f32, f32, f32, f32),
+        bar_color: Option<(f32, f32, f32, f32)>,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
@@ -1196,7 +1196,7 @@ impl ScrollArea {
             kind: WidgetKind::ScrollArea {
                 offset: (0.0, 0.0),
                 background: rgba(self.background),
-                bar_color: rgba(self.bar_color),
+                bar_color: rgba(self.bar_color.unwrap_or(crate::theme::palette().scrollbar)),
             },
             id_cell: self.id.clone(),
             sender_cell: self.sender.clone(),
@@ -1322,20 +1322,20 @@ pub(crate) struct Splitter {
     second: Py<PyAny>,
     direction: SplitDirection,
     ratio: f32,
-    bar_color: (f32, f32, f32, f32),
+    bar_color: Option<(f32, f32, f32, f32)>,
     thickness: f32,
 }
 
 #[pymethods]
 impl Splitter {
     #[new]
-    #[pyo3(signature = (first, second, direction="row", ratio=0.5, bar_color=(0.2, 0.21, 0.24, 1.0), thickness=6.0))]
+    #[pyo3(signature = (first, second, direction="row", ratio=0.5, bar_color=None, thickness=6.0))]
     fn new(
         first: Py<PyAny>,
         second: Py<PyAny>,
         direction: &str,
         ratio: f32,
-        bar_color: (f32, f32, f32, f32),
+        bar_color: Option<(f32, f32, f32, f32)>,
         thickness: f32,
     ) -> PyResult<Self> {
         if !(0.0..=1.0).contains(&ratio) {
@@ -1383,7 +1383,7 @@ impl Splitter {
             splitter_bar: Some(SplitterBarSpec {
                 direction: self.direction,
                 ratio: self.ratio,
-                bar_color: rgba(self.bar_color),
+                bar_color: rgba(self.bar_color.unwrap_or(crate::theme::palette().divider)),
                 thickness: self.thickness,
             }),
             tab_bar: None,
@@ -1412,9 +1412,9 @@ pub(crate) struct Panel {
     title: String,
     content: Py<PyAny>,
     title_font_size: f32,
-    title_color: (f32, f32, f32, f32),
-    title_background: (f32, f32, f32, f32),
-    background: (f32, f32, f32, f32),
+    title_color: Option<(f32, f32, f32, f32)>,
+    title_background: Option<(f32, f32, f32, f32)>,
+    background: Option<(f32, f32, f32, f32)>,
     title_height: f32,
 }
 
@@ -1425,9 +1425,9 @@ impl Panel {
         title,
         content,
         title_font_size=14.0,
-        title_color=(0.92, 0.93, 0.95, 1.0),
-        title_background=(0.16, 0.17, 0.20, 1.0),
-        background=(0.12, 0.13, 0.15, 1.0),
+        title_color=None,
+        title_background=None,
+        background=None,
         title_height=28.0,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -1435,9 +1435,9 @@ impl Panel {
         title: String,
         content: Py<PyAny>,
         title_font_size: f32,
-        title_color: (f32, f32, f32, f32),
-        title_background: (f32, f32, f32, f32),
-        background: (f32, f32, f32, f32),
+        title_color: Option<(f32, f32, f32, f32)>,
+        title_background: Option<(f32, f32, f32, f32)>,
+        background: Option<(f32, f32, f32, f32)>,
         title_height: f32,
     ) -> Self {
         Self {
@@ -1581,8 +1581,8 @@ impl Panel {
                 panel_id: self.region_id,
                 title: self.title.clone(),
                 font_size: self.title_font_size,
-                text_color: rgba(self.title_color),
-                background: rgba(self.title_background),
+                text_color: rgba(self.title_color.unwrap_or(crate::theme::palette().text)),
+                background: rgba(self.title_background.unwrap_or(crate::theme::palette().surface_alt)),
                 on_drop: on_drop.map(wrap_panel_drop_callback),
                 on_close: on_close.map(wrap_panel_close_callback),
                 floating: self.floating.load(Ordering::Relaxed),
@@ -1608,7 +1608,7 @@ impl Panel {
                 fill: false,
                 align_items: None, absolute: None,
             },
-            kind: WidgetKind::Container { background: rgba(self.background), region_id: Some(self.region_id) },
+            kind: WidgetKind::Container { background: rgba(self.background.unwrap_or(crate::theme::palette().surface)), region_id: Some(self.region_id) },
             id_cell: self.id.clone(),
             sender_cell: self.sender.clone(),
             children: vec![title_bar, content_described],
@@ -1633,9 +1633,9 @@ pub(crate) struct Tabs {
     panels: Py<PyList>,
     active: usize,
     font_size: f32,
-    text_color: (f32, f32, f32, f32),
-    active_color: (f32, f32, f32, f32),
-    inactive_color: (f32, f32, f32, f32),
+    text_color: Option<(f32, f32, f32, f32)>,
+    active_color: Option<(f32, f32, f32, f32)>,
+    inactive_color: Option<(f32, f32, f32, f32)>,
     height: f32,
     on_select: Option<Py<PyAny>>,
 }
@@ -1647,9 +1647,9 @@ impl Tabs {
         panels,
         active=0,
         font_size=14.0,
-        text_color=(0.92, 0.93, 0.95, 1.0),
-        active_color=(0.20, 0.22, 0.26, 1.0),
-        inactive_color=(0.14, 0.15, 0.18, 1.0),
+        text_color=None,
+        active_color=None,
+        inactive_color=None,
         height=28.0,
         on_select=None,
     ))]
@@ -1658,9 +1658,9 @@ impl Tabs {
         panels: Py<PyList>,
         active: usize,
         font_size: f32,
-        text_color: (f32, f32, f32, f32),
-        active_color: (f32, f32, f32, f32),
-        inactive_color: (f32, f32, f32, f32),
+        text_color: Option<(f32, f32, f32, f32)>,
+        active_color: Option<(f32, f32, f32, f32)>,
+        inactive_color: Option<(f32, f32, f32, f32)>,
         height: f32,
         on_select: Option<Py<PyAny>>,
     ) -> Self {
@@ -1761,9 +1761,9 @@ impl Tabs {
                 titles,
                 active,
                 font_size: self.font_size,
-                text_color: rgba(self.text_color),
-                active_color: rgba(self.active_color),
-                inactive_color: rgba(self.inactive_color),
+                text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
+                active_color: rgba(self.active_color.unwrap_or(crate::theme::palette().surface_active)),
+                inactive_color: rgba(self.inactive_color.unwrap_or(crate::theme::palette().surface_alt)),
                 height: self.height,
                 on_select: on_select.map(wrap_callback_usize),
                 panel_ids,

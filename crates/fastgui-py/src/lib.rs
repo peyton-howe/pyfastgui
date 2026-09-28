@@ -1,4 +1,5 @@
 mod backend;
+mod theme;
 mod widgets;
 
 use std::sync::atomic::Ordering;
@@ -408,6 +409,18 @@ impl Window {
         Ok(())
     }
 
+    /// Make `theme` current (like `fg.set_theme`) and rebuild this window's content so it shows
+    /// right away. Widgets keep their text, list selection and the like; scroll positions and
+    /// keyboard focus reset, as for any `set_content`.
+    fn set_theme(self_: &Bound<'_, Self>, theme: theme::Theme) -> PyResult<()> {
+        theme::install(theme);
+        let content = self_.borrow().content.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|c| c.clone_ref(self_.py()));
+        match content {
+            Some(content) => Window::set_content(self_, content.bind(self_.py())),
+            None => Ok(()),
+        }
+    }
+
     /// Open `popup` in this window with its top-left at `(x, y)` (window coordinates, flipped
     /// near the far edges), or centered when `x`/`y` are omitted (dialogs).
     #[pyo3(signature = (popup, x=None, y=None))]
@@ -601,5 +614,6 @@ fn _fastgui(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Viewport>()?;
     m.add_class::<CudaSurface>()?;
     widgets::register(m)?;
+    theme::register(m)?;
     Ok(())
 }

@@ -111,6 +111,7 @@ All under [`python/examples/`](python/examples/), runnable directly once install
 | [`widgets_demo.py`](python/examples/widgets_demo.py) | `Box` layout, `Label`, `Button`, `Slider`, click/drag input. |
 | [`text_input_demo.py`](python/examples/text_input_demo.py) | `TextInput` fields, keyboard focus (Tab/Shift+Tab), selection, clipboard, undo, IME. |
 | [`list_demo.py`](python/examples/list_demo.py) | A virtualized `ListView` of 1,000,000 rows with live filtering, keyboard selection and activation. |
+| [`theme_demo.py`](python/examples/theme_demo.py) | `fg.Theme`: switch a running window between light, dark and a custom accent. |
 | [`popup_demo.py`](python/examples/popup_demo.py) | `Popup` overlays: a menu anchored to a button, a modal dialog, a popup at a point — all drawn over live `Viewport` video. |
 | [`scroll_demo.py`](python/examples/scroll_demo.py) | `ScrollArea`: wheel/trackpad and scrollbar scrolling, clipping, a live `Viewport` inside, Tab scrolling focus into view. |
 | [`dock_layout.py`](python/examples/dock_layout.py) | A `DockArea` of resizable, titled `Panel`s with a live `Viewport` in the center. |
@@ -124,6 +125,8 @@ All under [`python/examples/`](python/examples/), runnable directly once install
   `Splitter` (draggable divider between two panes), `ScrollArea` (scrollable, clipped viewport), `Popup` (menus, dropdowns, tooltips, modal
   dialogs — anchored overlays drawn above everything).
 - **Data views**: `ListView` (virtualized: only visible rows are laid out and drawn).
+- **Theming**: `Theme` (`dark()`, `light()`, `replace(...)`), `set_theme` / `get_theme`,
+  `Window.set_theme`. Widget color arguments default to the current theme.
 - **Content**: `Label`, `Button`, `Slider`, `TextInput`, `Viewport` (arbitrary CPU/GPU frame content).
 - **Docking**: `Panel` (titled, draggable container), `Tabs` (several `Panel`s sharing one
   region), `DockArea` (a split-tree of panels/tabs with full drag-to-rearrange — split, tab-merge

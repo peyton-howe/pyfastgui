@@ -11,6 +11,7 @@ mod frame;
 mod queue;
 mod readback;
 pub mod text_edit;
+pub mod theme;
 pub mod widget;
 
 pub use frame::{

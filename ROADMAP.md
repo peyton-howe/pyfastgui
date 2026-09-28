@@ -1283,6 +1283,16 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
    overlap of both clips. Demo: `list_demo.py`. Fixed row height only; tables/trees (7D) build
    on `list_visible_rows`.
 6. **Theming** — shared palette/font/spacing tokens instead of per-widget color arguments.
+   **Done (2026-09-28), colors only:** `fg.Theme` (16 named tokens; `dark()` — the previous
+   defaults, with a few near-identical surface shades unified and plain labels now the same
+   off-white as other text — and `light()`; `replace(**colors)`), `fg.set_theme` / `get_theme`,
+   `Window.set_theme` (rebuilds the content; text/selection survive via their mirrors, scroll
+   and focus reset). Every existing widget's color arguments default to `None` → the current
+   theme at describe time; chrome's own colors (background, focus ring/caret, scrim, drop
+   preview, list scrollbar) moved from constants to `fastgui_core::theme`. Demo:
+   `theme_demo.py`. **Not yet:** font and spacing tokens; floating panels restyle on their next
+   rebuild rather than immediately; the 7B widgets added concurrently still take explicit
+   colors and should adopt `palette()` the same way.
 
 ### 7B. Tier 1 — core form controls
 

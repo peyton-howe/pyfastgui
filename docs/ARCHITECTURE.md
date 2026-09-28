@@ -71,6 +71,8 @@ crates/
                           without a working CUDA driver.
 
   fastgui-py/             PyO3 bindings — the only crate that knows about Python.
+    src/theme.rs              fg.Theme (named colors) + the process-wide current theme; pushes
+                              chrome's own colors to fastgui-core::theme
     src/backend.rs            cfg-picks fastgui-render-mtl on macOS, fastgui-render-vk elsewhere
     src/lib.rs                Window, Viewport, CudaSurface pyclasses (create_cuda_surface is a
                               RuntimeError stub on macOS)
@@ -186,6 +188,12 @@ multiplies by its (clipped) rect's box coverage — so no shader-side clip state
 calls. `Viewport` layers inside a scroll area keep their full-size GPU viewport and are cut by
 the scissor (`ViewportDraw::viewport_and_scissor`), so a partly scrolled-out frame is cut off,
 not squashed. Scrollbars are overlay thumbs drawn as extra items after all content.
+
+**Theming.** Widget colors are resolved in Python-facing `describe` (a color argument left as
+`None` takes the current `fg.Theme` token), so themes cost nothing at draw time and need no
+per-frame lookups. Colors chrome draws on its own — window background, focus ring/caret, modal
+scrim, drop preview, list scrollbars — come from `fastgui_core::theme::chrome_theme()`, set by
+the same `fg.set_theme`. `Window.set_theme` re-runs `set_content` so a live window restyles.
 
 **Virtualization (`ListView`).** A list is one widget node holding plain row data, not a node
 per row: chrome asks `WidgetTree::list_visible_rows` for the handful of rows in view and shapes

@@ -19,7 +19,7 @@ use fastgui_core::{
     AtlasUpload, ChromeQuad, ChromeQuads, PixelRect, QUAD_CIRCLE, QUAD_CIRCLE_CLIPPED, QUAD_SOLID, QUAD_SPRITE,
 };
 
-use super::{Color, Item, Op, Sprite, BACKGROUND};
+use super::{Color, Item, Op, Sprite};
 
 const ATLAS_MIN_SIZE: u32 = 512;
 /// 4096² RGBA8 = 64 MiB. Vulkan guarantees 2D images at least this large, and a window's text
@@ -112,7 +112,7 @@ impl GpuState {
     /// Quads for `items`; those from item `overlay_items` on are the overlay range.
     fn emit(&mut self, items: &[Item], overlay_items: usize, width: u32, height: u32) {
         self.quads.clear();
-        self.quads.push(solid([0.0, 0.0, width as f32, height as f32], BACKGROUND));
+        self.quads.push(solid([0.0, 0.0, width as f32, height as f32], fastgui_core::theme::chrome_theme().background));
         self.overlay_start = usize::MAX;
         for (index, item) in items.iter().enumerate() {
             if index == overlay_items {
