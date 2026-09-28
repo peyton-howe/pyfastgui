@@ -13,9 +13,18 @@ const SLIDER_PAGE: f32 = 0.1;
 
 /// Apply one key press to `tree`: Tab / Shift+Tab move focus, Escape clears it, and the
 /// focused widget handles the rest (Enter/Space click a `Button`; arrows, PageUp/PageDown and
-/// Home/End move a `Slider`; a `TextInput` edits — see `text_input::handle_key`). Returns
+/// Home/End move a `Slider`; a `TextInput` / `TextArea` edits — see `text_input::handle_key`). Returns
 /// whether anything happened, i.e. whether to redraw.
 pub fn handle_key(
+    tree: &mut WidgetTree,
+    press: &KeyPress<'_>,
+    measure: &mut dyn TextMeasure,
+    clipboard: &mut dyn Clipboard,
+) -> bool {
+    crate::forms::with_tree(tree, |tree| handle_key_inner(tree, press, measure, clipboard))
+}
+
+fn handle_key_inner(
     tree: &mut WidgetTree,
     press: &KeyPress<'_>,
     measure: &mut dyn TextMeasure,
@@ -65,11 +74,43 @@ pub fn handle_key(
             set_slider_value(tree, id, target.clamp(min.min(max), max.max(min)));
             true
         }
-        Some(WidgetKind::TextInput { .. }) => text_input::handle_key(tree, id, press, measure, clipboard),
+        Some(WidgetKind::TextInput { .. } | WidgetKind::TextArea { .. }) => {
+            text_input::handle_key(tree, id, press, measure, clipboard)
+        }
         Some(WidgetKind::ListView { items, selected, on_activate, .. }) => {
+            let combo = crate::forms::combo_for_list(tree, id);
             let (count, current) = (items.len(), *selected);
             let page = tree.list_page_rows(id);
             let last = count.saturating_sub(1);
+            // Combo dropdown: arrows move the highlight without firing on_select (which closes).
+            if combo.is_some() {
+                let activate = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space))
+                    || matches!(key, Key::Character(c) if c == " ");
+                if activate {
+                    if let (Some(callback), Some(row)) = (on_activate.clone(), current) {
+                        callback(row);
+                    }
+                    return current.is_some();
+                }
+                let target = match key {
+                    Key::Named(NamedKey::ArrowDown) => current.map_or(0, |i| (i + 1).min(last)),
+                    Key::Named(NamedKey::ArrowUp) => current.map_or(0, |i| i.saturating_sub(1)),
+                    Key::Named(NamedKey::PageDown) => current.map_or(0, |i| (i + page).min(last)),
+                    Key::Named(NamedKey::PageUp) => current.map_or(0, |i| i.saturating_sub(page)),
+                    Key::Named(NamedKey::Home) => 0,
+                    Key::Named(NamedKey::End) => last,
+                    _ => return false,
+                };
+                if count == 0 {
+                    return false;
+                }
+                tree.mutate_kind(id, |kind| {
+                    if let WidgetKind::ListView { selected, .. } = kind {
+                        *selected = Some(target);
+                    }
+                });
+                return true;
+            }
             let target = match key {
                 Key::Named(NamedKey::Enter) => {
                     if let (Some(callback), Some(row)) = (on_activate.clone(), current) {
@@ -129,6 +170,14 @@ pub fn handle_key(
                 _ => return false,
             };
             crate::forms::set_numeric(tree, id, target)
+        }
+        Some(WidgetKind::ComboBox { .. }) => {
+            let open = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space | NamedKey::ArrowDown))
+                || matches!(key, Key::Character(c) if c == " ");
+            if open {
+                crate::forms::open_combo(tree, id);
+            }
+            open
         }
         _ => false,
     }

@@ -1,9 +1,13 @@
-//! `TextInput` editing: keys, mouse, IME and clipboard on top of `fastgui_core::text_edit`,
-//! for whichever window's tree the event arrived in. Text is measured through `TextMeasure`
-//! (the window's `ChromeRenderer`) so click-to-caret and scrolling match what's drawn.
+//! `TextInput` / `TextArea` editing: keys, mouse, IME and clipboard on top of
+//! `fastgui_core::text_edit`, for whichever window's tree the event arrived in. Text is measured
+//! through `TextMeasure` (the window's `ChromeRenderer`) so click-to-caret and scrolling match
+//! what's drawn.
 
 use fastgui_core::text_edit::{TextEdit, TextMeasure};
-use fastgui_core::widget::{Rect, WidgetId, WidgetKind, WidgetTree, TEXT_INPUT_PADDING};
+use fastgui_core::widget::{
+    Rect, WidgetId, WidgetKind, WidgetTree, LINE_HEIGHT_RATIO, TEXT_INPUT_PADDING,
+    TEXT_INPUT_VERTICAL_PADDING,
+};
 use winit::event::Ime;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
@@ -67,14 +71,19 @@ impl Clipboard for SystemClipboard {
     }
 }
 
-/// Edit the `TextInput` `id` with `f`, which returns whether its text changed. Fires
+fn is_text_field(kind: &WidgetKind) -> bool {
+    matches!(kind, WidgetKind::TextInput { .. } | WidgetKind::TextArea { .. })
+}
+
+/// Edit the text field `id` with `f`, which returns whether its text changed. Fires
 /// `on_change` / updates the Python mirror on a change, and scrolls the caret into view.
 fn edit(tree: &mut WidgetTree, id: WidgetId, measure: &mut dyn TextMeasure, f: impl FnOnce(&mut TextEdit) -> bool) {
     let mut changed = false;
-    tree.mutate_kind(id, |kind| {
-        if let WidgetKind::TextInput { edit, .. } = kind {
+    tree.mutate_kind(id, |kind| match kind {
+        WidgetKind::TextInput { edit, .. } | WidgetKind::TextArea { edit, .. } => {
             changed = f(edit);
         }
+        _ => {}
     });
     if changed {
         notify_change(tree, id);
@@ -83,43 +92,75 @@ fn edit(tree: &mut WidgetTree, id: WidgetId, measure: &mut dyn TextMeasure, f: i
 }
 
 fn notify_change(tree: &WidgetTree, id: WidgetId) {
-    let Some(WidgetKind::TextInput { edit, on_change, mirror, .. }) = tree.kind(id) else { return };
-    let text = edit.text().to_owned();
+    let (text, on_change, mirror) = match tree.kind(id) {
+        Some(WidgetKind::TextInput { edit, on_change, mirror, .. } | WidgetKind::TextArea { edit, on_change, mirror, .. }) => {
+            (edit.text().to_owned(), on_change.clone(), mirror.clone())
+        }
+        _ => return,
+    };
     if let Some(mirror) = mirror {
         mirror.set(text.clone());
     }
-    if let Some(callback) = on_change.clone() {
+    if let Some(callback) = on_change {
         callback(text);
     }
 }
 
-/// Adjust the field's horizontal scroll so the caret is inside it, and never scrolled past
-/// the end of the text (deleting from a scrolled line pulls the text back in).
+/// Adjust the field's scroll so the caret is inside it.
 pub fn scroll_caret_into_view(tree: &mut WidgetTree, id: WidgetId, measure: &mut dyn TextMeasure) {
     let Some(rect) = tree.absolute_rect(id) else { return };
-    let Some(WidgetKind::TextInput { edit, font_size, scroll, preedit, .. }) = tree.kind(id) else { return };
-    let (display, caret, _) = edit.composed(preedit.as_ref());
-    let visible = (rect.width - 2.0 * TEXT_INPUT_PADDING - CARET_SLACK).max(0.0);
-    let caret_x = measure.caret_x(&display, *font_size, caret);
-    let line_width = measure.caret_x(&display, *font_size, display.len());
-    let mut target = *scroll;
-    if caret_x - target > visible {
-        target = caret_x - visible;
-    }
-    if caret_x < target {
-        target = caret_x;
-    }
-    target = target.clamp(0.0, (line_width - visible).max(0.0));
-    if target != *scroll {
-        tree.mutate_kind(id, |kind| {
-            if let WidgetKind::TextInput { scroll, .. } = kind {
-                *scroll = target;
+    match tree.kind(id) {
+        Some(WidgetKind::TextInput { edit, font_size, scroll, preedit, .. }) => {
+            let (display, caret, _) = edit.composed(preedit.as_ref());
+            let visible = (rect.width - 2.0 * TEXT_INPUT_PADDING - CARET_SLACK).max(0.0);
+            let caret_x = measure.caret_x(&display, *font_size, caret);
+            let line_width = measure.caret_x(&display, *font_size, display.len());
+            let mut target = *scroll;
+            if caret_x - target > visible {
+                target = caret_x - visible;
             }
-        });
+            if caret_x < target {
+                target = caret_x;
+            }
+            target = target.clamp(0.0, (line_width - visible).max(0.0));
+            if target != *scroll {
+                tree.mutate_kind(id, |kind| {
+                    if let WidgetKind::TextInput { scroll, .. } = kind {
+                        *scroll = target;
+                    }
+                });
+            }
+        }
+        Some(WidgetKind::TextArea { edit, font_size, scroll_y, preedit, .. }) => {
+            let (display, caret, _) = edit.composed(preedit.as_ref());
+            let line_height = *font_size * LINE_HEIGHT_RATIO;
+            let visible = (rect.height - 2.0 * TEXT_INPUT_VERTICAL_PADDING).max(0.0);
+            let line_index = display[..caret].bytes().filter(|&b| b == b'\n').count() as f32;
+            let caret_top = line_index * line_height;
+            let caret_bottom = caret_top + line_height;
+            let mut target = *scroll_y;
+            if caret_bottom - target > visible {
+                target = caret_bottom - visible;
+            }
+            if caret_top < target {
+                target = caret_top;
+            }
+            let total_lines = display.split('\n').count().max(1) as f32;
+            let content_h = total_lines * line_height;
+            target = target.clamp(0.0, (content_h - visible).max(0.0));
+            if target != *scroll_y {
+                tree.mutate_kind(id, |kind| {
+                    if let WidgetKind::TextArea { scroll_y, .. } = kind {
+                        *scroll_y = target;
+                    }
+                });
+            }
+        }
+        _ => {}
     }
 }
 
-/// A key press in the focused `TextInput` `id`. Returns whether it was handled.
+/// A key press in the focused `TextInput` / `TextArea` `id`. Returns whether it was handled.
 pub fn handle_key(
     tree: &mut WidgetTree,
     id: WidgetId,
@@ -127,24 +168,65 @@ pub fn handle_key(
     measure: &mut dyn TextMeasure,
     clipboard: &mut dyn Clipboard,
 ) -> bool {
+    let multiline = matches!(tree.kind(id), Some(WidgetKind::TextArea { .. }));
+    if !matches!(tree.kind(id), Some(k) if is_text_field(k)) {
+        return false;
+    }
     let shift = press.modifiers.shift_key();
     let (word, line) = (press.word(), press.line());
     match press.key {
+        Key::Named(NamedKey::Enter) if multiline && press.command() => {
+            if let Some(WidgetKind::TextArea { edit, on_submit: Some(callback), .. }) = tree.kind(id) {
+                let (callback, text) = (callback.clone(), edit.text().to_owned());
+                callback(text);
+            }
+        }
+        Key::Named(NamedKey::Enter) if multiline => {
+            edit(tree, id, measure, |e| e.insert("\n"));
+        }
         Key::Named(NamedKey::Enter) => {
             if let Some(WidgetKind::TextInput { edit, on_submit: Some(callback), .. }) = tree.kind(id) {
                 let (callback, text) = (callback.clone(), edit.text().to_owned());
                 callback(text);
             }
         }
+        Key::Named(NamedKey::ArrowLeft) if line && multiline => {
+            move_caret(tree, id, measure, |e| e.line_home(shift));
+        }
+        Key::Named(NamedKey::ArrowRight) if line && multiline => {
+            move_caret(tree, id, measure, |e| e.line_end_move(shift));
+        }
         Key::Named(NamedKey::ArrowLeft) if line => move_caret(tree, id, measure, |e| e.home(shift)),
         Key::Named(NamedKey::ArrowRight) if line => move_caret(tree, id, measure, |e| e.end(shift)),
         Key::Named(NamedKey::ArrowLeft) => move_caret(tree, id, measure, |e| e.move_left(shift, word)),
         Key::Named(NamedKey::ArrowRight) => move_caret(tree, id, measure, |e| e.move_right(shift, word)),
+        Key::Named(NamedKey::ArrowUp) if multiline => {
+            move_caret(tree, id, measure, |e| e.move_line_up(shift));
+        }
+        Key::Named(NamedKey::ArrowDown) if multiline => {
+            move_caret(tree, id, measure, |e| e.move_line_down(shift));
+        }
+        Key::Named(NamedKey::Home) if multiline && (press.command() || line) => {
+            move_caret(tree, id, measure, |e| e.home(shift));
+        }
+        Key::Named(NamedKey::End) if multiline && (press.command() || line) => {
+            move_caret(tree, id, measure, |e| e.end(shift));
+        }
+        Key::Named(NamedKey::Home) if multiline => {
+            move_caret(tree, id, measure, |e| e.line_home(shift));
+        }
+        Key::Named(NamedKey::End) if multiline => {
+            move_caret(tree, id, measure, |e| e.line_end_move(shift));
+        }
         Key::Named(NamedKey::ArrowUp | NamedKey::Home) => move_caret(tree, id, measure, |e| e.home(shift)),
         Key::Named(NamedKey::ArrowDown | NamedKey::End) => move_caret(tree, id, measure, |e| e.end(shift)),
         Key::Named(NamedKey::Backspace) if line => edit(tree, id, measure, |e| {
             if e.selection().is_empty() {
-                e.home(true);
+                if multiline {
+                    e.line_home(true);
+                } else {
+                    e.home(true);
+                }
             }
             e.backspace(false)
         }),
@@ -153,7 +235,7 @@ pub fn handle_key(
         Key::Character(c) if press.command() => match c.to_lowercase().as_str() {
             "a" => move_caret(tree, id, measure, |e| e.select_all()),
             "c" => {
-                if let Some(WidgetKind::TextInput { edit, .. }) = tree.kind(id) {
+                if let Some(WidgetKind::TextInput { edit, .. } | WidgetKind::TextArea { edit, .. }) = tree.kind(id) {
                     if !edit.selection().is_empty() {
                         clipboard.set(edit.selected_text().to_owned());
                     }
@@ -194,10 +276,18 @@ fn move_caret(tree: &mut WidgetTree, id: WidgetId, measure: &mut dyn TextMeasure
     });
 }
 
-/// Mouse press at window x `cursor_x` in `TextInput` `id`: place the caret there (extending
-/// the selection with `extend`), or select the word under it on a double-click.
-pub fn handle_press(tree: &mut WidgetTree, id: WidgetId, cursor_x: f32, extend: bool, double: bool, measure: &mut dyn TextMeasure) {
-    let Some(index) = index_at_cursor(tree, id, cursor_x, measure) else { return };
+/// Mouse press at window coords in text field `id`: place the caret (extending with `extend`),
+/// or select the word under it on a double-click.
+pub fn handle_press(
+    tree: &mut WidgetTree,
+    id: WidgetId,
+    cursor_x: f32,
+    cursor_y: f32,
+    extend: bool,
+    double: bool,
+    measure: &mut dyn TextMeasure,
+) {
+    let Some(index) = index_at_cursor(tree, id, cursor_x, cursor_y, measure) else { return };
     edit(tree, id, measure, |e| {
         if double {
             e.select_word_at(index);
@@ -208,27 +298,62 @@ pub fn handle_press(tree: &mut WidgetTree, id: WidgetId, cursor_x: f32, extend: 
     });
 }
 
-/// Mouse drag after a press in `id`: extend the selection to the cursor (scrolling the field
-/// when dragged past either edge, since the caret follows the cursor).
-pub fn handle_drag(tree: &mut WidgetTree, id: WidgetId, cursor_x: f32, measure: &mut dyn TextMeasure) {
-    let Some(index) = index_at_cursor(tree, id, cursor_x, measure) else { return };
+/// Mouse drag after a press in `id`: extend the selection to the cursor.
+pub fn handle_drag(tree: &mut WidgetTree, id: WidgetId, cursor_x: f32, cursor_y: f32, measure: &mut dyn TextMeasure) {
+    let Some(index) = index_at_cursor(tree, id, cursor_x, cursor_y, measure) else { return };
     move_caret(tree, id, measure, |e| e.move_to(index, true));
 }
 
-fn index_at_cursor(tree: &WidgetTree, id: WidgetId, cursor_x: f32, measure: &mut dyn TextMeasure) -> Option<usize> {
+fn index_at_cursor(
+    tree: &WidgetTree,
+    id: WidgetId,
+    cursor_x: f32,
+    cursor_y: f32,
+    measure: &mut dyn TextMeasure,
+) -> Option<usize> {
     let rect = tree.absolute_rect(id)?;
-    let Some(WidgetKind::TextInput { edit, font_size, scroll, .. }) = tree.kind(id) else { return None };
-    let x = cursor_x - rect.x - TEXT_INPUT_PADDING + scroll;
-    Some(measure.index_at(edit.text(), *font_size, x))
+    match tree.kind(id) {
+        Some(WidgetKind::TextInput { edit, font_size, scroll, .. }) => {
+            let x = cursor_x - rect.x - TEXT_INPUT_PADDING + scroll;
+            Some(measure.index_at(edit.text(), *font_size, x))
+        }
+        Some(WidgetKind::TextArea { edit, font_size, scroll_y, .. }) => {
+            let text = edit.text();
+            let line_height = *font_size * LINE_HEIGHT_RATIO;
+            let y = cursor_y - rect.y - TEXT_INPUT_VERTICAL_PADDING + *scroll_y;
+            let line_index = if line_height <= 0.0 {
+                0
+            } else {
+                (y / line_height).floor().max(0.0) as usize
+            };
+            let mut start = 0usize;
+            let mut lines = text.split('\n').peekable();
+            let mut i = 0usize;
+            while let Some(line) = lines.next() {
+                let end = start + line.len();
+                let last = lines.peek().is_none();
+                if i == line_index || last {
+                    let x = cursor_x - rect.x - TEXT_INPUT_PADDING;
+                    let local = measure.index_at(line, *font_size, x);
+                    return Some(start + local);
+                }
+                start = end + 1; // skip '\n'
+                i += 1;
+            }
+            Some(text.len())
+        }
+        _ => None,
+    }
 }
 
-/// An IME event for the focused `TextInput` `id`.
+/// An IME event for the focused text field `id`.
 pub fn handle_ime(tree: &mut WidgetTree, id: WidgetId, ime: &Ime, measure: &mut dyn TextMeasure) {
     let set_preedit = |tree: &mut WidgetTree, preedit: Option<(String, Option<(usize, usize)>)>| {
-        tree.mutate_kind(id, |kind| {
-            if let WidgetKind::TextInput { preedit: current, .. } = kind {
+        tree.mutate_kind(id, |kind| match kind {
+            WidgetKind::TextInput { preedit: current, .. } | WidgetKind::TextArea { preedit: current, .. } => {
                 *current = preedit;
             }
+            _ => {}
         });
     };
     match ime {
@@ -245,15 +370,33 @@ pub fn handle_ime(tree: &mut WidgetTree, id: WidgetId, ime: &Ime, measure: &mut 
     }
 }
 
-/// Where the focused `TextInput`'s caret is (window coordinates, layout units), for placing
-/// the IME candidate window next to it. `None` when no text input has focus.
+/// Where the focused text field's caret is (window coordinates, layout units), for placing
+/// the IME candidate window next to it. `None` when no text field has focus.
 pub fn ime_cursor_area(tree: &WidgetTree, measure: &mut dyn TextMeasure) -> Option<Rect> {
     let id = tree.focused()?;
     let rect = tree.absolute_rect(id)?;
-    let Some(WidgetKind::TextInput { edit, font_size, scroll, preedit, .. }) = tree.kind(id) else { return None };
-    let (display, caret, _) = edit.composed(preedit.as_ref());
-    let x = rect.x + TEXT_INPUT_PADDING + measure.caret_x(&display, *font_size, caret) - scroll;
-    Some(Rect { x, y: rect.y, width: 1.0, height: rect.height })
+    match tree.kind(id) {
+        Some(WidgetKind::TextInput { edit, font_size, scroll, preedit, .. }) => {
+            let (display, caret, _) = edit.composed(preedit.as_ref());
+            let x = rect.x + TEXT_INPUT_PADDING + measure.caret_x(&display, *font_size, caret) - scroll;
+            Some(Rect { x, y: rect.y, width: 1.0, height: rect.height })
+        }
+        Some(WidgetKind::TextArea { edit, font_size, scroll_y, preedit, .. }) => {
+            let (display, caret, _) = edit.composed(preedit.as_ref());
+            let caret = caret.min(display.len());
+            let line_height = *font_size * LINE_HEIGHT_RATIO;
+            let line_start = display[..caret].rfind('\n').map_or(0, |i| i + 1);
+            let line_end = display[line_start..].find('\n').map_or(display.len(), |i| line_start + i);
+            let line = &display[line_start..line_end];
+            let local_caret = caret.saturating_sub(line_start).min(line.len());
+            let line_index = display[..line_start].bytes().filter(|&b| b == b'\n').count() as f32;
+            let x = rect.x + TEXT_INPUT_PADDING + measure.caret_x(line, *font_size, local_caret);
+            let y = rect.y + TEXT_INPUT_VERTICAL_PADDING + line_index * line_height - *scroll_y;
+            let _ = edit;
+            Some(Rect { x, y, width: 1.0, height: line_height })
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -312,7 +455,10 @@ mod tests {
         let root = tree.root();
         let id = tree.new_node(
             Style {
-                size: Size { width: Dimension::length(100.0 + 2.0 * TEXT_INPUT_PADDING + CARET_SLACK), height: Dimension::length(30.0) },
+                size: Size {
+                    width: Dimension::length(100.0 + 2.0 * TEXT_INPUT_PADDING + CARET_SLACK),
+                    height: Dimension::length(30.0),
+                },
                 ..Default::default()
             },
             WidgetKind::TextInput {
@@ -336,6 +482,42 @@ mod tests {
         Field { tree, id, changes, submits, mirror, clipboard: FakeClipboard::default() }
     }
 
+    fn area(text: &str) -> Field {
+        let changes = Arc::new(Mutex::new(Vec::new()));
+        let submits = Arc::new(Mutex::new(Vec::new()));
+        let mirror = Readback::new(text.to_owned());
+        let (c, s) = (changes.clone(), submits.clone());
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let id = tree.new_node(
+            Style {
+                size: Size {
+                    width: Dimension::length(200.0),
+                    height: Dimension::length(16.0 * LINE_HEIGHT_RATIO * 4.0 + 2.0 * TEXT_INPUT_VERTICAL_PADDING),
+                },
+                ..Default::default()
+            },
+            WidgetKind::TextArea {
+                edit: TextEdit::new_multiline(text),
+                placeholder: String::new(),
+                font_size: 16.0,
+                text_color: Color::TRANSPARENT,
+                placeholder_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                selection_color: Color::TRANSPARENT,
+                scroll_y: 0.0,
+                preedit: None,
+                on_change: Some(Arc::new(move |t| c.lock().unwrap().push(t))),
+                on_submit: Some(Arc::new(move |t| s.lock().unwrap().push(t))),
+                mirror: Some(mirror.clone()),
+            },
+        );
+        tree.add_child(root, id);
+        tree.compute_layout(400.0, 300.0);
+        tree.set_focus(Some(id));
+        Field { tree, id, changes, submits, mirror, clipboard: FakeClipboard::default() }
+    }
+
     impl Field {
         fn key(&mut self, key: Key, text: Option<&str>, modifiers: ModifiersState) -> bool {
             let press = KeyPress { key: &key, text, modifiers };
@@ -350,8 +532,11 @@ mod tests {
         }
 
         fn state(&self) -> (String, usize, f32) {
-            let Some(WidgetKind::TextInput { edit, scroll, .. }) = self.tree.kind(self.id) else { panic!() };
-            (edit.text().to_owned(), edit.caret(), *scroll)
+            match self.tree.kind(self.id) {
+                Some(WidgetKind::TextInput { edit, scroll, .. }) => (edit.text().to_owned(), edit.caret(), *scroll),
+                Some(WidgetKind::TextArea { edit, scroll_y, .. }) => (edit.text().to_owned(), edit.caret(), *scroll_y),
+                _ => panic!(),
+            }
         }
     }
 
@@ -408,9 +593,9 @@ mod tests {
         let mut f = field("0123456789abcde");
         f.key(Key::Named(NamedKey::End), None, ModifiersState::empty());
         let scroll = f.state().2;
-        handle_press(&mut f.tree, f.id, TEXT_INPUT_PADDING + 31.0, false, false, &mut Mono);
+        handle_press(&mut f.tree, f.id, TEXT_INPUT_PADDING + 31.0, 15.0, false, false, &mut Mono);
         assert_eq!(f.state().1, ((31.0 + scroll) / 10.0).round() as usize);
-        handle_drag(&mut f.tree, f.id, 500.0, &mut Mono);
+        handle_drag(&mut f.tree, f.id, 500.0, 15.0, &mut Mono);
         let Some(WidgetKind::TextInput { edit, .. }) = f.tree.kind(f.id) else { panic!() };
         assert_eq!(edit.selection().end, 15, "dragging past the edge selects to the end");
     }
@@ -427,5 +612,32 @@ mod tests {
         let Some(WidgetKind::TextInput { preedit, .. }) = f.tree.kind(f.id) else { panic!() };
         assert!(preedit.is_none());
         assert_eq!(*f.changes.lock().unwrap(), ["ab日本"]);
+    }
+
+    #[test]
+    fn textarea_enter_inserts_newline_and_cmd_enter_submits() {
+        let mut f = area("hi");
+        f.key(Key::Named(NamedKey::Enter), Some("\r"), ModifiersState::empty());
+        assert_eq!(f.state().0, "hi\n");
+        assert!(f.submits.lock().unwrap().is_empty(), "plain Enter does not submit");
+        f.typed("there");
+        assert_eq!(f.state().0, "hi\nthere");
+        f.key(Key::Named(NamedKey::Enter), Some("\r"), CMD);
+        assert_eq!(*f.submits.lock().unwrap(), ["hi\nthere"]);
+        assert_eq!(f.state().0, "hi\nthere", "Cmd/Ctrl+Enter does not insert another newline");
+    }
+
+    #[test]
+    fn textarea_arrows_move_by_line() {
+        let mut f = area("ab\ncde\nf");
+        f.key(Key::Named(NamedKey::Home), None, ModifiersState::empty());
+        // End of document first, then Home = line start of last line ("f").
+        assert_eq!(f.state().1, 7);
+        f.key(Key::Named(NamedKey::ArrowUp), None, ModifiersState::empty());
+        assert_eq!(f.state().1, 3);
+        f.key(Key::Named(NamedKey::End), None, ModifiersState::empty());
+        assert_eq!(f.state().1, 6);
+        f.key(Key::Named(NamedKey::Home), None, CMD);
+        assert_eq!(f.state().1, 0);
     }
 }
