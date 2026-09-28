@@ -16,7 +16,8 @@ crates/
     src/frame.rs              FrameSlot<T> (latest-wins mailbox), CpuFrame, PixelFormat
     src/widget.rs             WidgetTree (wraps taffy::TaffyTree), WidgetKind (including
                               Viewport), WidgetId, Color, hit_test / find_region_at, DropZone,
-                              keyboard focus (set_focus / focus_next)
+                              keyboard focus (set_focus / focus_next), ScrollArea offsets,
+                              clip rects, wheel scrolling and scrollbar geometry
     src/text_edit.rs          TextEdit (text + caret/selection + undo, grapheme-aware, no
                               fonts) and the TextMeasure trait chrome implements
 
@@ -26,7 +27,8 @@ crates/
                           boundary. Backends implement SurfaceBackend and call run().
     src/app.rs                App<B: SurfaceBackend>, ApplicationHandler, floaters, tear ghost
     src/command.rs            Command, EventWaker, CommandDispatch, RenderThreadHandles
-    src/surface.rs            SurfaceBackend trait + MainResizePolicy (Immediate vs Debounced)
+    src/surface.rs            SurfaceBackend trait + MainResizePolicy (Immediate vs Debounced),
+                              ViewportDraw (a Viewport's full rect + visible part → viewport/scissor)
     src/keyboard.rs           Tab/Escape focus keys; routes key presses to the focused widget
     src/text_input.rs         TextInput keys/mouse/IME/clipboard (arboard), caret scrolling
 
@@ -173,6 +175,17 @@ the shader (close to tiny-skia's path AA); sprites copy 1:1 from the atlas.
 dirty-rect diffs and returns a `ChromeFrame`; `set_chrome_frame` copies only the damage (Vulkan
 host-visible `LINEAR` image, Metal `replaceRegion`). A patch must match a full repaint to the
 byte (unit test at 1×/1.5×/2×). This path is also the pixel reference GPU tests compare against.
+
+**Clipping (`ScrollArea`).** Layout shifts a scroll area's children by its offset and records a
+clip rect for everything inside it (`WidgetTree::clip_rect`); `hit_test` ignores clipped-out
+parts. Chrome clips per op rather than per draw call: fills are intersected with the clip,
+anything wholly outside is dropped, and text runs / circles that straddle the edge carry a
+whole-pixel `Clip`. On the GPU a clipped text quad shrinks and shifts its atlas offset (still a
+1:1 copy), and a clipped circle becomes `QUAD_CIRCLE_CLIPPED`, whose coverage the shader
+multiplies by its (clipped) rect's box coverage — so no shader-side clip state or extra draw
+calls. `Viewport` layers inside a scroll area keep their full-size GPU viewport and are cut by
+the scissor (`ViewportDraw::viewport_and_scissor`), so a partly scrolled-out frame is cut off,
+not squashed. Scrollbars are overlay thumbs drawn as extra items after all content.
 
 Layout and hit-testing stay in points; chrome is built at the window's backing scale so Retina
 matches the Python window size. Viewport layers still use the fullscreen-triangle path

@@ -15,7 +15,7 @@ pub mod widget;
 
 pub use frame::{
     AtlasUpload, ChromeFrame, ChromeQuad, ChromeQuads, CpuFrame, FrameSlot, PixelFormat, PixelRect, QUAD_CIRCLE,
-    QUAD_SOLID, QUAD_SPRITE,
+    QUAD_CIRCLE_CLIPPED, QUAD_SOLID, QUAD_SPRITE,
 };
 pub use queue::{command_channel, oneshot_channel, CommandReceiver, CommandSender, OneshotReceiver, OneshotSender};
 pub use readback::Readback;

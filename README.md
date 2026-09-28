@@ -110,6 +110,7 @@ All under [`python/examples/`](python/examples/), runnable directly once install
 | [`cuda_viewport.py`](python/examples/cuda_viewport.py) | GPU-to-GPU CUDA→Vulkan interop, zero CPU copy. **Unverified — no NVIDIA GPU has tested this path. Not available on macOS.** |
 | [`widgets_demo.py`](python/examples/widgets_demo.py) | `Box` layout, `Label`, `Button`, `Slider`, click/drag input. |
 | [`text_input_demo.py`](python/examples/text_input_demo.py) | `TextInput` fields, keyboard focus (Tab/Shift+Tab), selection, clipboard, undo, IME. |
+| [`scroll_demo.py`](python/examples/scroll_demo.py) | `ScrollArea`: wheel/trackpad and scrollbar scrolling, clipping, a live `Viewport` inside, Tab scrolling focus into view. |
 | [`dock_layout.py`](python/examples/dock_layout.py) | A `DockArea` of resizable, titled `Panel`s with a live `Viewport` in the center. |
 | [`dock_rearrange_demo.py`](python/examples/dock_rearrange_demo.py) | Drag a panel's title bar to split or tab-merge regions, including dropping at the window's outer edge to span the whole dock area. |
 | [`tabs_demo.py`](python/examples/tabs_demo.py) | Multiple `Panel`s sharing one `DockArea` region via `Tabs`, switched by clicking a header segment. |
@@ -118,7 +119,7 @@ All under [`python/examples/`](python/examples/), runnable directly once install
 ## Widget API
 
 - **Layout**: `Box` (flexbox row/column via [`taffy`](https://github.com/DioxusLabs/taffy)),
-  `Splitter` (draggable divider between two panes).
+  `Splitter` (draggable divider between two panes), `ScrollArea` (scrollable, clipped viewport).
 - **Content**: `Label`, `Button`, `Slider`, `TextInput`, `Viewport` (arbitrary CPU/GPU frame content).
 - **Docking**: `Panel` (titled, draggable container), `Tabs` (several `Panel`s sharing one
   region), `DockArea` (a split-tree of panels/tabs with full drag-to-rearrange — split, tab-merge

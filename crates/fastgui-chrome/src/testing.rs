@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use fastgui_core::taffy::prelude::*;
 use fastgui_core::widget::{Color, DropZone, WidgetKind, WidgetTree};
-use fastgui_core::{ChromeQuads, QUAD_CIRCLE};
+use fastgui_core::{ChromeQuads, QUAD_CIRCLE, QUAD_CIRCLE_CLIPPED};
 
 use crate::ChromeRenderer;
 
@@ -60,6 +60,54 @@ fn scene() -> (WidgetTree, fastgui_core::widget::WidgetId, fastgui_core::widget:
     (tree, slider, label.expect("five labels"))
 }
 
+/// A scroll area over a column of labels ending in a slider, so scrolling it clips text and the
+/// slider thumb (the clipped-circle quad kind). Returns (tree, area, slider).
+fn scroll_scene() -> (WidgetTree, fastgui_core::widget::WidgetId, fastgui_core::widget::WidgetId) {
+    let mut tree = WidgetTree::new();
+    let text = Color([0.9, 0.9, 0.92, 1.0]);
+    let area = tree.new_node(
+        Style {
+            flex_direction: FlexDirection::Column,
+            size: Size { width: length(220.0_f32), height: length(110.0_f32) },
+            margin: Rect { left: length(20.0_f32), top: length(20.0_f32), right: length(0.0_f32), bottom: length(0.0_f32) },
+            ..Default::default()
+        },
+        WidgetKind::ScrollArea {
+            offset: (0.0, 0.0),
+            background: Color([0.16, 0.17, 0.2, 1.0]),
+            bar_color: Color([1.0, 1.0, 1.0, 0.35]),
+        },
+    );
+    let root = tree.root();
+    tree.add_child(root, area);
+    let column = tree.new_node(
+        Style { flex_direction: FlexDirection::Column, gap: length(4.0_f32), ..Default::default() },
+        WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+    );
+    tree.add_child(area, column);
+    for i in 0..6 {
+        let l = tree.new_node(
+            Style::default(),
+            WidgetKind::Label { text: format!("Scrolled row {i}"), font_size: 13.0, color: text },
+        );
+        tree.add_child(column, l);
+    }
+    let slider = tree.new_node(
+        Style { size: Size { width: Dimension::auto(), height: length(24.0_f32) }, ..Default::default() },
+        WidgetKind::Slider {
+            value: 0.5,
+            min: 0.0,
+            max: 1.0,
+            track_color: Color([0.3, 0.3, 0.35, 1.0]),
+            thumb_color: Color([0.4, 0.65, 1.0, 1.0]),
+            on_change: None,
+        },
+    );
+    tree.add_child(column, slider);
+    tree.set_scroll_container(area);
+    (tree, area, slider)
+}
+
 /// GPU pixels vs the CPU painter: solid fills and text within rounding, the slider thumb's
 /// anti-aliased rim within a looser bound (analytic vs supersampled coverage).
 fn assert_matches(gpu: &[u8], cpu: &[u8], width: u32, thumb: Option<[f32; 4]>, what: &str) {
@@ -101,7 +149,7 @@ pub fn check_gpu_backend<G>(
             tree.compute_layout(w as f32 / scale, h as f32 / scale);
             let frame = quads.build_quads(tree, w, h, drop, scale);
             if let Some(frame) = &frame {
-                thumb = frame.quads.iter().find(|q| q.kind == QUAD_CIRCLE).map(|q| q.rect);
+                thumb = frame.quads.iter().find(|q| q.kind == QUAD_CIRCLE || q.kind == QUAD_CIRCLE_CLIPPED).map(|q| q.rect);
             }
             let drawn = draw(&mut target, frame);
             cpu.invalidate();
@@ -126,5 +174,21 @@ pub fn check_gpu_backend<G>(
         let region = tree.find_region_rect(1).expect("the panel is region 1");
         check(&mut tree, Some((region, DropZone::Right)), "translucent drop indicator");
         check(&mut tree, Some((region, DropZone::Right)), "unchanged frame (no new quads)");
+
+        // Scrolled content: the area's bottom edge cuts through text and the slider thumb.
+        let (mut scrolled, area, scrolled_slider) = scroll_scene();
+        scrolled.compute_layout(w as f32 / scale, h as f32 / scale);
+        let (a, s) = (scrolled.absolute_rect(area).unwrap(), scrolled.absolute_rect(scrolled_slider).unwrap());
+        let offset = s.y + s.height / 2.0 - (a.y + a.height);
+        assert!(scrolled.set_scroll_offset(area, 0.0, offset), "the column overflows the area");
+        scrolled.compute_layout(w as f32 / scale, h as f32 / scale);
+        let probe = ChromeRenderer::new().build_quads(&scrolled, w, h, None, scale).map(|f| f.quads.to_vec());
+        assert!(
+            probe.is_some_and(|q| q.iter().any(|q| q.kind == QUAD_CIRCLE_CLIPPED)),
+            "the scene must exercise the clipped-circle shader path"
+        );
+        check(&mut scrolled, None, "scroll area clipping text and the slider thumb");
+        scrolled.set_scroll_offset(area, 0.0, offset + 7.5);
+        check(&mut scrolled, None, "scrolled a fractional step further");
     }
 }

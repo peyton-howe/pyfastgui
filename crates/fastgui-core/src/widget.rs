@@ -52,6 +52,13 @@ const CLOSE_MAX_WIDTH_FRACTION: f32 = 0.4;
 pub const TEXT_INPUT_PADDING: f32 = 8.0;
 const TEXT_INPUT_VERTICAL_PADDING: f32 = 6.0;
 
+/// Scrollbar thickness and inset from the scroll area's edge (layout units). Overlay bars:
+/// drawn over the content's edge rather than taking layout space.
+pub const SCROLLBAR_WIDTH: f32 = 6.0;
+const SCROLLBAR_INSET: f32 = 2.0;
+/// Shortest a scrollbar thumb gets, so a very long list still has something to grab.
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
 /// How far (layout units, each side, across the bar) a press still grabs a `Splitter` bar —
 /// see `WidgetTree::splitter_at`. The bar keeps its drawn thickness; only the hit area grows.
 pub const SPLITTER_HIT_SLOP: f32 = 5.0;
@@ -238,6 +245,12 @@ pub enum WidgetKind {
         on_submit: Option<TextCallback>,
         mirror: Option<Readback<String>>,
     },
+    /// A viewport onto its (usually single) child, scrolled by `offset` (layout units, both
+    /// axes; clamped to the content's overflow at each layout). Children lay out at their
+    /// natural size and are shifted by `-offset`; everything inside is clipped to this node's
+    /// rect (see `WidgetTree::clip_rect`) and can't be clicked where it's clipped out.
+    /// Overflowing axes get overlay scrollbars (`scrollbar_thumbs`), drawn in `bar_color`.
+    ScrollArea { offset: (f32, f32), background: Color, bar_color: Color },
     /// A GPU/CPU image rect composited on top of chrome. `frames` is the same latest-wins
     /// mailbox `Viewport.submit_frame` writes; `viewport_id` is a stable identity for the
     /// renderer's GPU texture cache across tree rebuilds (unlike `WidgetId`).
@@ -265,6 +278,14 @@ pub struct Rect {
 }
 
 impl Rect {
+    /// The overlap of two rects (zero-sized, not negative, when they don't overlap).
+    pub fn intersect(&self, other: &Rect) -> Rect {
+        let (x0, y0) = (self.x.max(other.x), self.y.max(other.y));
+        let x1 = (self.x + self.width).min(other.x + other.width);
+        let y1 = (self.y + self.height).min(other.y + other.height);
+        Rect { x: x0, y: y0, width: (x1 - x0).max(0.0), height: (y1 - y0).max(0.0) }
+    }
+
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
     }
@@ -315,6 +336,11 @@ pub struct WidgetTree {
     /// nothing about the UI actually changed.
     dirty: bool,
     absolute_rects: HashMap<WidgetId, Rect>,
+    /// For nodes inside a `ScrollArea`: the visible part of the window they may draw in and be
+    /// clicked in (the intersection of every enclosing scroll area's rect).
+    clip_rects: HashMap<WidgetId, Rect>,
+    /// Each `ScrollArea`'s content size (layout units), from the last layout.
+    scroll_content: HashMap<WidgetId, Size<f32>>,
     /// The widget keyboard input goes to (see `fastgui-app`'s key handling). Cleared by
     /// `reset`, so a `set_content` rebuild starts unfocused.
     focused: Option<WidgetId>,
@@ -336,7 +362,16 @@ impl WidgetTree {
         let root = taffy.new_leaf(root_style()).expect("creating the root node cannot fail");
         let mut kinds = HashMap::new();
         kinds.insert(root, WidgetKind::Container { background: Color::TRANSPARENT, region_id: None });
-        Self { taffy, kinds, root, dirty: true, absolute_rects: HashMap::new(), focused: None }
+        Self {
+            taffy,
+            kinds,
+            root,
+            dirty: true,
+            absolute_rects: HashMap::new(),
+            clip_rects: HashMap::new(),
+            scroll_content: HashMap::new(),
+            focused: None,
+        }
     }
 
     pub fn root(&self) -> WidgetId {
@@ -409,6 +444,23 @@ impl WidgetTree {
         self.mark_dirty();
     }
 
+    /// Make `id` (a `ScrollArea`) a scroll container: overflow scrolls on both axes (so taffy
+    /// lets it be smaller than its content and reports the content's size), with no layout
+    /// space reserved for scrollbars (ours overlay the content), and its children keep their
+    /// natural size instead of shrinking to fit. Call once its children are added.
+    pub fn set_scroll_container(&mut self, id: WidgetId) {
+        let Some(mut style) = self.taffy.style(id).ok().cloned() else { return };
+        style.overflow = taffy::geometry::Point { x: taffy::style::Overflow::Scroll, y: taffy::style::Overflow::Scroll };
+        style.scrollbar_width = 0.0;
+        let _ = self.taffy.set_style(id, style);
+        for child in self.taffy.children(id).unwrap_or_default() {
+            let Some(mut style) = self.taffy.style(child).ok().cloned() else { continue };
+            style.flex_shrink = 0.0;
+            let _ = self.taffy.set_style(child, style);
+        }
+        self.mark_dirty();
+    }
+
     /// Used by `TabBar` click handling (`fastgui-app::app`) to show/hide a tab's content
     /// wrapper without touching anything else about its style.
     pub fn set_display(&mut self, id: WidgetId, visible: bool) {
@@ -467,19 +519,182 @@ impl WidgetTree {
             },
         );
 
+        // Scroll offsets can't exceed the (possibly just shrunk) content's overflow.
+        self.scroll_content.clear();
+        for (&id, kind) in self.kinds.iter_mut() {
+            let WidgetKind::ScrollArea { offset, .. } = kind else { continue };
+            let Ok(layout) = self.taffy.layout(id) else { continue };
+            self.scroll_content.insert(id, layout.content_size);
+            let max = max_scroll(layout.size, layout.content_size);
+            *offset = (offset.0.clamp(0.0, max.0), offset.1.clamp(0.0, max.1));
+        }
+
         self.absolute_rects.clear();
-        let mut stack = vec![(self.root, 0.0f32, 0.0f32)];
-        while let Some((id, parent_x, parent_y)) = stack.pop() {
+        self.clip_rects.clear();
+        let mut stack: Vec<(WidgetId, f32, f32, Option<Rect>)> = vec![(self.root, 0.0, 0.0, None)];
+        while let Some((id, parent_x, parent_y, clip)) = stack.pop() {
             let Ok(layout) = self.taffy.layout(id) else { continue };
             let x = parent_x + layout.location.x;
             let y = parent_y + layout.location.y;
-            self.absolute_rects.insert(id, Rect { x, y, width: layout.size.width, height: layout.size.height });
+            let rect = Rect { x, y, width: layout.size.width, height: layout.size.height };
+            self.absolute_rects.insert(id, rect);
+            if let Some(clip) = clip {
+                self.clip_rects.insert(id, clip);
+            }
+            // A scroll area shifts its children by its offset and clips them to itself.
+            let (child_x, child_y, child_clip) = match self.kinds.get(&id) {
+                Some(WidgetKind::ScrollArea { offset, .. }) => {
+                    (x - offset.0, y - offset.1, Some(clip.map_or(rect, |c| c.intersect(&rect))))
+                }
+                _ => (x, y, clip),
+            };
             if let Ok(children) = self.taffy.children(id) {
                 for child in children {
-                    stack.push((child, x, y));
+                    stack.push((child, child_x, child_y, child_clip));
                 }
             }
         }
+    }
+
+    /// Where `id` may draw and be clicked, if something clips it (it's inside a `ScrollArea`).
+    pub fn clip_rect(&self, id: WidgetId) -> Option<Rect> {
+        self.clip_rects.get(&id).copied()
+    }
+
+    /// Whether `(x, y)` lands on a visible part of `id`: inside its rect and its clip.
+    fn visible_at(&self, id: WidgetId, x: f32, y: f32) -> bool {
+        self.absolute_rect(id).is_some_and(|r| r.contains(x, y))
+            && self.clip_rects.get(&id).is_none_or(|c| c.contains(x, y))
+    }
+
+    /// How far `id` (a `ScrollArea`) can scroll on each axis, from the last layout.
+    pub fn scroll_extent(&self, id: WidgetId) -> Option<(f32, f32)> {
+        let content = *self.scroll_content.get(&id)?;
+        Some(max_scroll(self.taffy.layout(id).ok()?.size, content))
+    }
+
+    /// Set a `ScrollArea`'s offset (clamped). Returns whether it moved.
+    pub fn set_scroll_offset(&mut self, id: WidgetId, x: f32, y: f32) -> bool {
+        let Some(max) = self.scroll_extent(id) else { return false };
+        let target = (x.clamp(0.0, max.0), y.clamp(0.0, max.1));
+        let Some(WidgetKind::ScrollArea { offset, .. }) = self.kinds.get_mut(&id) else { return false };
+        if *offset == target {
+            return false;
+        }
+        *offset = target;
+        self.mark_dirty();
+        true
+    }
+
+    /// Scroll by `(dx, dy)` (layout units; positive reveals content further right/down) the
+    /// innermost `ScrollArea` under `(x, y)` that can still move that way; one at its limit
+    /// passes the scroll out to the one around it. Returns whether anything scrolled.
+    pub fn scroll_at(&mut self, x: f32, y: f32, dx: f32, dy: f32) -> bool {
+        let areas: Vec<WidgetId> = self
+            .walk()
+            .filter(|&id| matches!(self.kind(id), Some(WidgetKind::ScrollArea { .. })) && self.visible_at(id, x, y))
+            .collect();
+        // `walk` visits parents first, so the innermost area comes last.
+        for id in areas.into_iter().rev() {
+            let Some(WidgetKind::ScrollArea { offset, .. }) = self.kind(id) else { continue };
+            let (ox, oy) = *offset;
+            if self.set_scroll_offset(id, ox + dx, oy + dy) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Scroll every `ScrollArea` around `id` just enough to bring `id`'s rect into view — used
+    /// when keyboard focus moves to something scrolled out of sight.
+    pub fn scroll_into_view(&mut self, id: WidgetId) {
+        let Some(target) = self.absolute_rect(id) else { return };
+        let mut node = id;
+        while let Some(parent) = self.taffy.parent(node) {
+            node = parent;
+            let (Some(WidgetKind::ScrollArea { offset, .. }), Some(view)) = (self.kind(node), self.absolute_rect(node))
+            else {
+                continue;
+            };
+            let (mut ox, mut oy) = *offset;
+            // Where the target sits in the area's content, and the part of it now in view.
+            let (tx, ty) = (target.x - view.x + ox, target.y - view.y + oy);
+            ox = ox.min(tx).max(tx + target.width - view.width);
+            oy = oy.min(ty).max(ty + target.height - view.height);
+            self.set_scroll_offset(node, ox, oy);
+        }
+    }
+
+    /// A `ScrollArea`'s overlay scrollbar thumbs (vertical, horizontal), in window layout
+    /// units; `None` for an axis that doesn't overflow. Shared by chrome (drawing) and
+    /// `fastgui-app` (dragging) so the drawn thumb is the one you grab.
+    pub fn scrollbar_thumbs(&self, id: WidgetId) -> (Option<Rect>, Option<Rect>) {
+        let (Some(WidgetKind::ScrollArea { offset, .. }), Some(rect)) = (self.kind(id), self.absolute_rect(id)) else {
+            return (None, None);
+        };
+        let corner = SCROLLBAR_WIDTH + SCROLLBAR_INSET;
+        let v = self.scrollbar_track(id, true).map(|track| {
+            let y = track.start + track.travel() * (offset.1 / track.max);
+            Rect { x: rect.x + rect.width - corner, y, width: SCROLLBAR_WIDTH, height: track.thumb }
+        });
+        let h = self.scrollbar_track(id, false).map(|track| {
+            let x = track.start + track.travel() * (offset.0 / track.max);
+            Rect { x, y: rect.y + rect.height - corner, width: track.thumb, height: SCROLLBAR_WIDTH }
+        });
+        (v, h)
+    }
+
+    /// The scroll area whose scrollbar thumb is at `(x, y)` (with `slop` extra across the bar),
+    /// and whether it's the vertical one. Checked before other hit tests, like splitters.
+    pub fn scrollbar_at(&self, x: f32, y: f32, slop: f32) -> Option<(WidgetId, bool)> {
+        let areas: Vec<WidgetId> =
+            self.walk().filter(|&id| matches!(self.kind(id), Some(WidgetKind::ScrollArea { .. }))).collect();
+        areas.into_iter().rev().find_map(|id| {
+            if self.clip_rects.get(&id).is_some_and(|c| !c.contains(x, y)) {
+                return None;
+            }
+            let (v, h) = self.scrollbar_thumbs(id);
+            let grown_v = v.map(|r| Rect { x: r.x - slop, width: r.width + 2.0 * slop, ..r });
+            let grown_h = h.map(|r| Rect { y: r.y - slop, height: r.height + 2.0 * slop, ..r });
+            if grown_v.is_some_and(|r| r.contains(x, y)) {
+                Some((id, true))
+            } else if grown_h.is_some_and(|r| r.contains(x, y)) {
+                Some((id, false))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Scroll `id` so its vertical (or horizontal) thumb starts at `thumb_start` (window layout
+    /// units along the bar) — dragging a scrollbar. Returns whether it moved.
+    pub fn drag_scrollbar(&mut self, id: WidgetId, vertical: bool, thumb_start: f32) -> bool {
+        let Some(track) = self.scrollbar_track(id, vertical) else { return false };
+        let Some(WidgetKind::ScrollArea { offset, .. }) = self.kind(id) else { return false };
+        let fraction = if track.travel() > 0.0 { (thumb_start - track.start) / track.travel() } else { 0.0 };
+        let value = fraction.clamp(0.0, 1.0) * track.max;
+        let (x, y) = if vertical { (offset.0, value) } else { (value, offset.1) };
+        self.set_scroll_offset(id, x, y)
+    }
+
+    fn scrollbar_track(&self, id: WidgetId, vertical: bool) -> Option<ScrollTrack> {
+        let rect = self.absolute_rect(id)?;
+        let content = *self.scroll_content.get(&id)?;
+        let max = self.scroll_extent(id)?;
+        let (axis_max, other_max) = if vertical { (max.1, max.0) } else { (max.0, max.1) };
+        if axis_max <= 0.0 {
+            return None;
+        }
+        let (start, extent, visible, content) = if vertical {
+            (rect.y, rect.height, rect.height, content.height)
+        } else {
+            (rect.x, rect.width, rect.width, content.width)
+        };
+        // Leave the corner free when both bars show.
+        let corner = if other_max > 0.0 { SCROLLBAR_WIDTH + SCROLLBAR_INSET } else { 0.0 };
+        let length = (extent - 2.0 * SCROLLBAR_INSET - corner).max(0.0);
+        let thumb = (length * visible / content).clamp(SCROLLBAR_MIN_THUMB.min(length), length);
+        Some(ScrollTrack { start: start + SCROLLBAR_INSET, length, thumb, max: axis_max })
     }
 
     pub fn absolute_rect(&self, id: WidgetId) -> Option<Rect> {
@@ -502,7 +717,7 @@ impl WidgetTree {
     /// Topmost (last-drawn-on-top wins) widget whose rect contains `(x, y)`, for click/drag
     /// hit-testing. Depth-first-last-child-wins matches normal painter's-algorithm z-order.
     pub fn hit_test(&self, x: f32, y: f32) -> Option<WidgetId> {
-        self.walk().filter(|&id| self.absolute_rect(id).is_some_and(|r| r.contains(x, y))).last()
+        self.walk().filter(|&id| self.visible_at(id, x, y)).last()
     }
 
     /// The `Splitter` bar whose rect, widened by `slop` on both sides across the bar (x for a
@@ -514,7 +729,7 @@ impl WidgetTree {
         for id in self.walk() {
             let Some(WidgetKind::Splitter { direction, .. }) = self.kind(id) else { continue };
             let Some(rect) = self.absolute_rect(id) else { continue };
-            if rect.width <= 0.0 || rect.height <= 0.0 {
+            if rect.width <= 0.0 || rect.height <= 0.0 || self.clip_rects.get(&id).is_some_and(|c| !c.contains(x, y)) {
                 continue;
             }
             let grown = match direction {
@@ -610,6 +825,27 @@ impl WidgetTree {
     }
 }
 
+/// One scrollbar's geometry along its axis (window layout units).
+struct ScrollTrack {
+    start: f32,
+    length: f32,
+    thumb: f32,
+    /// The scroll area's maximum offset on this axis.
+    max: f32,
+}
+
+impl ScrollTrack {
+    /// How far the thumb's start can move along the track.
+    fn travel(&self) -> f32 {
+        self.length - self.thumb
+    }
+}
+
+/// How far content of `content` size can scroll inside a `size` viewport, per axis.
+fn max_scroll(size: Size<f32>, content: Size<f32>) -> (f32, f32) {
+    ((content.width - size.width).max(0.0), (content.height - size.height).max(0.0))
+}
+
 impl Default for WidgetTree {
     fn default() -> Self {
         Self::new()
@@ -658,6 +894,7 @@ fn measure_leaf(
             | WidgetKind::Splitter { .. }
             | WidgetKind::TabBar { .. }
             | WidgetKind::PanelTitleBar { .. }
+            | WidgetKind::ScrollArea { .. }
             | WidgetKind::Viewport { .. },
         )
         | None => Size::ZERO,
@@ -1014,6 +1251,150 @@ mod tests {
         tree.set_focus(Some(a));
         tree.reset();
         assert_eq!(tree.focused(), None);
+    }
+
+    /// A 100×100 scroll area at (0,0) holding a column of ten 40-tall buttons (400 tall), and
+    /// inside that a nested 100×60 scroll area as the first child holding 120 of content.
+    fn scroll_tree() -> (WidgetTree, WidgetId, WidgetId, Vec<WidgetId>) {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let area_style = |h: f32| Style {
+            overflow: taffy::geometry::Point { x: taffy::style::Overflow::Scroll, y: taffy::style::Overflow::Scroll },
+            scrollbar_width: 0.0,
+            size: Size { width: Dimension::length(100.0), height: Dimension::length(h) },
+            flex_shrink: 0.0,
+            ..Default::default()
+        };
+        let area = |tree: &mut WidgetTree, h: f32| {
+            tree.new_node(
+                area_style(h),
+                WidgetKind::ScrollArea { offset: (0.0, 0.0), background: Color::TRANSPARENT, bar_color: Color::TRANSPARENT },
+            )
+        };
+        let column = |tree: &mut WidgetTree| {
+            tree.new_node(
+                Style { flex_direction: FlexDirection::Column, flex_shrink: 0.0, ..Default::default() },
+                WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+            )
+        };
+        let button = |tree: &mut WidgetTree, h: f32| {
+            tree.new_node(
+                Style { size: Size { width: Dimension::length(80.0), height: Dimension::length(h) }, flex_shrink: 0.0, ..Default::default() },
+                WidgetKind::Button {
+                    text: String::new(),
+                    font_size: 12.0,
+                    text_color: Color::TRANSPARENT,
+                    background: Color::TRANSPARENT,
+                    on_click: None,
+                },
+            )
+        };
+        let outer = area(&mut tree, 100.0);
+        let outer_column = column(&mut tree);
+        let inner = area(&mut tree, 60.0);
+        let inner_column = column(&mut tree);
+        let inner_button = button(&mut tree, 120.0);
+        tree.add_child(root, outer);
+        tree.add_child(outer, outer_column);
+        tree.add_child(outer_column, inner);
+        tree.add_child(inner, inner_column);
+        tree.add_child(inner_column, inner_button);
+        let buttons: Vec<_> = (0..10).map(|_| button(&mut tree, 40.0)).collect();
+        for &b in &buttons {
+            tree.add_child(outer_column, b);
+        }
+        tree.compute_layout(300.0, 300.0);
+        (tree, outer, inner, buttons)
+    }
+
+    #[test]
+    fn scroll_area_offsets_children_and_clamps() {
+        let (mut tree, outer, _, buttons) = scroll_tree();
+        assert_eq!(tree.scroll_extent(outer), Some((0.0, 360.0)), "60 + 10×40 content in 100");
+        assert!(tree.set_scroll_offset(outer, 0.0, 100.0));
+        tree.compute_layout(300.0, 300.0);
+        assert_eq!(tree.absolute_rect(buttons[0]).unwrap().y, 60.0 - 100.0);
+        assert!(tree.set_scroll_offset(outer, 50.0, 1e6), "clamps rather than refusing");
+        let Some(WidgetKind::ScrollArea { offset, .. }) = tree.kind(outer) else { panic!() };
+        assert_eq!(*offset, (0.0, 360.0));
+        assert!(!tree.set_scroll_offset(outer, 0.0, 999.0), "already at the end");
+    }
+
+    #[test]
+    fn clipped_content_is_not_hit_and_clip_rect_is_the_area() {
+        let (mut tree, outer, _, buttons) = scroll_tree();
+        // buttons[1] spans y 100..140 unscrolled — entirely below the 100-tall area.
+        assert_eq!(tree.hit_test(40.0, 120.0), Some(tree.root()));
+        assert_eq!(tree.clip_rect(buttons[1]).map(|c| (c.y, c.height)), Some((0.0, 100.0)));
+        tree.set_scroll_offset(outer, 0.0, 60.0);
+        tree.compute_layout(300.0, 300.0);
+        assert_eq!(tree.hit_test(40.0, 50.0), Some(buttons[1]));
+        assert!(tree.clip_rect(outer).is_none(), "the area itself isn't clipped");
+    }
+
+    #[test]
+    fn wheel_scrolls_innermost_area_then_hands_off() {
+        let (mut tree, outer, inner, _) = scroll_tree();
+        let offset = |tree: &WidgetTree, id| match tree.kind(id) {
+            Some(WidgetKind::ScrollArea { offset, .. }) => offset.1,
+            _ => panic!(),
+        };
+        assert!(tree.scroll_at(10.0, 10.0, 0.0, 50.0));
+        assert_eq!((offset(&tree, inner), offset(&tree, outer)), (50.0, 0.0), "inner first");
+        tree.compute_layout(300.0, 300.0);
+        assert!(tree.scroll_at(10.0, 10.0, 0.0, 50.0));
+        assert_eq!((offset(&tree, inner), offset(&tree, outer)), (60.0, 0.0), "inner reaches its end (60)");
+        assert!(tree.scroll_at(10.0, 10.0, 0.0, 50.0));
+        assert_eq!(offset(&tree, outer), 50.0, "then the outer one scrolls");
+        assert!(!tree.scroll_at(250.0, 250.0, 0.0, 50.0), "nothing to scroll out there");
+    }
+
+    #[test]
+    fn scroll_into_view_reveals_focused_widget() {
+        let (mut tree, outer, _, buttons) = scroll_tree();
+        tree.scroll_into_view(buttons[5]); // content y 260..300
+        tree.compute_layout(300.0, 300.0);
+        let rect = tree.absolute_rect(buttons[5]).unwrap();
+        assert_eq!((rect.y, rect.y + rect.height), (60.0, 100.0), "bottom-aligned, the minimum scroll");
+        tree.scroll_into_view(buttons[0]);
+        tree.compute_layout(300.0, 300.0);
+        assert_eq!(tree.absolute_rect(buttons[0]).unwrap().y, 0.0);
+        let Some(WidgetKind::ScrollArea { offset, .. }) = tree.kind(outer) else { panic!() };
+        assert_eq!(offset.1, 60.0);
+    }
+
+    #[test]
+    fn scrollbar_thumb_tracks_offset() {
+        let (mut tree, outer, _, _) = scroll_tree();
+        let (v, h) = tree.scrollbar_thumbs(outer);
+        assert!(h.is_none(), "no horizontal overflow");
+        let v = v.unwrap();
+        assert_eq!((v.y, v.width), (SCROLLBAR_INSET, SCROLLBAR_WIDTH));
+        assert_eq!(v.height, SCROLLBAR_MIN_THUMB, "96 × 100/460 ≈ 21 is below the minimum");
+        tree.set_scroll_offset(outer, 0.0, 360.0);
+        let end = tree.scrollbar_thumbs(outer).0.unwrap();
+        assert!((end.y + end.height - (100.0 - SCROLLBAR_INSET)).abs() < 1e-3, "thumb at the bottom of the track");
+    }
+
+    #[test]
+    fn dragging_thumb_maps_back_to_offset() {
+        let (mut tree, outer, inner, _) = scroll_tree();
+        // The nested area is as wide as the outer one, so its thumb shares the column; move it
+        // down out of the way (where both overlap, the inner one wins, as for the wheel).
+        let inner_thumb = tree.scrollbar_thumbs(inner).0.unwrap();
+        assert_eq!(tree.scrollbar_at(inner_thumb.x + 1.0, inner_thumb.y + 5.0, 3.0), Some((inner, true)));
+        tree.set_scroll_offset(inner, 0.0, 60.0);
+        let thumb = tree.scrollbar_thumbs(outer).0.unwrap();
+        assert_eq!(tree.scrollbar_at(thumb.x + 1.0, thumb.y + 5.0, 3.0), Some((outer, true)));
+        assert_eq!(tree.scrollbar_at(thumb.x - 2.0, thumb.y + 5.0, 3.0), Some((outer, true)), "slop");
+        assert_eq!(tree.scrollbar_at(thumb.x + 1.0, 90.0, 3.0), None, "the track below the thumb isn't a grab");
+        // Halfway along the travel is half the extent.
+        let travel = 100.0 - 2.0 * SCROLLBAR_INSET - thumb.height;
+        assert!(tree.drag_scrollbar(outer, true, thumb.y + travel / 2.0));
+        let Some(WidgetKind::ScrollArea { offset, .. }) = tree.kind(outer) else { panic!() };
+        assert!((offset.1 - 180.0).abs() < 1e-3, "{offset:?}");
+        assert!(tree.drag_scrollbar(outer, true, 1e6));
+        assert_eq!(tree.scrollbar_thumbs(outer).0.map(|t| t.y + t.height), Some(100.0 - SCROLLBAR_INSET));
     }
 
     #[test]

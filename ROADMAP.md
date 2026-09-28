@@ -1246,7 +1246,19 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
    are per glyph cluster, correct for LTR only).
 3. **Scroll container + clipping** — needs per-quad clip rects in the GPU quad pipeline (Vulkan
    and Metal). The GPU chrome path already makes scroll cheap (~128 KiB/frame upload in
-   `chrome_bench`'s table scene vs 24 MiB on the CPU path).
+   `chrome_bench`'s table scene vs 24 MiB on the CPU path). **Done (2026-09-27):** `WidgetKind::ScrollArea` /
+   Python `fg.ScrollArea(content)` (`scroll_to`). Turned out not to need per-quad clip rects:
+   chrome clips per op (fills intersected, straddling text/circles carry a whole-pixel `Clip`),
+   the GPU builder shrinks clipped sprite quads and emits a new `QUAD_CIRCLE_CLIPPED` kind (one
+   extra shader branch on each backend, SPIR-V rebuilt). Wheel/trackpad scrolling with nested
+   hand-off, draggable overlay scrollbars, clipped hit-testing, Tab scrolls focus into view.
+   `Viewport`s inside keep their size and are scissored (fixed a latent squash: backends used to
+   clamp a partly off-window viewport's rect). The CPU chrome path clips too (sprite blits honor
+   the clip). Verified: core/chrome unit tests, GPU-emulation vs CPU-painter parity at fractional
+   offsets and 1×/1.5×/2×, and the shared real-GPU scenario on Metal and MoltenVK (with
+   validation) including a clipped thumb. Demo: `scroll_demo.py`. **Still open:** click on the
+   scrollbar track to page, kinetic/momentum scrolling beyond what the OS reports, and
+   virtualization (7A.5) for very long lists.
 4. **Overlay / popup layer** — z-ordered layer above content, dismiss-on-outside-click. Grow it
    out of the floating-panel machinery. Unblocks menus, combos, tooltips, dialogs.
 5. **Virtualization** — build only visible rows; required for lists/trees/tables to scale.

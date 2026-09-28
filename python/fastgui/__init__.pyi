@@ -78,7 +78,23 @@ class TextInput:
     def set_text(self, text: str) -> None:
         """Replace the text without calling `on_change`. Works before the field is attached."""
 
-Widget = Union[Label, Button, Slider, TextInput, "Box", "Splitter", "Panel", "Tabs", "DockArea", Viewport]
+class ScrollArea:
+    """A scrollable viewport onto `content`. The mouse wheel / trackpad scrolls it (the innermost
+    scroll area that can still move takes the scroll), overflowing axes get draggable overlay
+    scrollbars, and content outside it is clipped. Tab-focusing a widget scrolls it into view."""
+    def __init__(
+        self,
+        content: Widget,
+        flex_grow: float = 1.0,
+        width: float | None = None,
+        height: float | None = None,
+        background: RGBA = (0.0, 0.0, 0.0, 0.0),
+        bar_color: RGBA = (1.0, 1.0, 1.0, 0.35),
+    ) -> None: ...
+    def scroll_to(self, x: float, y: float) -> None:
+        """Scroll so content point `(x, y)` is at the top-left (clamped)."""
+
+Widget = Union[Label, Button, Slider, TextInput, "ScrollArea", "Box", "Splitter", "Panel", "Tabs", "DockArea", Viewport]
 
 class Box:
     def __init__(

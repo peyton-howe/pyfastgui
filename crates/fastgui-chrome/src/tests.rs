@@ -15,10 +15,10 @@ fn cached_run_blit_matches_per_pixel_fill_rect() {
     let mut chrome = ChromeRenderer::new();
     let mut ops = Vec::new();
     chrome.push_text(&mut ops, rect, text, font_size, color);
-    let [Op::Text { run, x, y }] = ops.as_slice() else { panic!("expected one text op") };
+    let [Op::Text { run, x, y, .. }] = ops.as_slice() else { panic!("expected one text op") };
     let mut blitted = Pixmap::new(260, 40).unwrap();
     blitted.fill(background);
-    blit_sprite(&mut blitted, run, x + run.x, y + run.y);
+    blit_sprite(&mut blitted, run, x + run.x, y + run.y, None);
 
     let mut per_pixel = Pixmap::new(260, 40).unwrap();
     per_pixel.fill(background);
@@ -278,7 +278,7 @@ fn check_gpu_matches_cpu(
         .gpu
         .quads
         .iter()
-        .filter(|q| q.kind == fastgui_core::QUAD_CIRCLE)
+        .filter(|q| q.kind == fastgui_core::QUAD_CIRCLE || q.kind == fastgui_core::QUAD_CIRCLE_CLIPPED)
         .map(|q| pixel_bounds(q.rect[0], q.rect[1], q.rect[2], q.rect[3], PixelRect { x: 0, y: 0, width: w, height: h }))
         .collect();
     for (i, (a, b)) in drawn.as_chunks::<4>().0.iter().zip(reference.as_chunks::<4>().0).enumerate() {
@@ -522,4 +522,110 @@ fn empty_unfocused_text_input_shows_placeholder_without_caret() {
     let items = chrome.build_items(&tree, None, 1.0, PixelRect { x: 0, y: 0, width: 400, height: 100 });
     let field = &items.iter().find(|item| item.key == u64::from(input)).unwrap().ops;
     assert!(matches!(field.as_slice(), [Op::Fill { .. }, Op::Text { .. }]), "background + placeholder only");
+}
+
+/// A 200×90 scroll area at (10, 10) over a column taller than it: labels, a button and a slider
+/// whose thumb the clip edge cuts through at some offsets.
+fn scroll_scene() -> (WidgetTree, WidgetId) {
+    let mut tree = WidgetTree::new();
+    let root = tree.root();
+    let area = tree.new_node(
+        Style {
+            flex_direction: FlexDirection::Column,
+            size: Size { width: Dimension::length(200.0), height: Dimension::length(90.0) },
+            margin: fastgui_core::taffy::prelude::Rect {
+                left: LengthPercentageAuto::length(10.0),
+                top: LengthPercentageAuto::length(10.0),
+                right: LengthPercentageAuto::length(0.0),
+                bottom: LengthPercentageAuto::length(0.0),
+            },
+            ..Default::default()
+        },
+        WidgetKind::ScrollArea {
+            offset: (0.0, 0.0),
+            background: Color([0.15, 0.16, 0.2, 1.0]),
+            bar_color: Color([1.0, 1.0, 1.0, 0.35]),
+        },
+    );
+    let column = tree.new_node(
+        Style { flex_direction: FlexDirection::Column, gap: Size { width: LengthPercentage::length(6.0), height: LengthPercentage::length(6.0) }, ..Default::default() },
+        WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+    );
+    tree.add_child(root, area);
+    tree.add_child(area, column);
+    for i in 0..4 {
+        let label = tree.new_node(
+            Style::default(),
+            WidgetKind::Label { text: format!("Row {i} — clipped text"), font_size: 15.0, color: Color([0.9, 0.9, 0.95, 1.0]) },
+        );
+        tree.add_child(column, label);
+    }
+    let button = tree.new_node(
+        Style { size: Size { width: Dimension::length(120.0), height: Dimension::length(28.0) }, ..Default::default() },
+        WidgetKind::Button {
+            text: "Button".into(),
+            font_size: 14.0,
+            text_color: Color([1.0; 4]),
+            background: Color([0.3, 0.4, 0.7, 1.0]),
+            on_click: None,
+        },
+    );
+    let slider = tree.new_node(
+        Style { size: Size { width: Dimension::auto(), height: Dimension::length(24.0) }, ..Default::default() },
+        WidgetKind::Slider {
+            value: 0.3,
+            min: 0.0,
+            max: 1.0,
+            track_color: Color([0.3, 0.3, 0.35, 1.0]),
+            thumb_color: Color([0.4, 0.7, 1.0, 1.0]),
+            on_change: None,
+        },
+    );
+    tree.add_child(column, button);
+    tree.add_child(column, slider);
+    tree.set_scroll_container(area);
+    tree.compute_layout(240.0, 130.0);
+    (tree, area)
+}
+
+#[test]
+fn clipped_scroll_content_matches_cpu_painter_and_stays_inside() {
+    for scale in [1.0f32, 1.5, 2.0] {
+        let size = ((240.0 * scale) as u32, (130.0 * scale) as u32);
+        let (mut tree, area) = scroll_scene();
+        let max = tree.scroll_extent(area).unwrap().1;
+        assert!(max > 30.0, "the column overflows: {max}");
+        let (mut gpu, mut cpu, mut atlas) = (ChromeRenderer::new(), ChromeRenderer::new(), Vec::new());
+        for offset in [0.0, 7.5, 13.25, 41.0, max] {
+            tree.set_scroll_offset(area, 0.0, offset);
+            check_gpu_matches_cpu(&mut gpu, &mut cpu, &mut atlas, &mut tree, size, None, scale);
+            let clip = Clip::from_rect(scale_rect(tree.absolute_rect(area).unwrap(), scale));
+            // Everything but the window background is inside the area.
+            for quad in &gpu.gpu.quads[1..] {
+                let [l, t, r, b] = quad.rect;
+                let inside = l >= clip.left as f32 && t >= clip.top as f32 && r <= clip.right as f32 && b <= clip.bottom as f32;
+                assert!(inside, "scale {scale} offset {offset}: quad {quad:?} leaves the scroll area {clip:?}");
+            }
+        }
+        assert!(
+            gpu.gpu.quads.iter().any(|q| q.kind == fastgui_core::QUAD_SPRITE),
+            "some text is still drawn at the end"
+        );
+    }
+}
+
+#[test]
+fn clip_ops_cuts_fills_and_tags_straddling_sprites() {
+    let mut chrome = ChromeRenderer::new();
+    let mut ops = Vec::new();
+    push_fill(&mut ops, WidgetRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 }, Color([1.0; 4]));
+    push_fill(&mut ops, WidgetRect { x: 200.0, y: 0.0, width: 10.0, height: 10.0 }, Color([1.0; 4]));
+    chrome.push_text(&mut ops, WidgetRect { x: 30.0, y: 40.0, width: 200.0, height: 30.0 }, "straddles", 16.0, Color([1.0; 4]));
+    chrome.push_text(&mut ops, WidgetRect { x: 12.0, y: 12.0, width: 200.0, height: 30.0 }, "in", 16.0, Color([1.0; 4]));
+    let clip = Clip { left: 10, top: 10, right: 60, bottom: 50 };
+    let ops = clip_ops(ops, clip);
+    assert_eq!(ops.len(), 3, "the fill outside the clip is dropped");
+    assert!(matches!(ops[0], Op::Fill { left: 10.0, top: 10.0, right: 60.0, bottom: 50.0, .. }));
+    assert!(matches!(ops[1], Op::Text { clip: Some(c), .. } if c == clip), "partly outside: carries the clip");
+    assert!(matches!(ops[2], Op::Text { clip: None, .. }), "wholly inside: no clip needed");
 }

@@ -284,6 +284,9 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
     if let Ok(w) = obj.cast::<TextInput>() {
         return Ok(w.borrow().describe());
     }
+    if let Ok(w) = obj.cast::<ScrollArea>() {
+        return w.borrow().describe();
+    }
     if let Ok(w) = obj.cast::<BoxWidget>() {
         return w.borrow().describe();
     }
@@ -307,7 +310,7 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
         return Ok(w.borrow().describe_widget());
     }
     Err(PyTypeError::new_err(
-        "expected a fastgui widget (Box, Label, Button, Slider, TextInput, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
+        "expected a fastgui widget (Box, Label, Button, Slider, TextInput, ScrollArea, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
     ))
 }
 
@@ -468,6 +471,9 @@ pub(crate) fn attach(
                 });
             }
         }
+    }
+    if let Some(WidgetKind::ScrollArea { .. }) = tree.kind(id) {
+        tree.set_scroll_container(id);
     }
     id
 }
@@ -805,6 +811,81 @@ impl TextInput {
             splitter_bar: None,
             tab_bar: None,
         }
+    }
+}
+
+/// A scrollable viewport onto `content`: the wheel/trackpad scrolls it, overlay scrollbars
+/// appear on overflowing axes and can be dragged, and content outside it is clipped.
+#[pyclass]
+pub(crate) struct ScrollArea {
+    id: IdCell,
+    sender: SenderCell,
+    content: Py<PyAny>,
+    flex_grow: f32,
+    width: Option<f32>,
+    height: Option<f32>,
+    background: (f32, f32, f32, f32),
+    bar_color: (f32, f32, f32, f32),
+}
+
+#[pymethods]
+impl ScrollArea {
+    #[new]
+    #[pyo3(signature = (
+        content,
+        flex_grow=1.0,
+        width=None,
+        height=None,
+        background=(0.0, 0.0, 0.0, 0.0),
+        bar_color=(1.0, 1.0, 1.0, 0.35),
+    ))]
+    fn new(
+        content: Py<PyAny>,
+        flex_grow: f32,
+        width: Option<f32>,
+        height: Option<f32>,
+        background: (f32, f32, f32, f32),
+        bar_color: (f32, f32, f32, f32),
+    ) -> Self {
+        Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            content,
+            flex_grow,
+            width,
+            height,
+            background,
+            bar_color,
+        }
+    }
+
+    /// Scroll so the content's point `(x, y)` is at the top-left (clamped to what can scroll).
+    fn scroll_to(&self, x: f32, y: f32) -> PyResult<()> {
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::ScrollArea { offset, .. } = kind {
+                // Clamped to the content at the next layout.
+                *offset = (x.max(0.0), y.max(0.0));
+            }
+        })
+    }
+}
+
+impl ScrollArea {
+    fn describe(&self) -> PyResult<DescribedWidget> {
+        let content = Python::attach(|py| describe(self.content.bind(py)))?;
+        Ok(DescribedWidget {
+            style: StyleParams::leaf(self.flex_grow, self.width, self.height),
+            kind: WidgetKind::ScrollArea {
+                offset: (0.0, 0.0),
+                background: rgba(self.background),
+                bar_color: rgba(self.bar_color),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: vec![content],
+            splitter_bar: None,
+            tab_bar: None,
+        })
     }
 }
 
@@ -1380,6 +1461,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Button>()?;
     m.add_class::<Slider>()?;
     m.add_class::<TextInput>()?;
+    m.add_class::<ScrollArea>()?;
     m.add_class::<BoxWidget>()?;
     m.add_class::<Splitter>()?;
     m.add_class::<Panel>()?;

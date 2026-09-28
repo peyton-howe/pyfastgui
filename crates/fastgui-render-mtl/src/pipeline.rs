@@ -151,14 +151,12 @@ fragment float4 quad_fragment(QuadOut in [[stage_in]], texture2d<float> atlas [[
         uint2 texel = uint2(in.params.xy + (px - in.rect.xy));
         return atlas.read(texel);
     }
-    float coverage;
-    if (in.kind == 1) {
-        coverage = clamp(in.params.z + 0.5 - distance(in.position.xy, in.params.xy), 0.0, 1.0);
-    } else {
-        float2 lo = max(px, in.rect.xy);
-        float2 hi = min(px + 1.0, in.rect.zw);
-        float2 c = clamp(hi - lo, 0.0, 1.0);
-        coverage = c.x * c.y;
+    // Box coverage of `rect`: the whole shape for solids, the clip for clipped circles (3).
+    float2 c = clamp(min(px + 1.0, in.rect.zw) - max(px, in.rect.xy), 0.0, 1.0);
+    float coverage = c.x * c.y;
+    if (in.kind == 1 || in.kind == 3) {
+        float circle = clamp(in.params.z + 0.5 - distance(in.position.xy, in.params.xy), 0.0, 1.0);
+        coverage = in.kind == 3 ? circle * coverage : circle;
     }
     float a = in.color.a * coverage;
     return float4(in.color.rgb * a, a);

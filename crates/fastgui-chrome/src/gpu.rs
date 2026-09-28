@@ -15,7 +15,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use fastgui_core::{AtlasUpload, ChromeQuad, ChromeQuads, PixelRect, QUAD_CIRCLE, QUAD_SOLID, QUAD_SPRITE};
+use fastgui_core::{
+    AtlasUpload, ChromeQuad, ChromeQuads, PixelRect, QUAD_CIRCLE, QUAD_CIRCLE_CLIPPED, QUAD_SOLID, QUAD_SPRITE,
+};
 
 use super::{Color, Item, Op, Sprite, BACKGROUND};
 
@@ -114,21 +116,47 @@ impl GpuState {
                     Op::Fill { left, top, right, bottom, color } => {
                         self.quads.push(solid([*left, *top, *right, *bottom], *color));
                     }
-                    Op::Circle { cx, cy, radius, color, .. } => self.quads.push(ChromeQuad {
-                        rect: [cx - radius, cy - radius, cx + radius, cy + radius],
-                        color: color.0,
-                        params: [*cx, *cy, *radius, 0.0],
-                        kind: QUAD_CIRCLE,
-                        _pad: [0; 3],
-                    }),
-                    Op::Text { run, x, y } => {
+                    Op::Circle { cx, cy, radius, color, clip, .. } => {
+                        let bounds = [cx - radius, cy - radius, cx + radius, cy + radius];
+                        // Clipped: the quad covers only the visible part (anti-aliasing pixel
+                        // included) and the shader cuts coverage to it.
+                        let (rect, kind) = match clip {
+                            Some(c) => (
+                                [
+                                    (bounds[0] - 1.0).max(c.left as f32),
+                                    (bounds[1] - 1.0).max(c.top as f32),
+                                    (bounds[2] + 1.0).min(c.right as f32),
+                                    (bounds[3] + 1.0).min(c.bottom as f32),
+                                ],
+                                QUAD_CIRCLE_CLIPPED,
+                            ),
+                            None => (bounds, QUAD_CIRCLE),
+                        };
+                        self.quads.push(ChromeQuad {
+                            rect,
+                            color: color.0,
+                            params: [*cx, *cy, *radius, 0.0],
+                            kind,
+                            _pad: [0; 3],
+                        });
+                    }
+                    Op::Text { run, x, y, clip } => {
                         // No slot only when the atlas overflowed at its maximum size.
                         let Some(&(ax, ay)) = self.atlas.slots.get(&run.id) else { continue };
-                        let (left, top) = ((x + run.x) as f32, (y + run.y) as f32);
+                        let (left, top) = (x + run.x, y + run.y);
+                        let (mut l, mut t) = (left, top);
+                        let (mut r, mut b) = (left + run.width as i32, top + run.height as i32);
+                        // A clipped run draws a whole-pixel sub-rect of its atlas slot.
+                        if let Some(c) = clip {
+                            (l, t, r, b) = (l.max(c.left), t.max(c.top), r.min(c.right), b.min(c.bottom));
+                            if r <= l || b <= t {
+                                continue;
+                            }
+                        }
                         self.quads.push(ChromeQuad {
-                            rect: [left, top, left + run.width as f32, top + run.height as f32],
+                            rect: [l as f32, t as f32, r as f32, b as f32],
                             color: [1.0; 4],
-                            params: [ax as f32, ay as f32, 0.0, 0.0],
+                            params: [(ax as i32 + l - left) as f32, (ay as i32 + t - top) as f32, 0.0, 0.0],
                             kind: QUAD_SPRITE,
                             _pad: [0; 3],
                         });
@@ -243,10 +271,15 @@ pub(crate) fn emulate(quads: &[ChromeQuad], width: u32, height: u32, atlas: &[u8
                         let cy = (b.min(fy + 1.0) - t.max(fy)).clamp(0.0, 1.0);
                         premultiply(quad.color, cx * cy)
                     }
-                    QUAD_CIRCLE => {
+                    QUAD_CIRCLE | QUAD_CIRCLE_CLIPPED => {
                         let [ccx, ccy, radius, _] = quad.params;
                         let d = ((fx + 0.5 - ccx).powi(2) + (fy + 0.5 - ccy).powi(2)).sqrt();
-                        premultiply(quad.color, (radius + 0.5 - d).clamp(0.0, 1.0))
+                        let mut coverage = (radius + 0.5 - d).clamp(0.0, 1.0);
+                        if quad.kind == QUAD_CIRCLE_CLIPPED {
+                            coverage *= (r.min(fx + 1.0) - l.max(fx)).clamp(0.0, 1.0)
+                                * (b.min(fy + 1.0) - t.max(fy)).clamp(0.0, 1.0);
+                        }
+                        premultiply(quad.color, coverage)
                     }
                     _ => {
                         let ax = quad.params[0] as u32 + (px - l as u32);

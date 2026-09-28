@@ -29,3 +29,9 @@ pub const RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
 /// double-click (select the word).
 pub const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 pub const DOUBLE_CLICK_SLOP: f32 = 4.0;
+
+/// Layout units one mouse-wheel notch (`MouseScrollDelta::LineDelta` of 1) scrolls.
+pub const SCROLL_LINE: f32 = 40.0;
+
+/// Extra grab width across a scrollbar thumb (layout units, each side).
+pub const SCROLLBAR_HIT_SLOP: f32 = 3.0;

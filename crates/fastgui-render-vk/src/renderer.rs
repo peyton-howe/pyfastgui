@@ -8,7 +8,7 @@ use ash::{
     khr::{self, surface, swapchain},
     vk, Device, Entry, Instance,
 };
-use fastgui_core::widget::Rect;
+use fastgui_app::ViewportDraw;
 use fastgui_core::{ChromeFrame, ChromeQuads, CpuFrame, PixelRect};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
@@ -611,7 +611,7 @@ impl VulkanRenderer {
         &mut self,
         clear_color: [f32; 4],
         draw_chrome: bool,
-        viewports: &[(u64, Rect)],
+        viewports: &[ViewportDraw],
     ) -> Result<(), Error> {
         if self.images.is_empty() {
             return Ok(());
@@ -701,8 +701,8 @@ impl VulkanRenderer {
                     );
                 }
             }
-            for (viewport_id, _) in viewports {
-                if let Some(layer) = self.layers.get_mut(viewport_id) {
+            for draw in viewports {
+                if let Some(layer) = self.layers.get_mut(&draw.viewport_id) {
                     sync_sampled_image(
                         &mut layer.image,
                         color_subresource,
@@ -742,7 +742,7 @@ impl VulkanRenderer {
             }
 
             let bind_pipeline = draw_chrome && self.chrome.is_some()
-                || viewports.iter().any(|(id, _)| self.layers.contains_key(id));
+                || viewports.iter().any(|draw| self.layers.contains_key(&draw.viewport_id));
             if bind_pipeline {
                 self.device.cmd_bind_pipeline(
                     cmd,
@@ -767,9 +767,18 @@ impl VulkanRenderer {
                     );
                 }
             }
-            for (viewport_id, rect) in viewports {
-                let Some(layer) = self.layers.get(viewport_id) else { continue };
-                let Some((vp, scissor)) = widget_rect_to_vk(*rect, self.extent) else { continue };
+            for draw in viewports {
+                let Some(layer) = self.layers.get(&draw.viewport_id) else { continue };
+                let Some(([x, y, width, height], [sx, sy, sw, sh])) =
+                    draw.viewport_and_scissor(self.extent.width, self.extent.height)
+                else {
+                    continue;
+                };
+                let vp = vk::Viewport { x, y, width, height, min_depth: 0.0, max_depth: 1.0 };
+                let scissor = vk::Rect2D {
+                    offset: vk::Offset2D { x: sx as i32, y: sy as i32 },
+                    extent: vk::Extent2D { width: sw, height: sh },
+                };
                 self.draw_sampled(cmd, layer, vp, scissor);
             }
 
@@ -849,38 +858,6 @@ impl VulkanRenderer {
     }
 }
 
-fn widget_rect_to_vk(rect: Rect, extent: vk::Extent2D) -> Option<(vk::Viewport, vk::Rect2D)> {
-    let x = rect.x.round().max(0.0);
-    let y = rect.y.round().max(0.0);
-    let w = rect.width.round().max(0.0);
-    let h = rect.height.round().max(0.0);
-    if w < 1.0 || h < 1.0 {
-        return None;
-    }
-    let x = (x as u32).min(extent.width);
-    let y = (y as u32).min(extent.height);
-    let w = w as u32;
-    let h = h as u32;
-    let w = w.min(extent.width.saturating_sub(x));
-    let h = h.min(extent.height.saturating_sub(y));
-    if w == 0 || h == 0 {
-        return None;
-    }
-    Some((
-        vk::Viewport {
-            x: x as f32,
-            y: y as f32,
-            width: w as f32,
-            height: h as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        },
-        vk::Rect2D {
-            offset: vk::Offset2D { x: x as i32, y: y as i32 },
-            extent: vk::Extent2D { width: w, height: h },
-        },
-    ))
-}
 
 fn sync_sampled_image(
     image: &mut GpuImage,
@@ -1025,7 +1002,7 @@ impl fastgui_app::SurfaceBackend for VulkanRenderer {
         &mut self,
         clear: [f32; 4],
         draw_chrome: bool,
-        draws: &[(u64, Rect)],
+        draws: &[ViewportDraw],
     ) -> Result<(), Self::Error> {
         VulkanRenderer::render_frame(self, clear, draw_chrome, draws)
     }

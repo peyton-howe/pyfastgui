@@ -26,6 +26,7 @@ pub fn handle_key(
         Key::Named(NamedKey::Tab) => {
             tree.focus_next(press.modifiers.shift_key());
             if let Some(id) = tree.focused() {
+                tree.scroll_into_view(id);
                 text_input::scroll_caret_into_view(tree, id, measure);
             }
             return true;

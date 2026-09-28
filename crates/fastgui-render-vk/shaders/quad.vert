@@ -6,7 +6,7 @@
 layout(location = 0) in vec4 in_rect;    // left, top, right, bottom (physical px, top-left origin)
 layout(location = 1) in vec4 in_color;   // straight RGBA
 layout(location = 2) in vec4 in_params;  // circle: cx, cy, radius; sprite: atlas x, y
-layout(location = 3) in uint in_kind;    // 0 solid, 1 circle, 2 sprite
+layout(location = 3) in uint in_kind;    // 0 solid, 1 circle, 2 sprite, 3 clipped circle
 
 layout(push_constant) uniform Push {
     vec2 viewport;  // size of the quads' pixel space

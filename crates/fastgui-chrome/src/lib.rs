@@ -43,6 +43,10 @@ const DROP_INDICATOR_COLOR: Color = Color([0.40, 0.65, 1.0, 0.35]);
 /// `Item::key` for the drop indicator (widget keys are taffy node ids, which never reach this).
 const DROP_INDICATOR_KEY: u64 = u64::MAX;
 
+/// Flipped into a `ScrollArea`'s id for the key of its scrollbars' item (drawn after its
+/// content, so the bars sit on top).
+const SCROLLBAR_KEY_BIT: u64 = 1 << 63;
+
 /// Once damage covers more than this share of the window, repaint (and upload) all of it: the
 /// partial path's per-rect overhead stops paying for itself.
 const FULL_REPAINT_FRACTION: f64 = 0.5;
@@ -214,6 +218,7 @@ impl ChromeRenderer {
                     push_slider(&mut ops, rect, *value, *min, *max, *track_color, *thumb_color, scale);
                 }
                 WidgetKind::Splitter { bar_color, .. } => push_fill(&mut ops, rect, *bar_color),
+                WidgetKind::ScrollArea { background, .. } => push_fill(&mut ops, rect, *background),
                 WidgetKind::TabBar {
                     titles,
                     active,
@@ -285,7 +290,24 @@ impl ChromeRenderer {
             if tree.focused() == Some(id) {
                 push_outline(&mut ops, rect, FOCUS_RING_WIDTH * scale, FOCUS_RING_COLOR);
             }
+            if let Some(clip) = tree.clip_rect(id) {
+                ops = clip_ops(ops, Clip::from_rect(scale_rect(clip, scale)));
+            }
             items.push(Item::new(u64::from(id), ops, window));
+        }
+
+        // Overlay scrollbars, after all content so nothing scrolled covers them.
+        for id in tree.walk() {
+            let Some(WidgetKind::ScrollArea { bar_color, .. }) = tree.kind(id) else { continue };
+            let mut ops = Vec::new();
+            let (vertical, horizontal) = tree.scrollbar_thumbs(id);
+            for thumb in [vertical, horizontal].into_iter().flatten() {
+                push_fill(&mut ops, scale_rect(thumb, scale), *bar_color);
+            }
+            if let Some(clip) = tree.clip_rect(id) {
+                ops = clip_ops(ops, Clip::from_rect(scale_rect(clip, scale)));
+            }
+            items.push(Item::new(u64::from(id) ^ SCROLLBAR_KEY_BIT, ops, window));
         }
 
         // Same rect the release will commit to (`DropZone::preview_rect`), drawn last so no
@@ -365,7 +387,7 @@ impl ChromeRenderer {
             Some(scroll),
         );
         if run.width > 0 {
-            ops.push(Op::Text { run, x: rect.x.round() as i32, y: rect.y.round() as i32 });
+            ops.push(Op::Text { run, x: rect.x.round() as i32, y: rect.y.round() as i32, clip: None });
         }
     }
 
@@ -405,7 +427,7 @@ impl ChromeRenderer {
         }
         // Snapped to whole pixels: runs are blitted straight into the buffer, and a fractional
         // origin would only smear each glyph pixel across its neighbours.
-        ops.push(Op::Text { run, x: rect.x.round() as i32, y: rect.y.round() as i32 });
+        ops.push(Op::Text { run, x: rect.x.round() as i32, y: rect.y.round() as i32, clip: None });
     }
 
     /// "×" centred in `rect` (physical px). Text is laid out from the top-left, which would put
@@ -533,9 +555,70 @@ enum Op {
     Fill { left: f32, top: f32, right: f32, bottom: f32, color: Color },
     /// `sprite` is the circle rasterized at its whole-pixel position, made on first CPU paint
     /// (the GPU path draws the circle analytically instead); only the parameters are compared.
-    Circle { cx: f32, cy: f32, radius: f32, color: Color, sprite: OnceLock<Sprite> },
+    /// `clip` (set only when the circle is partly clipped): draw just the part inside it.
+    Circle { cx: f32, cy: f32, radius: f32, color: Color, sprite: OnceLock<Sprite>, clip: Option<Clip> },
     /// `(x, y)` is the text box's snapped origin; the run's own offset is relative to it.
-    Text { run: Arc<Sprite>, x: i32, y: i32 },
+    /// `clip` as for `Circle`.
+    Text { run: Arc<Sprite>, x: i32, y: i32, clip: Option<Clip> },
+}
+
+/// A whole-pixel rect (physical px, window space) that ops inside a `ScrollArea` are clipped
+/// to. Whole pixels keep sprite clipping exact: a clipped run just copies fewer pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Clip {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+impl Clip {
+    fn from_rect(rect: WidgetRect) -> Self {
+        Self {
+            left: rect.x.round() as i32,
+            top: rect.y.round() as i32,
+            right: (rect.x + rect.width).round() as i32,
+            bottom: (rect.y + rect.height).round() as i32,
+        }
+    }
+
+    /// Where `[left, top, right, bottom]` stands relative to this clip: `None` if they don't
+    /// overlap, `Some(true)` if it's entirely inside, `Some(false)` if partly.
+    fn classify(&self, left: f32, top: f32, right: f32, bottom: f32) -> Option<bool> {
+        let (cl, ct, cr, cb) = (self.left as f32, self.top as f32, self.right as f32, self.bottom as f32);
+        if right <= cl || bottom <= ct || left >= cr || top >= cb {
+            return None;
+        }
+        Some(left >= cl && top >= ct && right <= cr && bottom <= cb)
+    }
+
+    fn shifted(self, dx: i32, dy: i32) -> Self {
+        Self { left: self.left + dx, top: self.top + dy, right: self.right + dx, bottom: self.bottom + dy }
+    }
+}
+
+/// Restrict `ops` to `clip`: fills are cut to it exactly, ops entirely outside are dropped,
+/// and circles/text that straddle it carry it along (see `Op::Circle` / `Op::Text`).
+fn clip_ops(ops: Vec<Op>, clip: Clip) -> Vec<Op> {
+    let (cl, ct, cr, cb) = (clip.left as f32, clip.top as f32, clip.right as f32, clip.bottom as f32);
+    ops.into_iter()
+        .filter_map(|op| match op {
+            Op::Fill { left, top, right, bottom, color } => {
+                let (left, top, right, bottom) = (left.max(cl), top.max(ct), right.min(cr), bottom.min(cb));
+                (right > left && bottom > top).then_some(Op::Fill { left, top, right, bottom, color })
+            }
+            // One pixel of anti-aliasing past the radius, as drawn.
+            Op::Circle { cx, cy, radius, color, sprite, .. } => {
+                let inside = clip.classify(cx - radius - 1.0, cy - radius - 1.0, cx + radius + 1.0, cy + radius + 1.0)?;
+                Some(Op::Circle { cx, cy, radius, color, sprite, clip: (!inside).then_some(clip) })
+            }
+            Op::Text { run, x, y, .. } => {
+                let (left, top) = ((x + run.x) as f32, (y + run.y) as f32);
+                let inside = clip.classify(left, top, left + run.width as f32, top + run.height as f32)?;
+                Some(Op::Text { run, x, y, clip: (!inside).then_some(clip) })
+            }
+        })
+        .collect()
 }
 
 impl PartialEq for Op {
@@ -547,14 +630,14 @@ impl PartialEq for Op {
                 Op::Fill { left: l2, top: t2, right: r2, bottom: b2, color: c2 },
             ) => bits(&[*l1, *t1, *r1, *b1]) == bits(&[*l2, *t2, *r2, *b2]) && bits(&c1.0) == bits(&c2.0),
             (
-                Op::Circle { cx: x1, cy: y1, radius: r1, color: c1, .. },
-                Op::Circle { cx: x2, cy: y2, radius: r2, color: c2, .. },
-            ) => bits(&[*x1, *y1, *r1]) == bits(&[*x2, *y2, *r2]) && bits(&c1.0) == bits(&c2.0),
+                Op::Circle { cx: x1, cy: y1, radius: r1, color: c1, clip: k1, .. },
+                Op::Circle { cx: x2, cy: y2, radius: r2, color: c2, clip: k2, .. },
+            ) => bits(&[*x1, *y1, *r1]) == bits(&[*x2, *y2, *r2]) && bits(&c1.0) == bits(&c2.0) && k1 == k2,
             // Pointer identity is exact here: both display lists being compared hold their
             // runs alive, so a run's allocation can't be reused for different text meanwhile.
             // The same text re-cached after eviction compares unequal, which only over-damages.
-            (Op::Text { run: r1, x: x1, y: y1 }, Op::Text { run: r2, x: x2, y: y2 }) => {
-                Arc::ptr_eq(r1, r2) && x1 == x2 && y1 == y2
+            (Op::Text { run: r1, x: x1, y: y1, clip: k1 }, Op::Text { run: r2, x: x2, y: y2, clip: k2 }) => {
+                Arc::ptr_eq(r1, r2) && x1 == x2 && y1 == y2 && k1 == k2
             }
             _ => false,
         }
@@ -569,11 +652,17 @@ impl Op {
             let (x0, y0) = ((x + sprite.x) as f32, (y + sprite.y) as f32);
             pixel_bounds(x0, y0, x0 + sprite.width as f32, y0 + sprite.height as f32, window)
         };
+        let clipped = |bounds: PixelRect, clip: &Option<Clip>| match clip {
+            Some(c) => bounds.intersect(&pixel_bounds(c.left as f32, c.top as f32, c.right as f32, c.bottom as f32, window)),
+            None => bounds,
+        };
         match self {
             Op::Fill { left, top, right, bottom, .. } => pixel_bounds(*left, *top, *right, *bottom, window),
             // Same extent `Sprite::circle` covers.
-            Op::Circle { cx, cy, radius, .. } => pixel_bounds(cx - radius, cy - radius, cx + radius, cy + radius, window),
-            Op::Text { run, x, y } => sprite_bounds(run, *x, *y),
+            Op::Circle { cx, cy, radius, clip, .. } => {
+                clipped(pixel_bounds(cx - radius, cy - radius, cx + radius, cy + radius, window), clip)
+            }
+            Op::Text { run, x, y, clip } => clipped(sprite_bounds(run, *x, *y), clip),
         }
     }
 }
@@ -666,11 +755,15 @@ fn paint(target: &mut Pixmap, items: &[Item], clip: PixelRect) {
                     let (l, t) = ((left - dx).max(-1.0), (top - dy).max(-1.0));
                     fill_rect(target, l, t, right - dx, bottom - dy, *color);
                 }
-                Op::Circle { cx, cy, radius, color, sprite } => {
+                Op::Circle { cx, cy, radius, color, sprite, clip } => {
                     let sprite = sprite.get_or_init(|| Sprite::circle(*cx, *cy, *radius, *color));
-                    blit_sprite(target, sprite, sprite.x - ox, sprite.y - oy);
+                    let clip = clip.map(|c| c.shifted(-ox, -oy));
+                    blit_sprite(target, sprite, sprite.x - ox, sprite.y - oy, clip);
                 }
-                Op::Text { run, x, y } => blit_sprite(target, run, x + run.x - ox, y + run.y - oy),
+                Op::Text { run, x, y, clip } => {
+                    let clip = clip.map(|c| c.shifted(-ox, -oy));
+                    blit_sprite(target, run, x + run.x - ox, y + run.y - oy, clip);
+                }
             }
         }
     }
@@ -859,7 +952,7 @@ fn push_slider(
 
     let fraction = if max > min { ((value - min) / (max - min)).clamp(0.0, 1.0) } else { 0.0 };
     let (cx, cy, radius) = (rect.x + fraction * rect.width, rect.y + rect.height / 2.0, SLIDER_THUMB_RADIUS * scale);
-    ops.push(Op::Circle { cx, cy, radius, color: thumb_color, sprite: OnceLock::new() });
+    ops.push(Op::Circle { cx, cy, radius, color: thumb_color, sprite: OnceLock::new(), clip: None });
 }
 
 /// A `width`-thick border along the inside of `rect`, as four fills.
@@ -919,10 +1012,15 @@ fn fill_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, radius: f32, color: Color)
 /// Source-over composite of a premultiplied run onto the premultiplied pixmap, with the run's
 /// top-left at `(x, y)`, clipped to the pixmap. For a pixel only one glyph touched this is
 /// exactly what blending that glyph pixel straight into the pixmap gave.
-fn blit_sprite(pixmap: &mut Pixmap, run: &Sprite, x: i32, y: i32) {
+/// Composite `run` with its top-left at `(x, y)`, only inside `clip` (pixmap coordinates) if given.
+fn blit_sprite(pixmap: &mut Pixmap, run: &Sprite, x: i32, y: i32, clip: Option<Clip>) {
     let (pixmap_w, pixmap_h) = (pixmap.width() as i32, pixmap.height() as i32);
-    let (x0, y0) = (x.max(0), y.max(0));
-    let (x1, y1) = ((x + run.width as i32).min(pixmap_w), (y + run.height as i32).min(pixmap_h));
+    let clip = clip.unwrap_or(Clip { left: 0, top: 0, right: pixmap_w, bottom: pixmap_h });
+    let (x0, y0) = (x.max(0).max(clip.left), y.max(0).max(clip.top));
+    let (x1, y1) = (
+        (x + run.width as i32).min(pixmap_w).min(clip.right),
+        (y + run.height as i32).min(pixmap_h).min(clip.bottom),
+    );
     if x1 <= x0 || y1 <= y0 {
         return;
     }
