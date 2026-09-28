@@ -25,6 +25,7 @@ impl Color {
 /// never need to know Python exists.
 pub type ClickCallback = Arc<dyn Fn() + Send + Sync>;
 pub type ChangeCallback = Arc<dyn Fn(f32) + Send + Sync>;
+pub type BoolCallback = Arc<dyn Fn(bool) + Send + Sync>;
 pub type TabSelectCallback = Arc<dyn Fn(usize) + Send + Sync>;
 /// `(dragged_region_id, target_region_id, zone, float_rect)`.
 /// `float_rect` is `Some((x, y, width, height))` in main-window client coords when `zone` is
@@ -76,6 +77,18 @@ const POPUP_GAP: f32 = 2.0;
 /// chrome's drawing and `fastgui-app`'s click-to-caret, so both agree on where text starts.
 pub const TEXT_INPUT_PADDING: f32 = 8.0;
 const TEXT_INPUT_VERTICAL_PADDING: f32 = 6.0;
+
+/// Drawn checkbox / radio indicator size (layout units). Shared by measure, chrome, and hit tests.
+pub const CHECK_SIZE: f32 = 18.0;
+/// Gap between the indicator and the label text on `Checkbox` / `Radio`.
+pub const CHECK_LABEL_GAP: f32 = 8.0;
+/// Intrinsic size of a `Toggle` track (layout units).
+pub const TOGGLE_WIDTH: f32 = 40.0;
+pub const TOGGLE_HEIGHT: f32 = 22.0;
+/// Width reserved for each ± button on a `SpinBox` (layout units).
+pub const SPIN_BUTTON_WIDTH: f32 = 22.0;
+/// Default track thickness for a `ProgressBar` when style doesn't pin height.
+pub const PROGRESS_HEIGHT: f32 = 8.0;
 
 /// Scrollbar thickness and inset from the scroll area's edge (layout units). Overlay bars:
 /// drawn over the content's edge rather than taking layout space.
@@ -318,6 +331,84 @@ pub enum WidgetKind {
         viewport_id: u64,
         frames: FrameSlot<crate::CpuFrame>,
     },
+    /// A labeled on/off control. `checked` is the current value; `on_change` fires on toggle
+    /// (Space/click). Indicator size is `CHECK_SIZE`; chrome draws the box and checkmark.
+    Checkbox {
+        checked: bool,
+        label: String,
+        font_size: f32,
+        text_color: Color,
+        box_color: Color,
+        check_color: Color,
+        on_change: Option<BoolCallback>,
+    },
+    /// One option in a radio group. `group_id` ties peers together — exclusivity is enforced
+    /// later in `fastgui-app` (selecting one clears others with the same id). `on_select` fires
+    /// when this option becomes selected (click/Space); it is not re-fired if already selected.
+    Radio {
+        selected: bool,
+        label: String,
+        group_id: u64,
+        font_size: f32,
+        text_color: Color,
+        box_color: Color,
+        dot_color: Color,
+        on_select: Option<ClickCallback>,
+    },
+    /// A compact on/off switch with no built-in label (pair with a `Label` in demos). Track
+    /// colors swap with `checked`; thumb is always `thumb_color`.
+    Toggle {
+        checked: bool,
+        track_off: Color,
+        track_on: Color,
+        thumb_color: Color,
+        on_change: Option<BoolCallback>,
+    },
+    /// Numeric stepper with −/+ buttons. `decimals == 0` shows an integer; otherwise that many
+    /// fractional digits. `mirror` publishes every change for a synchronous Python getter, like
+    /// `TextInput`.
+    SpinBox {
+        value: f32,
+        min: f32,
+        max: f32,
+        step: f32,
+        decimals: u32,
+        font_size: f32,
+        text_color: Color,
+        background: Color,
+        button_color: Color,
+        on_change: Option<ChangeCallback>,
+        mirror: Option<Readback<f32>>,
+    },
+    /// Drag-to-scrub numeric field: horizontal drag changes `value` by `speed` per logical
+    /// pixel. Same display/`mirror` conventions as `SpinBox`.
+    NumericScrub {
+        value: f32,
+        min: f32,
+        max: f32,
+        speed: f32,
+        decimals: u32,
+        font_size: f32,
+        text_color: Color,
+        background: Color,
+        on_change: Option<ChangeCallback>,
+        mirror: Option<Readback<f32>>,
+    },
+    /// Non-interactive determinate progress track. `value` is clamped to `[min, max]` when drawn.
+    ProgressBar {
+        value: f32,
+        min: f32,
+        max: f32,
+        track_color: Color,
+        fill_color: Color,
+    },
+    /// Static/CPU image via the same latest-wins mailbox as `Viewport`. `image_id` is a stable
+    /// identity for the renderer's texture cache across tree rebuilds; a later GPU path can
+    /// reuse viewport draws for the same slot.
+    Image {
+        image_id: u64,
+        frames: FrameSlot<crate::CpuFrame>,
+    },
 }
 
 impl WidgetKind {
@@ -329,6 +420,11 @@ impl WidgetKind {
                 | WidgetKind::Slider { .. }
                 | WidgetKind::TextInput { .. }
                 | WidgetKind::ListView { .. }
+                | WidgetKind::Checkbox { .. }
+                | WidgetKind::Radio { .. }
+                | WidgetKind::Toggle { .. }
+                | WidgetKind::SpinBox { .. }
+                | WidgetKind::NumericScrub { .. }
         )
     }
 }
@@ -386,6 +482,51 @@ pub fn close_hit_rect(bar: Rect) -> Rect {
     let drawn = close_button_rect(bar);
     let width = (drawn.width + CLOSE_HIT_SLOP).min(bar.width.max(0.0) * CLOSE_MAX_WIDTH_FRACTION).max(drawn.width);
     Rect { x: bar.x + bar.width - width, y: bar.y, width, height: bar.height }
+}
+
+/// Checkbox / radio indicator square (or the circle's bounding box), vertically centred in `row`.
+pub fn check_indicator_rect(row: Rect) -> Rect {
+    let size = CHECK_SIZE.min(row.height).min(row.width.max(0.0));
+    Rect {
+        x: row.x,
+        y: row.y + (row.height - size) * 0.5,
+        width: size,
+        height: size,
+    }
+}
+
+/// Right-hand column reserved for a `SpinBox`'s −/+ buttons.
+pub fn spin_buttons_rect(row: Rect) -> Rect {
+    let width = SPIN_BUTTON_WIDTH.min(row.width.max(0.0) * 0.5).min(row.height.max(SPIN_BUTTON_WIDTH));
+    Rect { x: row.x + row.width - width, y: row.y, width, height: row.height }
+}
+
+/// Top half of `spin_buttons_rect` (increment).
+pub fn spin_up_rect(row: Rect) -> Rect {
+    let buttons = spin_buttons_rect(row);
+    Rect { height: buttons.height * 0.5, ..buttons }
+}
+
+/// Bottom half of `spin_buttons_rect` (decrement).
+pub fn spin_down_rect(row: Rect) -> Rect {
+    let buttons = spin_buttons_rect(row);
+    let half = buttons.height * 0.5;
+    Rect { y: buttons.y + half, height: buttons.height - half, ..buttons }
+}
+
+/// Value area of a `SpinBox` (everything left of the button column).
+pub fn spin_value_rect(row: Rect) -> Rect {
+    let buttons = spin_buttons_rect(row);
+    Rect { width: (row.width - buttons.width).max(0.0), ..row }
+}
+
+/// Format a spin/scrub value for display (`decimals == 0` → integer).
+pub fn format_decimal(value: f32, decimals: u32) -> String {
+    if decimals == 0 {
+        format!("{}", value.round() as i64)
+    } else {
+        format!("{value:.prec$}", prec = decimals as usize)
+    }
 }
 
 /// The retained-mode widget tree: taffy owns layout (parent/child structure + style), this
@@ -1276,6 +1417,23 @@ fn measure_leaf<'m>(
             width: 160.0,
             height: font_size * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
         },
+        Some(WidgetKind::Checkbox { label, font_size, .. } | WidgetKind::Radio { label, font_size, .. }) => {
+            let text_size = measure_text(label, *font_size);
+            Size {
+                width: CHECK_SIZE + CHECK_LABEL_GAP + text_size.width,
+                height: CHECK_SIZE.max(text_size.height),
+            }
+        }
+        Some(WidgetKind::Toggle { .. }) => Size { width: TOGGLE_WIDTH, height: TOGGLE_HEIGHT },
+        Some(WidgetKind::SpinBox { font_size, .. }) => Size {
+            width: 100.0,
+            height: font_size * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
+        },
+        Some(WidgetKind::NumericScrub { font_size, .. }) => Size {
+            width: 80.0,
+            height: font_size * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
+        },
+        Some(WidgetKind::ProgressBar { .. }) => Size { width: 120.0, height: PROGRESS_HEIGHT },
         Some(
             WidgetKind::Container { .. }
             | WidgetKind::Slider { .. }
@@ -1284,7 +1442,8 @@ fn measure_leaf<'m>(
             | WidgetKind::PanelTitleBar { .. }
             | WidgetKind::ScrollArea { .. }
             | WidgetKind::Popup { .. }
-            | WidgetKind::Viewport { .. },
+            | WidgetKind::Viewport { .. }
+            | WidgetKind::Image { .. },
         )
         | None => Size::ZERO,
         Some(WidgetKind::ListView { row_height, items, .. }) => {
@@ -2190,5 +2349,78 @@ mod tests {
         let WidgetKind::Viewport { frames, .. } = tree.kind(id).unwrap() else { panic!("kind") };
         let frame = frames.take_latest().expect("frame");
         assert_eq!(frame.data, vec![1, 2, 3, 4]);
+    }
+
+    /// Intrinsic measure without the root column stretching the cross axis.
+    fn measure_style() -> Style {
+        Style { align_self: Some(AlignSelf::START), ..Default::default() }
+    }
+
+    #[test]
+    fn checkbox_measure_includes_box_and_label() {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let id = tree.new_node(
+            measure_style(),
+            WidgetKind::Checkbox {
+                checked: false,
+                label: "On".into(),
+                font_size: 14.0,
+                text_color: Color::TRANSPARENT,
+                box_color: Color::TRANSPARENT,
+                check_color: Color::TRANSPARENT,
+                on_change: None,
+            },
+        );
+        tree.add_child(root, id);
+        tree.compute_layout(400.0, 200.0);
+        let rect = tree.absolute_rect(id).expect("laid out");
+        let text = measure_text("On", 14.0);
+        // taffy may round final layout sizes; measure only has to land nearby.
+        assert!((rect.width - (CHECK_SIZE + CHECK_LABEL_GAP + text.width)).abs() < 1.0);
+        assert!((rect.height - CHECK_SIZE.max(text.height)).abs() < 1.0);
+        assert!(tree.kind(id).unwrap().is_focusable());
+    }
+
+    #[test]
+    fn toggle_and_spinbox_intrinsic_sizes() {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let toggle = tree.new_node(
+            measure_style(),
+            WidgetKind::Toggle {
+                checked: false,
+                track_off: Color::TRANSPARENT,
+                track_on: Color::TRANSPARENT,
+                thumb_color: Color::TRANSPARENT,
+                on_change: None,
+            },
+        );
+        let spin = tree.new_node(
+            measure_style(),
+            WidgetKind::SpinBox {
+                value: 0.0,
+                min: 0.0,
+                max: 10.0,
+                step: 1.0,
+                decimals: 0,
+                font_size: 14.0,
+                text_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                button_color: Color::TRANSPARENT,
+                on_change: None,
+                mirror: None,
+            },
+        );
+        tree.add_child(root, toggle);
+        tree.add_child(root, spin);
+        tree.compute_layout(400.0, 200.0);
+        let t = tree.absolute_rect(toggle).expect("toggle");
+        assert!((t.width - TOGGLE_WIDTH).abs() < 1.0);
+        assert!((t.height - TOGGLE_HEIGHT).abs() < 1.0);
+        let s = tree.absolute_rect(spin).expect("spin");
+        assert!((s.width - 100.0).abs() < 1.0);
+        let expected_h = 14.0 * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING;
+        assert!((s.height - expected_h).abs() < 1.0);
     }
 }
