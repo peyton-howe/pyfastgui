@@ -144,6 +144,8 @@ struct StyleParams {
     /// already qualifies as "closest positioned ancestor" without needing to say so explicitly)
     /// instead of taking part in normal flex flow. `None` (everything else) is ordinary flow.
     absolute: Option<(f32, f32)>,
+    /// Let children flow onto further rows/columns when they don't fit (`Box(wrap=True)`).
+    wrap: bool,
 }
 
 impl StyleParams {
@@ -158,6 +160,7 @@ impl StyleParams {
             fill: false,
             align_items: None,
             absolute: None,
+            wrap: false,
         }
     }
 
@@ -199,6 +202,7 @@ impl StyleParams {
             padding: Rect { left: lp_padding, right: lp_padding, top: lp_padding, bottom: lp_padding },
             size,
             align_items: self.align_items,
+            flex_wrap: if self.wrap { FlexWrap::Wrap } else { FlexWrap::NoWrap },
             position,
             inset,
             ..Default::default()
@@ -401,7 +405,7 @@ pub(crate) fn attach(
             width: (bar_spec.direction == SplitDirection::Row).then_some(bar_spec.thickness),
             height: (bar_spec.direction == SplitDirection::Column).then_some(bar_spec.thickness),
             fill: false,
-            align_items: None, absolute: None,
+            align_items: None, absolute: None, wrap: false,
         };
         let bar_kind = WidgetKind::Splitter {
             direction: bar_spec.direction,
@@ -436,7 +440,7 @@ pub(crate) fn attach(
             width: None,
             height: Some(bar_spec.height),
             fill: false,
-            align_items: None, absolute: None,
+            align_items: None, absolute: None, wrap: false,
         };
         let active = bar_spec.active;
         let bar_kind = WidgetKind::TabBar {
@@ -1222,6 +1226,7 @@ pub(crate) struct BoxWidget {
     width: Option<f32>,
     height: Option<f32>,
     background: (f32, f32, f32, f32),
+    wrap: bool,
     children: Py<PyList>,
 }
 
@@ -1237,6 +1242,7 @@ impl BoxWidget {
         width=None,
         height=None,
         background=(0.0, 0.0, 0.0, 0.0),
+        wrap=false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1248,6 +1254,7 @@ impl BoxWidget {
         width: Option<f32>,
         height: Option<f32>,
         background: (f32, f32, f32, f32),
+        wrap: bool,
     ) -> PyResult<Self> {
         let direction = match direction {
             "row" => FlexDirection::Row,
@@ -1268,6 +1275,7 @@ impl BoxWidget {
             width,
             height,
             background,
+            wrap,
             children,
         })
     }
@@ -1276,7 +1284,7 @@ impl BoxWidget {
 impl BoxWidget {
     fn describe(&self) -> PyResult<DescribedWidget> {
         let style =
-            StyleParams { direction: self.direction, gap: self.gap.resolve(), padding: self.padding.resolve(), flex_grow: self.flex_grow, width: self.width, height: self.height, fill: false, align_items: None, absolute: None };
+            StyleParams { direction: self.direction, gap: self.gap.resolve(), padding: self.padding.resolve(), flex_grow: self.flex_grow, width: self.width, height: self.height, fill: false, align_items: None, absolute: None, wrap: self.wrap };
 
         let children = Python::attach(|py| -> PyResult<Vec<DescribedWidget>> {
             self.children.bind(py).iter().map(|child| describe(&child)).collect()
@@ -1376,7 +1384,7 @@ impl Splitter {
                 width: None,
                 height: None,
                 fill: false,
-                align_items: None, absolute: None,
+                align_items: None, absolute: None, wrap: false,
             },
             kind: WidgetKind::Container { background: transparent(), region_id: None },
             id_cell: self.id.clone(),
@@ -1578,7 +1586,7 @@ impl Panel {
             .map(|cb| Python::attach(|py| cb.clone_ref(py)));
 
         let title_bar = DescribedWidget {
-            style: StyleParams { direction: FlexDirection::Row, gap: 0.0, padding: 0.0, flex_grow: 0.0, width: None, height: Some(self.title_height), fill: false, align_items: None, absolute: None },
+            style: StyleParams { direction: FlexDirection::Row, gap: 0.0, padding: 0.0, flex_grow: 0.0, width: None, height: Some(self.title_height), fill: false, align_items: None, absolute: None, wrap: false },
             kind: WidgetKind::PanelTitleBar {
                 panel_id: self.region_id,
                 title: self.title.clone(),
@@ -1608,7 +1616,7 @@ impl Panel {
                 width: None,
                 height: None,
                 fill: false,
-                align_items: None, absolute: None,
+                align_items: None, absolute: None, wrap: false,
             },
             kind: WidgetKind::Container { background: rgba(self.background.unwrap_or(crate::theme::palette().surface)), region_id: Some(self.region_id) },
             id_cell: self.id.clone(),
@@ -1752,7 +1760,7 @@ impl Tabs {
                 width: None,
                 height: None,
                 fill: false,
-                align_items: None, absolute: None,
+                align_items: None, absolute: None, wrap: false,
             },
             kind: WidgetKind::Container { background: transparent(), region_id: Some(self.region_id) },
             id_cell: self.id.clone(),

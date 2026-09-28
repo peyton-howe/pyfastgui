@@ -621,11 +621,13 @@ impl WidgetTree {
             if let Some(clip) = clip {
                 self.clip_rects.insert(id, clip);
             }
-            // A scroll area shifts its children by its offset and clips them to itself.
+            // A scroll area shifts its children by its offset and clips them to itself. A dock
+            // region (a `Panel`'s or `Tabs`' outer container) clips too, so content wider than
+            // its pane is cut off there instead of spilling over the neighbouring pane.
+            let clip_to_self = || Some(clip.map_or(rect, |c| c.intersect(&rect)));
             let (child_x, child_y, child_clip) = match self.kinds.get(&id) {
-                Some(WidgetKind::ScrollArea { offset, .. }) => {
-                    (x - offset.0, y - offset.1, Some(clip.map_or(rect, |c| c.intersect(&rect))))
-                }
+                Some(WidgetKind::ScrollArea { offset, .. }) => (x - offset.0, y - offset.1, clip_to_self()),
+                Some(WidgetKind::Container { region_id: Some(_), .. }) => (x, y, clip_to_self()),
                 _ => (x, y, clip),
             };
             if let Ok(children) = self.taffy.children(id) {
@@ -1927,6 +1929,67 @@ mod tests {
         let (mut empty, id, _, _) = list_tree(0);
         empty.list_select(id, Some(0));
         assert_eq!(empty.list_row_at(id, 5.0), None);
+    }
+
+    #[test]
+    fn dock_region_clips_overflowing_content() {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let region = tree.new_node(
+            Style { size: Size { width: Dimension::length(100.0), height: Dimension::length(50.0) }, ..Default::default() },
+            WidgetKind::Container { background: Color::TRANSPARENT, region_id: Some(3) },
+        );
+        let wide = sized_button(&mut tree, 300.0, 20.0);
+        tree.add_child(root, region);
+        tree.add_child(region, wide);
+        tree.compute_layout(400.0, 100.0);
+        assert_eq!(tree.clip_rect(wide).map(|c| (c.x, c.width)), Some((0.0, 100.0)));
+        assert_eq!(tree.hit_test(50.0, 10.0), Some(wide));
+        assert_ne!(tree.hit_test(250.0, 10.0), Some(wide), "the overflowing part isn't clickable");
+        assert!(tree.clip_rect(region).is_none(), "a region isn't clipped by itself");
+    }
+
+    #[test]
+    fn wrapping_row_stays_inside_a_narrow_pane() {
+        // Like theme_demo's left pane: a region holding a column holding a wrapping row of
+        // buttons whose total width is well over the pane's.
+        let (mut tree, first, _, _) = split_row_tree(0.3, true);
+        let region = tree.new_node(
+            Style { flex_direction: FlexDirection::Column, flex_grow: 1.0, ..Default::default() },
+            WidgetKind::Container { background: Color::TRANSPARENT, region_id: Some(9) },
+        );
+        let row = tree.new_node(
+            Style {
+                flex_direction: FlexDirection::Row,
+                flex_wrap: FlexWrap::Wrap,
+                gap: Size { width: LengthPercentage::length(4.0), height: LengthPercentage::length(4.0) },
+                ..Default::default()
+            },
+            WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+        );
+        tree.add_child(first, region);
+        tree.add_child(region, row);
+        let buttons: Vec<_> = (0..5).map(|_| sized_button(&mut tree, 110.0, 30.0)).collect();
+        for &b in &buttons {
+            tree.add_child(row, b);
+        }
+        tree.compute_layout(1006.0, 400.0);
+        let pane = tree.absolute_rect(first).unwrap();
+        let rects: Vec<Rect> = buttons.iter().map(|&b| tree.absolute_rect(b).unwrap()).collect();
+        for r in &rects {
+            assert!(r.x >= pane.x && r.x + r.width <= pane.x + pane.width + 0.5, "{r:?} outside {pane:?}");
+        }
+        let lines = {
+            let mut ys: Vec<i32> = rects.iter().map(|r| r.y as i32).collect();
+            ys.dedup();
+            ys.len()
+        };
+        assert!(lines >= 2, "5 × 110 in a ~300-wide pane wraps onto several lines");
+        for (i, a) in rects.iter().enumerate() {
+            for b in &rects[i + 1..] {
+                assert!(!a.intersects(b), "wrapped buttons don't overlap: {a:?} {b:?}");
+            }
+        }
     }
 
     #[test]

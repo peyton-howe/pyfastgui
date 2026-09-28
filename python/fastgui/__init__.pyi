@@ -202,6 +202,7 @@ class Box:
         width: float | None = None,
         height: float | None = None,
         background: RGBA = (0.0, 0.0, 0.0, 0.0),
+        wrap: bool = False,
     ) -> None: ...
 
 class Splitter:

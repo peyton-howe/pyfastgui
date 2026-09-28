@@ -178,9 +178,11 @@ dirty-rect diffs and returns a `ChromeFrame`; `set_chrome_frame` copies only the
 host-visible `LINEAR` image, Metal `replaceRegion`). A patch must match a full repaint to the
 byte (unit test at 1×/1.5×/2×). This path is also the pixel reference GPU tests compare against.
 
-**Clipping (`ScrollArea`).** Layout shifts a scroll area's children by its offset and records a
-clip rect for everything inside it (`WidgetTree::clip_rect`); `hit_test` ignores clipped-out
-parts. Chrome clips per op rather than per draw call: fills are intersected with the clip,
+**Clipping (`ScrollArea`, dock regions).** Layout shifts a scroll area's children by its offset
+and records a clip rect for everything inside it (`WidgetTree::clip_rect`); dock regions (a
+`Panel`'s or `Tabs`' outer container) clip their contents the same way, without an offset, so
+content wider than its pane is cut off rather than drawn over the next pane. `hit_test` ignores
+clipped-out parts. Chrome clips per op rather than per draw call: fills are intersected with the clip,
 anything wholly outside is dropped, and text runs / circles that straddle the edge carry a
 whole-pixel `Clip`. On the GPU a clipped text quad shrinks and shifts its atlas offset (still a
 1:1 copy), and a clipped circle becomes `QUAD_CIRCLE_CLIPPED`, whose coverage the shader

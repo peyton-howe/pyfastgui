@@ -121,7 +121,8 @@ All under [`python/examples/`](python/examples/), runnable directly once install
 
 ## Widget API
 
-- **Layout**: `Box` (flexbox row/column via [`taffy`](https://github.com/DioxusLabs/taffy)),
+- **Layout**: `Box` (flexbox row/column via [`taffy`](https://github.com/DioxusLabs/taffy);
+  `wrap=True` flows children onto more rows/columns),
   `Splitter` (draggable divider between two panes), `ScrollArea` (scrollable, clipped viewport), `Popup` (menus, dropdowns, tooltips, modal
   dialogs — anchored overlays drawn above everything).
 - **Data views**: `ListView` (virtualized: only visible rows are laid out and drawn).

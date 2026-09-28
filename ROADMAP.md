@@ -1297,7 +1297,11 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
    spacing_large` (4/8/16). Every `font_size` argument takes points or `"small"|"body"|"large"`
    and defaults by role (body text 16, lists/tabs/panel titles 14 — unchanged); `Box(gap=,
    padding=)` and `Popup(padding=)` take units or `"small"|"medium"|"large"` (numeric
-   defaults unchanged). Bad names/values raise at construction. **Not yet:** floating panels restyle on their next
+   defaults unchanged). Bad names/values raise at construction. Follow-ups from trying the
+   demo: dock regions (`Panel` / `Tabs`) now clip their contents, so a too-wide pane is cut
+   off instead of drawn over its neighbour (and the hidden part isn't clickable); `Box(wrap=
+   True)` flows children onto more lines (taffy flex-wrap); theme_demo gained Smaller / Bigger /
+   Reset sizes. **Not yet:** floating panels restyle on their next
    rebuild rather than immediately; the 7B widgets added concurrently still take explicit
    colors and should adopt `palette()` the same way.
 
