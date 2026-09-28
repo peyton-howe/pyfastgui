@@ -88,6 +88,48 @@ pub fn handle_key(
             tree.list_select(id, Some(target));
             true
         }
+        Some(WidgetKind::Checkbox { .. } | WidgetKind::Toggle { .. }) => {
+            let activate = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space))
+                || matches!(key, Key::Character(c) if c == " ");
+            if activate {
+                crate::forms::toggle_bool(tree, id);
+            }
+            activate
+        }
+        Some(WidgetKind::Radio { .. }) => {
+            let activate = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space))
+                || matches!(key, Key::Character(c) if c == " ");
+            if activate {
+                crate::forms::select_radio(tree, id);
+            }
+            activate
+        }
+        Some(WidgetKind::SpinBox { value, min, max, step, .. }) => {
+            let (value, min, max, step) = (*value, *min, *max, *step);
+            let target = match key {
+                Key::Named(NamedKey::ArrowUp | NamedKey::ArrowRight) => value + step,
+                Key::Named(NamedKey::ArrowDown | NamedKey::ArrowLeft) => value - step,
+                Key::Named(NamedKey::PageUp) => value + step * 10.0,
+                Key::Named(NamedKey::PageDown) => value - step * 10.0,
+                Key::Named(NamedKey::Home) => min,
+                Key::Named(NamedKey::End) => max,
+                _ => return false,
+            };
+            crate::forms::set_numeric(tree, id, target)
+        }
+        Some(WidgetKind::NumericScrub { value, min, max, speed, .. }) => {
+            let (value, min, max, speed) = (*value, *min, *max, *speed);
+            let target = match key {
+                Key::Named(NamedKey::ArrowUp | NamedKey::ArrowRight) => value + speed,
+                Key::Named(NamedKey::ArrowDown | NamedKey::ArrowLeft) => value - speed,
+                Key::Named(NamedKey::PageUp) => value + speed * 10.0,
+                Key::Named(NamedKey::PageDown) => value - speed * 10.0,
+                Key::Named(NamedKey::Home) => min,
+                Key::Named(NamedKey::End) => max,
+                _ => return false,
+            };
+            crate::forms::set_numeric(tree, id, target)
+        }
         _ => false,
     }
 }

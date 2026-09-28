@@ -15,6 +15,7 @@ use crate::cloak::set_cloaked;
 use crate::command::{Command, RenderThreadHandles};
 use crate::constants::*;
 use crate::coords::{remap_rect, scale_rect};
+use crate::forms::{self, PressResult};
 use crate::ghost::build_tear_ghost_tree;
 use crate::keyboard::handle_key;
 use crate::text_input::{self, KeyPress, SystemClipboard};
@@ -115,6 +116,8 @@ struct FloatingWindow<B: SurfaceBackend> {
     dragging_slider: Option<WidgetId>,
     dragging_splitter: Option<WidgetId>,
     dragging_text: Option<WidgetId>,
+    /// A `NumericScrub` / `SpinBox` value area being dragged horizontally.
+    dragging_scrub: Option<(WidgetId, f32)>,
     dragging_scrollbar: Option<ScrollbarDrag>,
     pressed_button: Option<WidgetId>,
     last_click: Option<(Instant, (f32, f32))>,
@@ -159,6 +162,8 @@ struct App<B: SurfaceBackend> {
     dragging_splitter: Option<WidgetId>,
     /// A `TextInput` whose selection follows the cursor until mouse-up.
     dragging_text: Option<WidgetId>,
+    /// `(widget, last cursor x)` while scrubbing a `NumericScrub` / `SpinBox` value.
+    dragging_scrub: Option<(WidgetId, f32)>,
     dragging_scrollbar: Option<ScrollbarDrag>,
     /// A `Button` pressed and not yet released; it clicks if released over itself.
     pressed_button: Option<WidgetId>,
@@ -409,6 +414,7 @@ impl<B: SurfaceBackend> App<B> {
             dragging_slider: None,
             dragging_splitter: None,
             dragging_text: None,
+            dragging_scrub: None,
             dragging_scrollbar: None,
             pressed_button: None,
             last_click: None,
@@ -453,12 +459,14 @@ impl<B: SurfaceBackend> App<B> {
         let mut live_ids = Vec::new();
         let mut uploads = Vec::new();
         for id in self.widget_tree.walk() {
-            let Some(WidgetKind::Viewport { viewport_id, frames }) = self.widget_tree.kind(id) else {
-                continue;
+            let (layer_id, frames) = match self.widget_tree.kind(id) {
+                Some(WidgetKind::Viewport { viewport_id, frames }) => (*viewport_id, frames),
+                Some(WidgetKind::Image { image_id, frames }) => (*image_id, frames),
+                _ => continue,
             };
-            live_ids.push(*viewport_id);
+            live_ids.push(layer_id);
             if let Some(frame) = frames.take_latest() {
-                uploads.push((*viewport_id, frame));
+                uploads.push((layer_id, frame));
             }
         }
         if let Some(renderer) = &mut self.renderer {
@@ -499,12 +507,14 @@ impl<B: SurfaceBackend> App<B> {
         let mut live_ids = Vec::new();
         let mut uploads = Vec::new();
         for id in floater.widget_tree.walk() {
-            let Some(WidgetKind::Viewport { viewport_id, frames }) = floater.widget_tree.kind(id) else {
-                continue;
+            let (layer_id, frames) = match floater.widget_tree.kind(id) {
+                Some(WidgetKind::Viewport { viewport_id, frames }) => (*viewport_id, frames),
+                Some(WidgetKind::Image { image_id, frames }) => (*image_id, frames),
+                _ => continue,
             };
-            live_ids.push(*viewport_id);
+            live_ids.push(layer_id);
             if let Some(frame) = frames.take_latest() {
-                uploads.push((*viewport_id, frame));
+                uploads.push((layer_id, frame));
             }
         }
         for (viewport_id, frame) in uploads {
@@ -524,14 +534,16 @@ impl<B: SurfaceBackend> App<B> {
         // overlaps (its chrome placeholder shows instead) so the highlight is visible.
         let preview = self.hover_region.map(|(_, rect, zone)| zone.preview_rect(rect));
         for id in self.widget_tree.walk() {
-            let Some(WidgetKind::Viewport { viewport_id, .. }) = self.widget_tree.kind(id) else {
-                continue;
+            let layer_id = match self.widget_tree.kind(id) {
+                Some(WidgetKind::Viewport { viewport_id, .. }) => *viewport_id,
+                Some(WidgetKind::Image { image_id, .. }) => *image_id,
+                _ => continue,
             };
             let Some(rect) = self.widget_tree.absolute_rect(id) else { continue };
             if preview.is_some_and(|p| p.intersects(&rect)) {
                 continue;
             }
-            if let Some(draw) = viewport_draw(&self.widget_tree, id, *viewport_id, rect, self.scale_factor) {
+            if let Some(draw) = viewport_draw(&self.widget_tree, id, layer_id, rect, self.scale_factor) {
                 draws.push(draw);
             }
         }
@@ -544,11 +556,13 @@ impl<B: SurfaceBackend> App<B> {
             return draws;
         }
         for id in floater.widget_tree.walk() {
-            let Some(WidgetKind::Viewport { viewport_id, .. }) = floater.widget_tree.kind(id) else {
-                continue;
+            let layer_id = match floater.widget_tree.kind(id) {
+                Some(WidgetKind::Viewport { viewport_id, .. }) => *viewport_id,
+                Some(WidgetKind::Image { image_id, .. }) => *image_id,
+                _ => continue,
             };
             let Some(rect) = floater.widget_tree.absolute_rect(id) else { continue };
-            if let Some(draw) = viewport_draw(&floater.widget_tree, id, *viewport_id, rect, floater.scale_factor) {
+            if let Some(draw) = viewport_draw(&floater.widget_tree, id, layer_id, rect, floater.scale_factor) {
                 draws.push(draw);
             }
         }
@@ -596,6 +610,16 @@ impl<B: SurfaceBackend> App<B> {
                 let extend = self.modifiers.shift_key();
                 text_input::handle_press(&mut self.widget_tree, id, self.cursor.0, extend, double, &mut self.chrome);
                 self.dragging_text = Some(id);
+            }
+            WidgetKind::Checkbox { .. }
+            | WidgetKind::Radio { .. }
+            | WidgetKind::Toggle { .. }
+            | WidgetKind::SpinBox { .. }
+            | WidgetKind::NumericScrub { .. } => {
+                match forms::handle_press(&mut self.widget_tree, id, self.cursor.0, self.cursor.1) {
+                    PressResult::StartScrub => self.dragging_scrub = Some((id, self.cursor.0)),
+                    PressResult::Handled(_) | PressResult::Ignored => {}
+                }
             }
             WidgetKind::TabBar { panel_ids, content_ids, titles, on_close, .. } => {
                 if let Some(index) = self.tab_bar_clicked_index(id) {
@@ -657,6 +681,8 @@ impl<B: SurfaceBackend> App<B> {
             | WidgetKind::Label { .. }
             | WidgetKind::ScrollArea { .. }
             | WidgetKind::Popup { .. }
+            | WidgetKind::ProgressBar { .. }
+            | WidgetKind::Image { .. }
             | WidgetKind::Viewport { .. } => {}
         }
     }
@@ -737,6 +763,18 @@ impl<B: SurfaceBackend> App<B> {
                     floater.dragging_text = Some(id);
                 }
             }
+            WidgetKind::Checkbox { .. }
+            | WidgetKind::Radio { .. }
+            | WidgetKind::Toggle { .. }
+            | WidgetKind::SpinBox { .. }
+            | WidgetKind::NumericScrub { .. } => {
+                if let Some(floater) = self.floating.get_mut(&window_id) {
+                    match forms::handle_press(&mut floater.widget_tree, id, cursor.0, cursor.1) {
+                        PressResult::StartScrub => floater.dragging_scrub = Some((id, cursor.0)),
+                        PressResult::Handled(_) | PressResult::Ignored => {}
+                    }
+                }
+            }
             WidgetKind::TabBar { panel_ids, titles, on_close, .. } => {
                 if let Some(index) = Self::floating_tab_bar_clicked_index(floater, id) {
                     if let Some(rect) = floater.widget_tree.absolute_rect(id) {
@@ -790,6 +828,8 @@ impl<B: SurfaceBackend> App<B> {
             | WidgetKind::Label { .. }
             | WidgetKind::ScrollArea { .. }
             | WidgetKind::Popup { .. }
+            | WidgetKind::ProgressBar { .. }
+            | WidgetKind::Image { .. }
             | WidgetKind::Viewport { .. } => {}
         }
     }
@@ -1709,6 +1749,7 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                     || self.dragging_splitter.is_some()
                     || self.dragging_panel_title.is_some()
                     || self.dragging_text.is_some()
+                    || self.dragging_scrub.is_some()
                     || self.dragging_scrollbar.is_some();
                 if self.dragging_slider.is_some() {
                     self.update_dragged_slider();
@@ -1718,6 +1759,13 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                 }
                 if let Some(id) = self.dragging_text {
                     text_input::handle_drag(&mut self.widget_tree, id, self.cursor.0, &mut self.chrome);
+                }
+                if let Some((id, last_x)) = self.dragging_scrub {
+                    let dx = self.cursor.0 - last_x;
+                    if dx != 0.0 {
+                        forms::scrub_by(&mut self.widget_tree, id, dx);
+                        self.dragging_scrub = Some((id, self.cursor.0));
+                    }
                 }
                 if self.dragging_splitter.is_some() {
                     self.update_dragged_splitter();
@@ -1737,16 +1785,27 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                 button: MouseButton::Left,
                 ..
             } => match state {
-                ElementState::Pressed => self.handle_mouse_press(),
+                ElementState::Pressed => {
+                    self.handle_mouse_press();
+                    // Focus changes and form-control toggles mark the tree dirty; redraw so
+                    // checkboxes / radios / spin buttons update without waiting on a wake.
+                    if self.widget_tree.is_dirty() {
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                }
                 ElementState::Released => {
                     let was_dragging = self.dragging_slider.is_some()
                         || self.dragging_splitter.is_some()
                         || self.dragging_panel_title.is_some()
                         || self.dragging_text.is_some()
+                        || self.dragging_scrub.is_some()
                         || self.dragging_scrollbar.is_some();
                     self.dragging_slider = None;
                     self.dragging_splitter = None;
                     self.dragging_text = None;
+                    self.dragging_scrub = None;
                     self.dragging_scrollbar = None;
                     release_button(&self.widget_tree, self.pressed_button.take(), self.cursor);
                     // Floater OS-window drag is owned by the floater's mouse-up path.
@@ -1863,11 +1922,19 @@ impl<B: SurfaceBackend> App<B> {
                     f.dragging_slider.is_some()
                         || f.dragging_splitter.is_some()
                         || f.dragging_text.is_some()
+                        || f.dragging_scrub.is_some()
                         || f.dragging_scrollbar.is_some()
                 });
                 if let Some(floater) = self.floating.get_mut(&window_id) {
                     if let Some(id) = floater.dragging_text {
                         text_input::handle_drag(&mut floater.widget_tree, id, floater.cursor.0, &mut floater.chrome);
+                    }
+                    if let Some((id, last_x)) = floater.dragging_scrub {
+                        let dx = floater.cursor.0 - last_x;
+                        if dx != 0.0 {
+                            forms::scrub_by(&mut floater.widget_tree, id, dx);
+                            floater.dragging_scrub = Some((id, floater.cursor.0));
+                        }
                     }
                     if let Some(drag) = floater.dragging_scrollbar {
                         drag_scrollbar(&mut floater.widget_tree, drag, floater.cursor);
@@ -1900,12 +1967,20 @@ impl<B: SurfaceBackend> App<B> {
                 button: MouseButton::Left,
                 ..
             } => match state {
-                ElementState::Pressed => self.handle_floating_mouse_press(window_id),
+                ElementState::Pressed => {
+                    self.handle_floating_mouse_press(window_id);
+                    if self.floating.get(&window_id).is_some_and(|f| f.widget_tree.is_dirty()) {
+                        if let Some(floater) = self.floating.get(&window_id) {
+                            floater.window.request_redraw();
+                        }
+                    }
+                }
                 ElementState::Released => {
                     let was_dragging = self.floating.get(&window_id).is_some_and(|f| {
                         f.dragging_slider.is_some()
                             || f.dragging_splitter.is_some()
                             || f.dragging_text.is_some()
+                            || f.dragging_scrub.is_some()
                             || f.dragging_scrollbar.is_some()
                     }) || self.dragging_floating_panel.is_some_and(|(id, _)| id == window_id)
                         || self.dragging_floating_resize.as_ref().is_some_and(|d| d.window_id == window_id)
@@ -1914,6 +1989,7 @@ impl<B: SurfaceBackend> App<B> {
                         floater.dragging_slider = None;
                         floater.dragging_splitter = None;
                         floater.dragging_text = None;
+                        floater.dragging_scrub = None;
                         floater.dragging_scrollbar = None;
                         release_button(&floater.widget_tree, floater.pressed_button.take(), floater.cursor);
                     }
@@ -2090,6 +2166,7 @@ pub fn run<B: SurfaceBackend>(
         dragging_slider: None,
         dragging_splitter: None,
         dragging_text: None,
+        dragging_scrub: None,
         dragging_scrollbar: None,
         pressed_button: None,
         last_click: None,
