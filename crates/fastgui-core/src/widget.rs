@@ -73,10 +73,11 @@ pub enum PopupSide {
 /// window's edges (layout units).
 const POPUP_GAP: f32 = 2.0;
 
-/// Horizontal space between a `TextInput`'s edge and its text (layout units). Shared by
-/// chrome's drawing and `fastgui-app`'s click-to-caret, so both agree on where text starts.
+/// Horizontal space between a `TextInput` / `TextArea`'s edge and its text (layout units).
+/// Shared by chrome's drawing and `fastgui-app`'s click-to-caret, so both agree on where text starts.
 pub const TEXT_INPUT_PADDING: f32 = 8.0;
-const TEXT_INPUT_VERTICAL_PADDING: f32 = 6.0;
+/// Vertical inset for `TextInput` / `TextArea` content (layout units).
+pub const TEXT_INPUT_VERTICAL_PADDING: f32 = 6.0;
 
 /// Drawn checkbox / radio indicator size (layout units). Shared by measure, chrome, and hit tests.
 pub const CHECK_SIZE: f32 = 18.0;
@@ -283,6 +284,22 @@ pub enum WidgetKind {
         on_submit: Option<TextCallback>,
         mirror: Option<Readback<String>>,
     },
+    /// A multi-line editable text field (`QTextEdit`) with hard newlines only (no soft wrap yet).
+    /// Same editing/IME/`mirror` model as `TextInput`; `scroll_y` keeps the caret line in view.
+    TextArea {
+        edit: TextEdit,
+        placeholder: String,
+        font_size: f32,
+        text_color: Color,
+        placeholder_color: Color,
+        background: Color,
+        selection_color: Color,
+        scroll_y: f32,
+        preedit: Option<(String, Option<(usize, usize)>)>,
+        on_change: Option<TextCallback>,
+        on_submit: Option<TextCallback>,
+        mirror: Option<Readback<String>>,
+    },
     /// A viewport onto its (usually single) child, scrolled by `offset` (layout units, both
     /// axes; clamped to the content's overflow at each layout). Children lay out at their
     /// natural size and are shifted by `-offset`; everything inside is clipped to this node's
@@ -409,6 +426,23 @@ pub enum WidgetKind {
         image_id: u64,
         frames: FrameSlot<crate::CpuFrame>,
     },
+    /// Closed field showing the selected item (or `placeholder`) with a chevron; click / Space /
+    /// ArrowDown opens a non-modal `Popup` anchored below with a `ListView` of `items`.
+    /// `popup_id` is the open dropdown (runtime only — `describe` leaves it `None`).
+    ComboBox {
+        items: Vec<String>,
+        selected: Option<usize>,
+        placeholder: String,
+        font_size: f32,
+        text_color: Color,
+        placeholder_color: Color,
+        background: Color,
+        border: Color,
+        on_change: Option<IndexCallback>,
+        mirror: Option<Readback<Option<usize>>>,
+        /// Open dropdown popup id, if any (runtime; describe leaves None).
+        popup_id: Option<WidgetId>,
+    },
 }
 
 impl WidgetKind {
@@ -419,12 +453,14 @@ impl WidgetKind {
             WidgetKind::Button { .. }
                 | WidgetKind::Slider { .. }
                 | WidgetKind::TextInput { .. }
+                | WidgetKind::TextArea { .. }
                 | WidgetKind::ListView { .. }
                 | WidgetKind::Checkbox { .. }
                 | WidgetKind::Radio { .. }
                 | WidgetKind::Toggle { .. }
                 | WidgetKind::SpinBox { .. }
                 | WidgetKind::NumericScrub { .. }
+                | WidgetKind::ComboBox { .. }
         )
     }
 }
@@ -1374,7 +1410,7 @@ impl Default for WidgetTree {
 /// this only has to be good enough that layout doesn't look broken before that happens. Good
 /// enough for M4; swap for measuring through `fastgui-chrome`'s font system if/when this
 /// approximation visibly matters (e.g. non-Latin scripts, tight-fitting layouts).
-const LINE_HEIGHT_RATIO: f32 = 1.3;
+pub const LINE_HEIGHT_RATIO: f32 = 1.3;
 
 fn measure_text(text: &str, font_size: f32) -> Size<f32> {
     const AVG_ADVANCE_RATIO: f32 = 0.55;
@@ -1417,6 +1453,11 @@ fn measure_leaf<'m>(
             width: 160.0,
             height: font_size * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
         },
+        Some(WidgetKind::TextArea { font_size, .. }) => Size {
+            // Default ~4 lines tall; soft wrap is not modeled — height is for hard newlines.
+            width: 160.0,
+            height: font_size * LINE_HEIGHT_RATIO * 4.0 + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
+        },
         Some(WidgetKind::Checkbox { label, font_size, .. } | WidgetKind::Radio { label, font_size, .. }) => {
             let text_size = measure_text(label, *font_size);
             Size {
@@ -1434,6 +1475,10 @@ fn measure_leaf<'m>(
             height: font_size * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
         },
         Some(WidgetKind::ProgressBar { .. }) => Size { width: 120.0, height: PROGRESS_HEIGHT },
+        Some(WidgetKind::ComboBox { font_size, .. }) => Size {
+            width: 160.0,
+            height: font_size * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
+        },
         Some(
             WidgetKind::Container { .. }
             | WidgetKind::Slider { .. }
@@ -2422,5 +2467,34 @@ mod tests {
         assert!((s.width - 100.0).abs() < 1.0);
         let expected_h = 14.0 * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING;
         assert!((s.height - expected_h).abs() < 1.0);
+    }
+
+    #[test]
+    fn combo_box_measure_and_focusable() {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let id = tree.new_node(
+            measure_style(),
+            WidgetKind::ComboBox {
+                items: vec!["a".into(), "b".into()],
+                selected: None,
+                placeholder: "Pick…".into(),
+                font_size: 14.0,
+                text_color: Color::TRANSPARENT,
+                placeholder_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                border: Color::TRANSPARENT,
+                on_change: None,
+                mirror: None,
+                popup_id: None,
+            },
+        );
+        tree.add_child(root, id);
+        tree.compute_layout(400.0, 200.0);
+        let rect = tree.absolute_rect(id).expect("laid out");
+        assert!((rect.width - 160.0).abs() < 1.0);
+        let expected_h = 14.0 * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING;
+        assert!((rect.height - expected_h).abs() < 1.0);
+        assert!(tree.kind(id).unwrap().is_focusable());
     }
 }
