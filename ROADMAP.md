@@ -1327,14 +1327,20 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 
 ### 7B. Tier 1 — core form controls
 
-- Single-line and multi-line text input (`QLineEdit` / `QTextEdit`)
-- Checkbox, radio group, toggle switch
-- Spin box (int/float) and a drag-to-scrub numeric field
+- Single-line and multi-line text input (`QLineEdit` / `QTextEdit`) — **single-line done**
+  (see 7A.2); multi-line still open.
+- Checkbox, radio group, toggle switch — **Done (2026-09-27):** `Checkbox` / `Radio` (shared
+  `group` id for exclusivity) / `Toggle`; click + Space/Enter; focusable.
+- Spin box (int/float) and a drag-to-scrub numeric field — **Done (2026-09-27):** `SpinBox`
+  (± buttons, arrows/Page/Home/End) and `NumericScrub` (horizontal drag); `value` mirror
+  getters; scrub also works on a SpinBox's value area.
 - Combo box / dropdown (needs 7A.4)
-- Progress bar
-- Scroll area (needs 7A.3)
-- Grid layout — `taffy` already supports CSS Grid, so this is mostly bindings
-- Image widget
+- Progress bar — **Done (2026-09-27):** `ProgressBar` (display-only track + fill).
+- Scroll area — **Done** (see 7A.3).
+- Grid layout — **Done (2026-09-27):** `Grid(children, columns=N)` via taffy CSS Grid
+  (`evenly_sized_tracks`).
+- Image widget — **Done (2026-09-27):** `Image` + `set_image` (same GPU layer path as
+  `Viewport`). Demo: `form_controls_demo.py`.
 
 ### 7C. Tier 2 — application structure
 
