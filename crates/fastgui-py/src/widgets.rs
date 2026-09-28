@@ -349,6 +349,9 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
     if let Ok(w) = obj.cast::<ProgressBar>() {
         return Ok(w.borrow().describe());
     }
+    if let Ok(w) = obj.cast::<ComboBox>() {
+        return Ok(w.borrow().describe());
+    }
     if let Ok(w) = obj.cast::<Image>() {
         return Ok(w.borrow().describe());
     }
@@ -378,7 +381,7 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
         return Ok(w.borrow().describe_widget());
     }
     Err(PyTypeError::new_err(
-        "expected a fastgui widget (Box, Grid, Label, Button, Slider, TextInput, TextArea, ScrollArea, Checkbox, Radio, Toggle, SpinBox, NumericScrub, ProgressBar, Image, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
+        "expected a fastgui widget (Box, Grid, Label, Button, Slider, TextInput, TextArea, ScrollArea, Checkbox, Radio, Toggle, SpinBox, NumericScrub, ProgressBar, ComboBox, Image, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
     ))
 }
 
@@ -2022,6 +2025,170 @@ impl ProgressBar {
     }
 }
 
+/// Closed dropdown field: shows the selected item (or placeholder) and opens a popup list on
+/// click / Space / ArrowDown.
+#[pyclass]
+pub(crate) struct ComboBox {
+    id: IdCell,
+    sender: SenderCell,
+    items: Arc<Mutex<Arc<Vec<String>>>>,
+    selected: Readback<Option<usize>>,
+    placeholder: String,
+    font_size: Option<FontSize>,
+    width: Option<f32>,
+    flex_grow: f32,
+    text_color: Option<(f32, f32, f32, f32)>,
+    placeholder_color: Option<(f32, f32, f32, f32)>,
+    background: Option<(f32, f32, f32, f32)>,
+    border: Option<(f32, f32, f32, f32)>,
+    on_change: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl ComboBox {
+    #[new]
+    #[pyo3(signature = (
+        items=None,
+        selected=None,
+        placeholder="",
+        on_change=None,
+        font_size=None,
+        width=None,
+        flex_grow=0.0,
+        text_color=None,
+        placeholder_color=None,
+        background=None,
+        border=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        items: Option<Vec<String>>,
+        selected: Option<usize>,
+        placeholder: &str,
+        on_change: Option<Py<PyAny>>,
+        font_size: Option<FontSize>,
+        width: Option<f32>,
+        flex_grow: f32,
+        text_color: Option<(f32, f32, f32, f32)>,
+        placeholder_color: Option<(f32, f32, f32, f32)>,
+        background: Option<(f32, f32, f32, f32)>,
+        border: Option<(f32, f32, f32, f32)>,
+    ) -> Self {
+        let items = items.unwrap_or_default();
+        let selected = selected.filter(|&i| i < items.len());
+        Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            items: Arc::new(Mutex::new(Arc::new(items))),
+            selected: Readback::new(selected),
+            placeholder: placeholder.to_owned(),
+            font_size,
+            width,
+            flex_grow,
+            text_color,
+            placeholder_color,
+            background,
+            border,
+            on_change,
+        }
+    }
+
+    /// Replace the dropdown rows (clears the selection). Works before attaching.
+    fn set_items(&self, items: Vec<String>) -> PyResult<()> {
+        let items = Arc::new(items);
+        *self.items.lock().unwrap_or_else(|p| p.into_inner()) = items.clone();
+        self.selected.set(None);
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::ComboBox { items: current, selected, popup_id, .. } = kind {
+                *current = Arc::unwrap_or_clone(items);
+                *selected = None;
+                *popup_id = None;
+            }
+        })
+    }
+
+    /// Select row `index` (clamped) or clear with `None`. Does not open the popup; fires
+    /// `on_change` only through the live tree path when attached.
+    #[pyo3(signature = (index))]
+    fn select(&self, index: Option<usize>) -> PyResult<()> {
+        let items = self.items.lock().unwrap_or_else(|p| p.into_inner());
+        let index = index.filter(|&i| i < items.len());
+        drop(items);
+        self.selected.set(index);
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::ComboBox { selected, mirror, items, on_change, .. } = kind {
+                let index = index.filter(|&i| i < items.len());
+                *selected = index;
+                if let Some(mirror) = mirror {
+                    mirror.set(index);
+                }
+                if let (Some(callback), Some(i)) = (on_change.clone(), index) {
+                    callback(i);
+                }
+            }
+        })
+    }
+
+    /// The selected row, or `None`. Safe from any thread.
+    #[getter]
+    fn selected(&self) -> Option<usize> {
+        self.selected.get()
+    }
+}
+
+impl ComboBox {
+    fn describe(&self) -> DescribedWidget {
+        let on_change = self.on_change.as_ref().map(|cb| Python::attach(|py| cb.clone_ref(py)));
+        let mirror = self.selected.clone();
+        let on_change: Option<IndexCallback> = on_change.map(|callback| {
+            Arc::new(move |index: usize| {
+                mirror.set(Some(index));
+                Python::attach(|py| {
+                    if let Err(err) = callback.call1(py, (index,)) {
+                        err.print(py);
+                    }
+                });
+            }) as IndexCallback
+        });
+        // When there is no user callback, still publish through the mirror for `.selected`.
+        let on_change = on_change.or_else(|| {
+            let mirror = self.selected.clone();
+            Some(Arc::new(move |index: usize| {
+                mirror.set(Some(index));
+            }) as IndexCallback)
+        });
+        let items = self.items.lock().unwrap_or_else(|p| p.into_inner()).as_ref().clone();
+        let selected = self.selected.get().filter(|&i| i < items.len());
+        DescribedWidget {
+            style: StyleParams::leaf(self.flex_grow, self.width, None),
+            kind: WidgetKind::ComboBox {
+                items,
+                selected,
+                placeholder: self.placeholder.clone(),
+                font_size: self.font_size.unwrap_or(FontSize::Body).resolve(),
+                text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
+                placeholder_color: rgba(self.placeholder_color.unwrap_or(crate::theme::palette().text_muted)),
+                background: rgba(self.background.unwrap_or(crate::theme::palette().surface_alt)),
+                border: rgba(self.border.unwrap_or(crate::theme::palette().border)),
+                on_change,
+                mirror: Some(self.selected.clone()),
+                popup_id: None,
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+        }
+    }
+}
+
 /// A static CPU image composited like a `Viewport`. Feed pixels with `set_image`.
 #[pyclass]
 pub(crate) struct Image {
@@ -2803,6 +2970,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SpinBox>()?;
     m.add_class::<NumericScrub>()?;
     m.add_class::<ProgressBar>()?;
+    m.add_class::<ComboBox>()?;
     m.add_class::<Image>()?;
     m.add_class::<Grid>()?;
     m.add_class::<BoxWidget>()?;

@@ -342,7 +342,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use fastgui_core::taffy::prelude::*;
     use fastgui_core::widget::{Color, WidgetKind};
 
     use super::*;

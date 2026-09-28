@@ -1337,7 +1337,9 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 - Spin box (int/float) and a drag-to-scrub numeric field — **Done (2026-09-27):** `SpinBox`
   (± buttons, arrows/Page/Home/End) and `NumericScrub` (horizontal drag); `value` mirror
   getters; scrub also works on a SpinBox's value area.
-- Combo box / dropdown (needs 7A.4)
+- Combo box / dropdown — **Done (2026-09-28):** `ComboBox` closed field + chevron; click /
+  Space / ArrowDown opens a non-modal `Popup` with a `ListView`; pick/activate sets selection,
+  fires `on_change`, closes via existing dismiss. Demo: `form_controls_demo.py`.
 - Progress bar — **Done (2026-09-27):** `ProgressBar` (display-only track + fill).
 - Scroll area — **Done** (see 7A.3).
 - Grid layout — **Done (2026-09-27):** `Grid(children, columns=N)` via taffy CSS Grid

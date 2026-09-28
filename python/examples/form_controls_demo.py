@@ -1,4 +1,4 @@
-"""M7 7B demo: checkbox, radio, toggle, spin box, numeric scrub, progress, grid, image, text area."""
+"""M7 7B demo: checkbox, radio, toggle, spin, scrub, progress, combo, grid, image, text area."""
 
 import numpy as np
 
@@ -6,7 +6,7 @@ import fastgui as fg
 
 
 def main() -> None:
-    window = fg.Window(title="fastgui — M7 form controls", width=640, height=640)
+    window = fg.Window(title="fastgui — M7 form controls", width=640, height=680)
     status = fg.Label("Try the controls…", font_size=14.0, color=(0.7, 0.75, 0.85, 1.0))
 
     def set_status(text: str) -> None:
@@ -52,6 +52,13 @@ def main() -> None:
         width=120.0,
         on_change=lambda v: set_status(f"scrub={v:.1f}"),
     )
+    fruits = ["Apple", "Banana", "Cherry", "Date", "Elderberry", "Fig", "Grape", "Honeydew", "Kiwi"]
+    combo = fg.ComboBox(
+        items=fruits,
+        placeholder="Pick a fruit…",
+        width=200.0,
+        on_change=lambda i: set_status(f"combo={fruits[i]}"),
+    )
 
     image = fg.Image(width=160.0, height=96.0, flex_grow=0.0)
     # Simple gradient checker so the GPU image path is visibly exercised.
@@ -81,6 +88,8 @@ def main() -> None:
             spin,
             fg.Label("NumericScrub", font_size=13.0, color=(0.6, 0.65, 0.7, 1.0)),
             scrub,
+            fg.Label("ComboBox", font_size=13.0, color=(0.6, 0.65, 0.7, 1.0)),
+            combo,
             fg.Label("Progress", font_size=13.0, color=(0.6, 0.65, 0.7, 1.0)),
             progress,
             fg.Label("Image", font_size=13.0, color=(0.6, 0.65, 0.7, 1.0)),

@@ -992,6 +992,24 @@ fn form_controls_rasterize_without_panicking() {
     add(
         &mut tree,
         column,
+        Style { size: Size { width: Dimension::length(160.0), height: Dimension::length(28.0) }, ..Default::default() },
+        WidgetKind::ComboBox {
+            items: vec!["One".into(), "Two".into()],
+            selected: Some(0),
+            placeholder: "Pick…".into(),
+            font_size: 14.0,
+            text_color: text,
+            placeholder_color: Color([0.5, 0.5, 0.55, 1.0]),
+            background: bg,
+            border: Color([0.32, 0.35, 0.42, 1.0]),
+            on_change: None,
+            mirror: None,
+            popup_id: None,
+        },
+    );
+    add(
+        &mut tree,
+        column,
         Style { size: Size { width: Dimension::length(200.0), height: Dimension::length(72.0) }, ..Default::default() },
         WidgetKind::TextArea {
             edit: fastgui_core::text_edit::TextEdit::new_multiline("a\nb\nc"),

@@ -470,12 +470,33 @@ impl ChromeRenderer {
                     border,
                     ..
                 } => {
-                    // Closed field; dropdown popup is drawn as its own Popup/ListView nodes.
                     push_fill(&mut ops, rect, *background);
                     push_outline(&mut ops, rect, scale.max(1.0), *border);
+                    const CHEVRON_WIDTH: f32 = 22.0;
+                    let pad = TEXT_INPUT_PADDING;
+                    let chevron = WidgetRect {
+                        x: logical_rect.x + logical_rect.width - CHEVRON_WIDTH,
+                        y: logical_rect.y,
+                        width: CHEVRON_WIDTH,
+                        height: logical_rect.height,
+                    };
+                    let text_box = WidgetRect {
+                        x: logical_rect.x + pad,
+                        y: logical_rect.y,
+                        width: (logical_rect.width - pad - CHEVRON_WIDTH).max(0.0),
+                        height: logical_rect.height,
+                    };
                     let label = selected.and_then(|i| items.get(i).map(String::as_str)).unwrap_or(placeholder);
                     let color = if selected.is_some() { *text_color } else { *placeholder_color };
-                    self.push_text(&mut ops, rect, label, *font_size * scale, color);
+                    let line = font_size * LINE_HEIGHT_RATIO;
+                    let text_line = WidgetRect {
+                        x: text_box.x,
+                        y: text_box.y + (text_box.height - line) / 2.0,
+                        width: text_box.width,
+                        height: line.min(text_box.height),
+                    };
+                    self.push_text(&mut ops, scale_rect(text_line, scale), label, font_size * scale, color);
+                    self.push_centered_text(&mut ops, scale_rect(chevron, scale), "▾", font_size * scale * 0.85, color);
                 }
             }
             if tree.focused() == Some(id) {

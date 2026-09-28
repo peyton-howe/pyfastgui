@@ -312,6 +312,30 @@ class ProgressBar:
     def value(self) -> float: ...
     def set_value(self, value: float) -> None: ...
 
+class ComboBox:
+    """Closed dropdown field. Click / Space / ArrowDown opens a popup list; choosing a row
+    (or activating) sets the selection, fires `on_change(index)`, and closes the popup."""
+    def __init__(
+        self,
+        items: Sequence[str] | None = None,
+        selected: int | None = None,
+        placeholder: str = "",
+        on_change: Callable[[int], None] | None = None,
+        font_size: FontSize | None = None,
+        width: float | None = None,
+        flex_grow: float = 0.0,
+        text_color: RGBA | None = None,
+        placeholder_color: RGBA | None = None,
+        background: RGBA | None = None,
+        border: RGBA | None = None,
+    ) -> None: ...
+    def set_items(self, items: Sequence[str]) -> None:
+        """Replace the rows (clears the selection). Works before attaching."""
+    def select(self, index: int | None) -> None:
+        """Select a row (clamped) or clear with `None`."""
+    @property
+    def selected(self) -> int | None: ...
+
 class Image:
     """Static CPU image composited like a `Viewport`. Feed pixels with `set_image`."""
     def __init__(
@@ -353,6 +377,7 @@ Widget = Union[
     SpinBox,
     NumericScrub,
     ProgressBar,
+    ComboBox,
     Image,
     Grid,
     "Box",
