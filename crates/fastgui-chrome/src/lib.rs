@@ -834,13 +834,14 @@ impl ChromeRenderer {
         let cx = (box_logical.x + box_logical.width * 0.5) * scale;
         let cy = (box_logical.y + box_logical.height * 0.5) * scale;
         let radius = (box_logical.width * 0.5) * scale;
-        ops.push(Op::Circle { cx, cy, radius, color: box_color, sprite: OnceLock::new(), clip: None });
-        // Thin ring so an unchecked radio still reads as a control against dark chrome.
+        // Accent ring around a `box_color` disc, like the checkbox's outline + fill — both from
+        // the theme, so it reads in light themes too (the inner disc used to be fixed dark).
+        ops.push(Op::Circle { cx, cy, radius, color: dot_color, sprite: OnceLock::new(), clip: None });
         ops.push(Op::Circle {
             cx,
             cy,
             radius: (radius - (1.5 * scale).max(1.0)).max(1.0),
-            color: Color([0.10, 0.11, 0.13, 1.0]),
+            color: box_color,
             sprite: OnceLock::new(),
             clip: None,
         });

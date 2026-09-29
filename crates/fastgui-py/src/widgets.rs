@@ -72,9 +72,23 @@ fn wrap_callback_bool(callback: Py<PyAny>) -> BoolCallback {
     })
 }
 
-static NEXT_IMAGE_ID: AtomicU64 = AtomicU64::new(1);
+/// `Image` layers share the renderer's layer map with `Viewport`s (fastgui-app's viewport/image walk),
+/// so they must draw ids from the same counter — separate counters both started at 1 and the
+/// first `Image` showed the first `Viewport`'s frames.
 fn next_image_id() -> u64 {
-    NEXT_IMAGE_ID.fetch_add(1, Ordering::Relaxed)
+    crate::next_viewport_id()
+}
+
+/// `value` clamped to the range between `a` and `b` in either order. `f32::clamp` panics when
+/// `min > max` or a bound is NaN — on the render thread that took the whole app down for a
+/// `ProgressBar(min=1, max=0).set_value(...)`.
+fn clamp_range(value: f32, a: f32, b: f32) -> f32 {
+    let (lo, hi) = (a.min(b), a.max(b));
+    if lo.is_nan() || hi.is_nan() {
+        value
+    } else {
+        value.clamp(lo, hi)
+    }
 }
 
 static NEXT_RADIO_GROUP: AtomicU64 = AtomicU64::new(1);
@@ -761,7 +775,7 @@ impl Slider {
     fn set_value(&self, value: f32) -> PyResult<()> {
         mutate(&self.id, &self.sender, move |kind| {
             if let WidgetKind::Slider { value: current, min, max, .. } = kind {
-                *current = value.clamp(*min, *max);
+                *current = clamp_range(value, *min, *max);
             }
         })
     }
@@ -1595,8 +1609,8 @@ impl Radio {
     fn describe(&self) -> DescribedWidget {
         let mirror = self.selected.clone();
         let user = self.on_select.as_ref().map(|cb| Python::attach(|py| cb.clone_ref(py)));
-        // Peers cleared by `forms::select_radio` don't get a callback, so their mirrors can
-        // lag until the next rebuild — fine for demos that key off `on_select`.
+        // Peers cleared by `forms::select_radio` don't get a callback; their `mirror` (below)
+        // is cleared there instead.
         let on_select: ClickCallback = Arc::new(move || {
             mirror.set(true);
             if let Some(callback) = user.as_ref() {
@@ -1618,6 +1632,7 @@ impl Radio {
                 box_color: rgba(self.box_color.unwrap_or(crate::theme::palette().surface_alt)),
                 dot_color: rgba(self.dot_color.unwrap_or(crate::theme::palette().accent)),
                 on_select: Some(on_select),
+                mirror: Some(self.selected.clone()),
             },
             id_cell: self.id.clone(),
             sender_cell: self.sender.clone(),
@@ -1999,7 +2014,7 @@ impl ProgressBar {
         }
         mutate(&self.id, &self.sender, move |kind| {
             if let WidgetKind::ProgressBar { value: current, min, max, .. } = kind {
-                *current = value.clamp(*min, *max);
+                *current = clamp_range(value, *min, *max);
             }
         })
     }
@@ -2098,14 +2113,22 @@ impl ComboBox {
         let items = Arc::new(items);
         *self.items.lock().unwrap_or_else(|p| p.into_inner()) = items.clone();
         self.selected.set(None);
-        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
-            return Ok(());
-        }
-        mutate(&self.id, &self.sender, move |kind| {
-            if let WidgetKind::ComboBox { items: current, selected, popup_id, .. } = kind {
-                *current = Arc::unwrap_or_clone(items);
-                *selected = None;
-                *popup_id = None;
+        let id = *self.id.lock().unwrap_or_else(|p| p.into_inner());
+        let sender = self.sender.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let (Some(id), Some(sender)) = (id, sender) else { return Ok(()) };
+        // Close an open dropdown too: it holds a copy of the old rows, and a pick in it would
+        // select that index in the new rows (and leave the stale list open).
+        send_tree_mutation(&sender, move |tree| {
+            let mut open = None;
+            tree.mutate_kind(id, |kind| {
+                if let WidgetKind::ComboBox { items: current, selected, popup_id, .. } = kind {
+                    *current = Arc::unwrap_or_clone(items);
+                    *selected = None;
+                    open = popup_id.take();
+                }
+            });
+            if let Some(popup) = open.filter(|&p| matches!(tree.kind(p), Some(WidgetKind::Popup { .. }))) {
+                tree.close_popup(popup);
             }
         })
     }
@@ -2228,6 +2251,9 @@ impl Image {
         }
         if !buffer.is_c_contiguous() {
             return Err(PyValueError::new_err("image buffer must be C-contiguous"));
+        }
+        if shape[0] == 0 || shape[1] == 0 {
+            return Err(PyValueError::new_err("image must be at least 1x1 pixels"));
         }
         let height = shape[0] as u32;
         let width = shape[1] as u32;

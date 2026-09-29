@@ -71,8 +71,11 @@ pub fn select_radio(tree: &mut WidgetTree, id: WidgetId) -> bool {
         .collect();
     for peer in peers {
         tree.mutate_kind(peer, |kind| {
-            if let WidgetKind::Radio { selected, .. } = kind {
+            if let WidgetKind::Radio { selected, mirror, .. } = kind {
                 *selected = peer == id;
+                if let Some(mirror) = mirror {
+                    mirror.set(*selected);
+                }
             }
         });
     }
@@ -210,6 +213,10 @@ pub fn open_combo(tree: &mut WidgetTree, combo_id: WidgetId) {
 
     let width = tree.absolute_rect(combo_id).map(|r| r.width).unwrap_or(160.0);
     let row_height = (font_size * 1.25).max(18.0);
+    // Open with the selected row in view (at the top when the list can scroll that far); the
+    // dropdown shows up to 8 rows (`ListView`'s intrinsic height).
+    let visible = items.len().clamp(1, 8);
+    let scroll = selected.map_or(0.0, |i| i.min(items.len().saturating_sub(visible)) as f32 * row_height);
 
     let pick = Arc::new(move |index: usize| {
         with_active_tree(|tree| apply_combo_pick(tree, combo_id, index));
@@ -241,7 +248,7 @@ pub fn open_combo(tree: &mut WidgetTree, combo_id: WidgetId) {
         items,
         row_height,
         font_size,
-        scroll: 0.0,
+        scroll,
         selected,
         text_color,
         background,
@@ -392,6 +399,7 @@ mod tests {
                     on_select: Some(Arc::new(move || {
                         counter.fetch_add(1, Ordering::SeqCst);
                     })),
+                    mirror: Some(fastgui_core::Readback::new(selected)),
                 },
             );
             tree.add_child(root, id);
@@ -404,6 +412,38 @@ mod tests {
         assert!(matches!(tree.kind(b), Some(WidgetKind::Radio { selected: true, .. })));
         assert_eq!(clicks.load(Ordering::SeqCst), 1);
         assert!(!select_radio(&mut tree, b), "already selected is a no-op");
+    }
+
+    #[test]
+    fn selecting_a_radio_clears_peer_mirrors() {
+        // Python's `Radio.selected` reads the mirror, and a rebuild describes the radio from it:
+        // a peer cleared without its mirror came back selected after `set_theme`.
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let mirrors: Vec<_> = [true, false, false].into_iter().map(fastgui_core::Readback::new).collect();
+        let ids: Vec<_> = mirrors
+            .iter()
+            .map(|mirror| {
+                let id = tree.new_node(
+                    fixed(80.0, 20.0),
+                    WidgetKind::Radio {
+                        selected: mirror.get(),
+                        label: "r".into(),
+                        group_id: 3,
+                        font_size: 14.0,
+                        text_color: Color::TRANSPARENT,
+                        box_color: Color::TRANSPARENT,
+                        dot_color: Color::TRANSPARENT,
+                        on_select: None,
+                        mirror: Some(mirror.clone()),
+                    },
+                );
+                tree.add_child(root, id);
+                id
+            })
+            .collect();
+        assert!(select_radio(&mut tree, ids[2]));
+        assert_eq!(mirrors.iter().map(|m| m.get()).collect::<Vec<_>>(), [false, false, true]);
     }
 
     #[test]
@@ -485,6 +525,22 @@ mod tests {
             Some(WidgetKind::ComboBox { selected: Some(1), popup_id: None, .. })
         ));
         assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn open_combo_shows_the_selected_row() {
+        let items: Vec<String> = (0..200).map(|i| format!("row {i}")).collect();
+        let mut tree = WidgetTree::new();
+        let combo = tree.new_node(fixed(160.0, 28.0), combo_kind(items, Some(150), None));
+        tree.add_child(tree.root(), combo);
+        tree.compute_layout(400.0, 800.0);
+        open_combo(&mut tree, combo);
+        tree.compute_layout(400.0, 800.0);
+        let list = tree.walk().find(|&id| matches!(tree.kind(id), Some(WidgetKind::ListView { .. }))).unwrap();
+        assert!(tree.list_visible_rows(list).contains(&150), "rows {:?}", tree.list_visible_rows(list));
+        tree.list_highlight(list, 170);
+        tree.compute_layout(400.0, 800.0);
+        assert!(tree.list_visible_rows(list).contains(&170), "highlight scrolled into view: {:?}", tree.list_visible_rows(list));
     }
 
     #[test]

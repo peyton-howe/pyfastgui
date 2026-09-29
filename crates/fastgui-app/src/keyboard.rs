@@ -104,11 +104,8 @@ fn handle_key_inner(
                 if count == 0 {
                     return false;
                 }
-                tree.mutate_kind(id, |kind| {
-                    if let WidgetKind::ListView { selected, .. } = kind {
-                        *selected = Some(target);
-                    }
-                });
+                // Scrolls too: past the 8 visible rows the highlight used to move out of sight.
+                tree.list_highlight(id, target);
                 return true;
             }
             let target = match key {

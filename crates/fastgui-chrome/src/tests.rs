@@ -922,6 +922,7 @@ fn form_controls_rasterize_without_panicking() {
             box_color: bg,
             dot_color: accent,
             on_select: None,
+            mirror: None,
         },
     );
     add(

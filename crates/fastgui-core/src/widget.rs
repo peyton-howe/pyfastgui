@@ -371,6 +371,9 @@ pub enum WidgetKind {
         box_color: Color,
         dot_color: Color,
         on_select: Option<ClickCallback>,
+        /// Python's `Radio.selected`: kept in step when a peer's selection clears this one too,
+        /// so a rebuild (theme switch, `set_content`) doesn't bring back a stale selection.
+        mirror: Option<Readback<bool>>,
     },
     /// A compact on/off switch with no built-in label (pair with a `Label` in demos). Track
     /// colors swap with `checked`; thumb is always `thumb_color`.
@@ -935,6 +938,23 @@ impl WidgetTree {
         }
     }
 
+    /// Move `ListView` `id`'s highlighted row to `index` (clamped) and scroll it into view,
+    /// without `on_select` or the mirror: a combo dropdown's arrow keys, where selecting commits.
+    pub fn list_highlight(&mut self, id: WidgetId, index: usize) {
+        let view = self.absolute_rects.get(&id).map_or(0.0, |r| r.height);
+        let Some(WidgetKind::ListView { items, row_height, scroll, selected, .. }) = self.kinds.get_mut(&id) else {
+            return;
+        };
+        if items.is_empty() {
+            return;
+        }
+        let i = index.min(items.len() - 1);
+        *selected = Some(i);
+        let (top, bottom) = (i as f32 * *row_height, (i + 1) as f32 * *row_height);
+        *scroll = if view > 0.0 { scroll.min(top).max(bottom - view) } else { top };
+        self.mark_dirty();
+    }
+
     /// How many whole rows fit in `ListView` `id` (at least 1) — PageUp/PageDown's step.
     pub fn list_page_rows(&self, id: WidgetId) -> usize {
         let (Some(WidgetKind::ListView { row_height, .. }), Some(rect)) = (self.kind(id), self.absolute_rect(id)) else {
@@ -1474,7 +1494,8 @@ fn measure_leaf<'m>(
             height: font_size * LINE_HEIGHT_RATIO * 4.0 + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
         },
         Some(WidgetKind::Checkbox { label, font_size, .. } | WidgetKind::Radio { label, font_size, .. }) => {
-            let text_size = measure_text(label, *font_size);
+            // Real shaping like `Label`: the 0.55×size estimate cut wide labels short.
+            let text_size = text_size(label, *font_size);
             Size {
                 width: CHECK_SIZE + CHECK_LABEL_GAP + text_size.width,
                 height: CHECK_SIZE.max(text_size.height),
@@ -2347,6 +2368,42 @@ mod tests {
         assert!(target.y >= i.y && target.y + target.height <= i.y + i.height, "and the inner area {i:?}");
         assert_eq!(tree.scroll_offset(inner), Some((0.0, 100.0)));
         assert_eq!(tree.scroll_offset(outer), Some((0.0, 160.0)), "not 260: the inner scroll is accounted for");
+    }
+
+    #[test]
+    fn measured_layout_sizes_checkbox_and_radio_labels_by_real_text_width() {
+        struct Wide;
+        impl TextMeasure for Wide {
+            fn caret_x(&mut self, text: &str, _: f32, index: usize) -> f32 {
+                text[..index].chars().count() as f32 * 20.0
+            }
+            fn index_at(&mut self, _: &str, _: f32, _: f32) -> usize {
+                0
+            }
+        }
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let row = tree.new_node(
+            Style { flex_direction: FlexDirection::Row, align_items: Some(AlignItems::FLEX_START), ..Default::default() },
+            WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+        );
+        tree.add_child(root, row);
+        let check = tree.new_node(
+            Style::default(),
+            WidgetKind::Checkbox {
+                checked: false,
+                label: "Modal".into(),
+                font_size: 14.0,
+                text_color: Color::TRANSPARENT,
+                box_color: Color::TRANSPARENT,
+                check_color: Color::TRANSPARENT,
+                on_change: None,
+            },
+        );
+        tree.add_child(row, check);
+        tree.compute_layout_measured(600.0, 200.0, &mut Wide);
+        let width = tree.absolute_rect(check).unwrap().width;
+        assert_eq!(width, CHECK_SIZE + CHECK_LABEL_GAP + 100.0, "label measured 5 × 20, not the 5 × 7.7 estimate");
     }
 
     #[test]
