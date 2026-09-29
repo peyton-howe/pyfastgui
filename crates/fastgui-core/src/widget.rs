@@ -121,6 +121,8 @@ const CLOSE_MAX_WIDTH_FRACTION: f32 = 0.4;
 pub enum PopupAnchor {
     /// Next to a widget, on `side` (flipped to the opposite side when there's no room there).
     Widget(WidgetId, PopupSide),
+    /// Like `Widget`, but centers on the cross-axis (tooltips under/over their target).
+    WidgetCentered(WidgetId, PopupSide),
     /// With its top-left at a window point (flipped up/left near the window's far edges).
     Point(f32, f32),
     /// Centered in the window (dialogs).
@@ -1362,6 +1364,25 @@ impl WidgetTree {
             .find(|id| matches!(self.kind(*id), Some(WidgetKind::Popup { .. })))
     }
 
+    /// How many popup nodes are currently open (menus, dialogs, tooltips).
+    pub fn open_popup_count(&self) -> usize {
+        self.taffy
+            .children(self.root)
+            .ok()
+            .map(|children| {
+                children
+                    .into_iter()
+                    .filter(|id| matches!(self.kind(*id), Some(WidgetKind::Popup { .. })))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Depth-first ids in `id`'s subtree (including `id`).
+    pub fn subtree_ids(&self, id: WidgetId) -> Vec<WidgetId> {
+        self.walk_from(id).collect()
+    }
+
     /// The popup `id` is inside (or is), if any.
     pub fn popup_of(&self, id: WidgetId) -> Option<WidgetId> {
         let mut node = id;
@@ -1376,6 +1397,11 @@ impl WidgetTree {
     /// What a press at `(x, y)` does with popups open: `Pass` lets it through to whatever's
     /// under it; `Consumed` means it dismissed a popup (outside click) or hit a modal popup's
     /// dimmed backdrop, and nothing else should see it.
+    ///
+    /// Outside a nested non-modal stack (submenu over menu), every popup that does not contain
+    /// the click is dismissed so one outside click closes the whole menu hierarchy. A click
+    /// that lands in a lower popup (parent menu while a submenu is open) only closes the
+    /// layers above it and then `Pass`es through.
     pub fn popup_press(&mut self, x: f32, y: f32) -> PopupPress {
         let Some(top) = self.topmost_popup() else { return PopupPress::Pass };
         if self.absolute_rect(top).is_some_and(|r| r.contains(x, y)) {
@@ -1384,7 +1410,18 @@ impl WidgetTree {
         match self.kind(top) {
             Some(WidgetKind::Popup { modal: true, .. }) => PopupPress::Consumed,
             _ => {
-                self.dismiss_popup();
+                while let Some(id) = self.topmost_popup() {
+                    match self.kind(id) {
+                        Some(WidgetKind::Popup { modal: true, .. }) => return PopupPress::Consumed,
+                        Some(WidgetKind::Popup { .. }) => {
+                            if self.absolute_rect(id).is_some_and(|r| r.contains(x, y)) {
+                                return PopupPress::Pass;
+                            }
+                            self.dismiss_popup();
+                        }
+                        _ => break,
+                    }
+                }
                 PopupPress::Consumed
             }
         }
@@ -1599,6 +1636,35 @@ fn place_popup(
     let (w, h) = (size.width, size.height);
     let fits_x = |x: f32| x >= POPUP_GAP && x + w <= width - POPUP_GAP;
     let fits_y = |y: f32| y >= POPUP_GAP && y + h <= height - POPUP_GAP;
+    let place_widget = |id: WidgetId, side: PopupSide, center: bool| {
+        let a = rect_of(id).unwrap_or_default();
+        let below = a.y + a.height + POPUP_GAP;
+        let above = a.y - POPUP_GAP - h;
+        let right = a.x + a.width + POPUP_GAP;
+        let left = a.x - POPUP_GAP - w;
+        let start_x = a.x;
+        let start_y = a.y;
+        let mid_x = a.x + (a.width - w) * 0.5;
+        let mid_y = a.y + (a.height - h) * 0.5;
+        match side {
+            PopupSide::Below => (
+                if center { mid_x } else { start_x },
+                if fits_y(below) || !fits_y(above) { below } else { above },
+            ),
+            PopupSide::Above => (
+                if center { mid_x } else { start_x },
+                if fits_y(above) || !fits_y(below) { above } else { below },
+            ),
+            PopupSide::Right => (
+                if fits_x(right) || !fits_x(left) { right } else { left },
+                if center { mid_y } else { start_y },
+            ),
+            PopupSide::Left => (
+                if fits_x(left) || !fits_x(right) { left } else { right },
+                if center { mid_y } else { start_y },
+            ),
+        }
+    };
     let (x, y) = match anchor {
         PopupAnchor::Center => ((width - w) / 2.0, (height - h) / 2.0),
         PopupAnchor::Point(px, py) => {
@@ -1606,19 +1672,8 @@ fn place_popup(
             let y = if py + h > height - POPUP_GAP && py - h >= POPUP_GAP { py - h } else { py };
             (x, y)
         }
-        PopupAnchor::Widget(id, side) => {
-            let a = rect_of(id).unwrap_or_default();
-            let below = a.y + a.height + POPUP_GAP;
-            let above = a.y - POPUP_GAP - h;
-            let right = a.x + a.width + POPUP_GAP;
-            let left = a.x - POPUP_GAP - w;
-            match side {
-                PopupSide::Below => (a.x, if fits_y(below) || !fits_y(above) { below } else { above }),
-                PopupSide::Above => (a.x, if fits_y(above) || !fits_y(below) { above } else { below }),
-                PopupSide::Right => (if fits_x(right) || !fits_x(left) { right } else { left }, a.y),
-                PopupSide::Left => (if fits_x(left) || !fits_x(right) { left } else { right }, a.y),
-            }
-        }
+        PopupAnchor::Widget(id, side) => place_widget(id, side, false),
+        PopupAnchor::WidgetCentered(id, side) => place_widget(id, side, true),
     };
     let clamp = |v: f32, extent: f32, limit: f32| v.min(limit - POPUP_GAP - extent).max(POPUP_GAP);
     (clamp(x, w, width), clamp(y, h, height))
@@ -2318,6 +2373,36 @@ mod tests {
         let (popup, _) = open_menu(&mut tree, PopupAnchor::Center, true, 1);
         let r = tree.absolute_rect(popup).unwrap();
         assert_eq!((r.x, r.y), (75.0, 85.0));
+    }
+
+    #[test]
+    fn popup_widget_centered_aligns_on_the_cross_axis() {
+        // Anchor at x=10 width=60; popup width 50 → centered x = 10 + 5 = 15.
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        let (popup, _) = open_menu(&mut tree, PopupAnchor::WidgetCentered(anchor, PopupSide::Below), false, 2);
+        let r = tree.absolute_rect(popup).unwrap();
+        let a = tree.absolute_rect(anchor).unwrap();
+        assert_eq!(r.y, a.y + a.height + POPUP_GAP);
+        assert!((r.x - (a.x + (a.width - r.width) * 0.5)).abs() < 0.01, "centered under anchor");
+    }
+
+    #[test]
+    fn outside_press_dismisses_nested_non_modal_stack() {
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        let (parent, items) = open_menu(&mut tree, PopupAnchor::Widget(anchor, PopupSide::Below), false, 2);
+        let child = tree.open_popup(
+            popup_kind(PopupAnchor::Widget(items[0], PopupSide::Right), false, None),
+            |tree, popup| {
+                let b = sized_button(tree, 40.0, 20.0);
+                tree.add_child(popup, b);
+            },
+        );
+        tree.compute_layout(200.0, 200.0);
+        assert_eq!(tree.open_popup_count(), 2);
+        assert_eq!(tree.topmost_popup(), Some(child));
+        assert_eq!(tree.popup_press(190.0, 190.0), PopupPress::Consumed);
+        assert!(tree.kind(child).is_none() && tree.kind(parent).is_none());
+        assert_eq!(tree.open_popup_count(), 0);
     }
 
     #[test]

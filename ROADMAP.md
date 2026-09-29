@@ -1351,11 +1351,12 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 
 - Menu bar, context menus, keyboard shortcuts / accelerators — **Done (2026-09-29):**
   hover tooltips (~500ms, no focus steal), Python `Menu`/`MenuBar`/`MenuItem`/`MenuSeparator`,
-  right-click `context_menu=`, `Accel` parse + tree side-table, demo `menus_demo.py`.
-  Still open: nested submenus; menu checkmarks/radio/icons/arrow-key nav.
+  right-click `context_menu=`, `Accel` parse + tree side-table, nested submenus, check/radio/icon
+  rows, arrow-key menu navigation (flat rows via hover), demo `menus_demo.py`.
 - Toolbar, status bar — **Done (2026-09-29):** `Toolbar` / `StatusBar` Python composites;
   demos `menus_demo.py` and `app_chrome_demo.py`.
-- Tooltips — **Done** with the menus work above (remaining polish: soft placement, themed chrome).
+- Tooltips — **Done** with the menus work above: soft placement (`WidgetCentered`, prefer above
+  near the bottom edge) and themed chrome (`ChromeTheme.surface_alt` / `text` / `border`).
 - Modal and modeless dialogs; native file/color pickers — **Done (2026-09-29):** `Dialog` over
   `Popup`; `open_file_dialog` / `save_file_dialog` via `rfd`; in-app `pick_color` (rfd has no
   color dialog). Demo: `app_chrome_demo.py`.

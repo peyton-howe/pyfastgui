@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use fastgui_chrome::ChromeRenderer;
+use fastgui_core::theme::chrome_theme;
 use fastgui_core::widget::{
     Color, DropZone, PopupAnchor, PopupPress, PopupSide, Rect, WidgetId, WidgetKind, WidgetTree,
     SPLITTER_HIT_SLOP,
@@ -27,9 +28,6 @@ use crate::surface::{MainResizePolicy, SurfaceBackend, ViewportDraw};
 
 /// Hover delay before a tooltip popup opens.
 const TOOLTIP_DELAY: Duration = Duration::from_millis(500);
-const TOOLTIP_BG: Color = Color([0.12, 0.13, 0.15, 0.96]);
-const TOOLTIP_FG: Color = Color([0.92, 0.93, 0.95, 1.0]);
-const TOOLTIP_BORDER: Color = Color([0.35, 0.37, 0.40, 1.0]);
 const TOOLTIP_PAD: f32 = 6.0;
 
 /// Active edge-resize of a floating window, tracked in physical screen space so size/position
@@ -642,15 +640,22 @@ impl<B: SurfaceBackend> App<B> {
         if self.widget_tree.kind(id).is_none() {
             return;
         }
+        let theme = chrome_theme();
+        // Soft side pick: prefer below, but open above when the target sits in the lower third.
+        let side = match self.widget_tree.absolute_rect(id) {
+            Some(r) if r.y + r.height > self.height as f32 * (2.0 / 3.0) => PopupSide::Above,
+            _ => PopupSide::Below,
+        };
         let kind = WidgetKind::Popup {
-            anchor: PopupAnchor::Widget(id, PopupSide::Below),
+            anchor: PopupAnchor::WidgetCentered(id, side),
             modal: false,
-            background: TOOLTIP_BG,
-            border: TOOLTIP_BORDER,
+            background: theme.surface_alt,
+            border: theme.border,
             on_dismiss: None,
             restore_focus: None,
             open: None,
         };
+        let fg = theme.text;
         let popup = self.widget_tree.open_popup_no_focus(kind, |tree, popup| {
             use fastgui_core::taffy::prelude::{FlexDirection, LengthPercentage, Style};
             let pad = Style {
@@ -670,7 +675,7 @@ impl<B: SurfaceBackend> App<B> {
             tree.add_child(popup, wrap);
             let label = tree.new_node(
                 Default::default(),
-                WidgetKind::Label { text, font_size: 12.0, color: TOOLTIP_FG },
+                WidgetKind::Label { text, font_size: 12.0, color: fg },
             );
             tree.add_child(wrap, label);
         });

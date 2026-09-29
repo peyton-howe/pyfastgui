@@ -1563,10 +1563,15 @@ impl Popup {
             }
             // An anchor that's no longer shown (its window's content was replaced) has nowhere
             // to put the popup: leave it closed rather than open it in the corner.
-            if let WidgetKind::Popup { anchor: PopupAnchor::Widget(anchor, _), .. } = &kind {
-                if tree.kind(*anchor).is_none() {
-                    return;
-                }
+            let dead_anchor = match &kind {
+                WidgetKind::Popup {
+                    anchor: PopupAnchor::Widget(anchor, _) | PopupAnchor::WidgetCentered(anchor, _),
+                    ..
+                } => tree.kind(*anchor).is_none(),
+                _ => false,
+            };
+            if dead_anchor {
+                return;
             }
             *id = Some(tree.open_popup(kind, |tree, popup| {
                 attach(tree, popup, wrapper, &attach_sender);

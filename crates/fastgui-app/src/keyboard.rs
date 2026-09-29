@@ -53,6 +53,10 @@ fn handle_key_inner(
     if crate::accel::try_fire(tree, press) {
         return true;
     }
+    // Flat menu rows aren't focusable (no accent ring); drive them via hover + arrows.
+    if handle_menu_popup_keys(tree, press) {
+        return true;
+    }
     let Some(id) = tree.focused() else { return false };
     match tree.kind(id) {
         Some(WidgetKind::Button { on_click, .. }) => {
@@ -209,6 +213,80 @@ fn handle_key_inner(
     }
 }
 
+/// Arrow / Enter navigation for flat-button menus (Menu / context menu popups).
+///
+/// Skips combo dropdowns (they contain a `ListView`) and popups that already have a focusable
+/// widget focused inside them.
+fn handle_menu_popup_keys(tree: &mut WidgetTree, press: &KeyPress<'_>) -> bool {
+    let Some(popup) = tree.topmost_popup() else {
+        return false;
+    };
+    let nodes = tree.subtree_ids(popup);
+    if nodes
+        .iter()
+        .any(|&id| matches!(tree.kind(id), Some(WidgetKind::ListView { .. })))
+    {
+        return false;
+    }
+    if tree.focused().is_some_and(|id| tree.popup_of(id) == Some(popup)) {
+        return false;
+    }
+    let buttons: Vec<_> = nodes
+        .into_iter()
+        .filter(|&id| {
+            matches!(
+                tree.kind(id),
+                Some(WidgetKind::Button {
+                    flat: true,
+                    on_click: Some(_),
+                    ..
+                })
+            )
+        })
+        .collect();
+    if buttons.is_empty() {
+        return false;
+    }
+    let key = press.key;
+    let current = tree.hovered().and_then(|id| buttons.iter().position(|&b| b == id));
+    let activate = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space | NamedKey::ArrowRight))
+        || matches!(key, Key::Character(c) if c == " ");
+    if activate {
+        let index = match current {
+            Some(i) => i,
+            None if matches!(key, Key::Named(NamedKey::ArrowRight)) => {
+                tree.set_hovered(Some(buttons[0]));
+                return true;
+            }
+            None => return false,
+        };
+        if let Some(WidgetKind::Button { on_click: Some(callback), .. }) = tree.kind(buttons[index]) {
+            let callback = callback.clone();
+            callback();
+            return true;
+        }
+        return false;
+    }
+    match key {
+        Key::Named(NamedKey::ArrowDown) => {
+            let next = current.map_or(0, |i| (i + 1) % buttons.len());
+            tree.set_hovered(Some(buttons[next]));
+            true
+        }
+        Key::Named(NamedKey::ArrowUp) => {
+            let next =
+                current.map_or(buttons.len() - 1, |i| if i == 0 { buttons.len() - 1 } else { i - 1 });
+            tree.set_hovered(Some(buttons[next]));
+            true
+        }
+        Key::Named(NamedKey::ArrowLeft) => {
+            // Nested submenu: leave the child menu. A single top-level menu ignores Left.
+            tree.open_popup_count() > 1 && tree.dismiss_popup()
+        }
+        _ => false,
+    }
+}
+
 /// Set a slider's value and fire its `on_change` — unless the value didn't move (already at
 /// an end), so holding an arrow key against the stop doesn't spam the callback.
 fn set_slider_value(tree: &mut WidgetTree, id: fastgui_core::widget::WidgetId, new_value: f32) {
@@ -263,6 +341,17 @@ mod tests {
     fn press(tree: &mut WidgetTree, key: Key, shift: bool) -> bool {
         let modifiers = if shift { ModifiersState::SHIFT } else { ModifiersState::empty() };
         handle_key(tree, &KeyPress { key: &key, text: None, modifiers }, &mut NoMeasure, &mut NoClipboard)
+    }
+
+    fn flat_button(on_click: Option<fastgui_core::widget::ClickCallback>) -> WidgetKind {
+        WidgetKind::Button {
+            text: "item".into(),
+            font_size: 14.0,
+            text_color: Color::TRANSPARENT,
+            background: Color::TRANSPARENT,
+            flat: true,
+            on_click,
+        }
     }
 
     fn fixed(w: f32, h: f32) -> Style {
@@ -401,5 +490,54 @@ mod tests {
         assert!(press(&mut tree, Key::Named(NamedKey::Escape), false));
         assert_eq!(tree.focused(), None);
         assert!(!press(&mut tree, Key::Named(NamedKey::Escape), false));
+    }
+
+    #[test]
+    fn arrow_keys_navigate_flat_menu_rows_via_hover() {
+        use fastgui_core::widget::{PopupAnchor, PopupSide};
+
+        let clicks = Arc::new(AtomicUsize::new(0));
+        let c0 = clicks.clone();
+        let c1 = clicks.clone();
+        let (mut tree, ids) = tree_with(vec![slider(0.0, None)]);
+        let popup_kind = WidgetKind::Popup {
+            anchor: PopupAnchor::Widget(ids[0], PopupSide::Below),
+            modal: false,
+            background: Color::TRANSPARENT,
+            border: Color::TRANSPARENT,
+            on_dismiss: None,
+            restore_focus: None,
+            open: None,
+        };
+        let row_a = std::cell::Cell::new(None);
+        let row_b = std::cell::Cell::new(None);
+        tree.open_popup(popup_kind, |tree, popup| {
+            let a = tree.new_node(
+                fixed(80.0, 20.0),
+                flat_button(Some(Arc::new(move || {
+                    c0.fetch_add(1, Ordering::SeqCst);
+                }))),
+            );
+            let b = tree.new_node(
+                fixed(80.0, 20.0),
+                flat_button(Some(Arc::new(move || {
+                    c1.fetch_add(1, Ordering::SeqCst);
+                }))),
+            );
+            tree.add_child(popup, a);
+            tree.add_child(popup, b);
+            row_a.set(Some(a));
+            row_b.set(Some(b));
+        });
+        tree.compute_layout(300.0, 300.0);
+        // Flat buttons aren't focusable — menu nav uses hover.
+        assert!(tree.focused().is_none());
+        assert!(press(&mut tree, Key::Named(NamedKey::ArrowDown), false));
+        assert_eq!(tree.hovered(), row_a.get());
+        assert!(press(&mut tree, Key::Named(NamedKey::ArrowDown), false));
+        assert_eq!(tree.hovered(), row_b.get());
+        assert!(press(&mut tree, Key::Named(NamedKey::Enter), false));
+        assert_eq!(clicks.load(Ordering::SeqCst), 1);
+        assert!(!press(&mut tree, Key::Named(NamedKey::ArrowLeft), false), "single menu ignores Left");
     }
 }
