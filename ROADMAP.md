@@ -1349,11 +1349,19 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 
 ### 7C. Tier 2 — application structure
 
-- Menu bar, context menus, keyboard shortcuts / accelerators
-- Toolbar, status bar
-- Tooltips
-- Modal and modeless dialogs; native file/color pickers via the OS (e.g. the `rfd` crate)
-- Group box, collapsible section, stacked widget (one child visible at a time)
+- Menu bar, context menus, keyboard shortcuts / accelerators — **Done (2026-09-29):**
+  hover tooltips (~500ms, no focus steal), Python `Menu`/`MenuBar`/`MenuItem`/`MenuSeparator`,
+  right-click `context_menu=`, `Accel` parse + tree side-table, demo `menus_demo.py`.
+  Still open: nested submenus; menu checkmarks/radio/icons/arrow-key nav.
+- Toolbar, status bar — **Done (2026-09-29):** `Toolbar` / `StatusBar` Python composites;
+  demos `menus_demo.py` and `app_chrome_demo.py`.
+- Tooltips — **Done** with the menus work above (remaining polish: soft placement, themed chrome).
+- Modal and modeless dialogs; native file/color pickers — **Done (2026-09-29):** `Dialog` over
+  `Popup`; `open_file_dialog` / `save_file_dialog` via `rfd`; in-app `pick_color` (rfd has no
+  color dialog). Demo: `app_chrome_demo.py`.
+- Group box, collapsible section, stacked widget — **Done (2026-09-29):** `GroupBox`,
+  `CollapsibleSection`, `StackedWidget` via `Box.set_display` / `visible=`; demo
+  `app_chrome_demo.py`.
 
 ### 7D. Tier 3 — data views
 

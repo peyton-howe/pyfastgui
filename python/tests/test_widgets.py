@@ -189,5 +189,35 @@ class GridTests(unittest.TestCase):
             fg.Grid([fg.Label("a")], columns=0)
 
 
+class AppChromeTests(unittest.TestCase):
+    def test_stacked_widget_index_and_empty_rejected(self):
+        stack = fg.StackedWidget([fg.Label("a"), fg.Label("b"), fg.Label("c")], index=1)
+        self.assertEqual(stack.index, 1)
+        stack.set_index(2)
+        self.assertEqual(stack.index, 2)
+        stack.set_index(99)
+        self.assertEqual(stack.index, 2)
+        with self.assertRaises(ValueError):
+            fg.StackedWidget([])
+
+    def test_collapsible_tracks_expanded(self):
+        section = fg.CollapsibleSection("More", fg.Label("body"), expanded=False)
+        self.assertFalse(section.expanded)
+        section.set_expanded(True)
+        self.assertTrue(section.expanded)
+
+    def test_dialog_and_status_bar_api(self):
+        bar = fg.StatusBar("hi")
+        bar.set_text("there")
+        dialog = fg.Dialog("Title", fg.Label("body"), buttons=[("OK", None)], modal=False)
+        self.assertFalse(dialog.is_open)
+        dialog.close()
+        self.assertFalse(dialog.is_open)
+
+    def test_box_set_display_before_attach(self):
+        box = fg.Box(children=[fg.Label("x")], visible=False)
+        box.set_display(True)
+
+
 if __name__ == "__main__":
     unittest.main()

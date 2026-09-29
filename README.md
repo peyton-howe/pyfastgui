@@ -115,6 +115,8 @@ All under [`python/examples/`](python/examples/), runnable directly once install
 | [`popup_demo.py`](python/examples/popup_demo.py) | `Popup` overlays: a menu anchored to a button, a modal dialog, a popup at a point — all drawn over live `Viewport` video. |
 | [`scroll_demo.py`](python/examples/scroll_demo.py) | `ScrollArea`: wheel/trackpad and scrollbar scrolling, clipping, a live `Viewport` inside, Tab scrolling focus into view. |
 | [`form_controls_demo.py`](python/examples/form_controls_demo.py) | M7 form controls: `Checkbox`, `Radio`, `Toggle`, `SpinBox`, `NumericScrub`, `ProgressBar`, `ComboBox`, `Grid`, `Image`, `TextArea`. |
+| [`menus_demo.py`](python/examples/menus_demo.py) | M7 7C: `MenuBar` / context menus, hover tooltips, accelerators, `Toolbar`, `StatusBar`. |
+| [`app_chrome_demo.py`](python/examples/app_chrome_demo.py) | M7 7C: `Dialog`, file/color pickers, `GroupBox`, `CollapsibleSection`, `StackedWidget`. |
 | [`dock_layout.py`](python/examples/dock_layout.py) | A `DockArea` of resizable, titled `Panel`s with a live `Viewport` in the center. |
 | [`dock_rearrange_demo.py`](python/examples/dock_rearrange_demo.py) | Drag a panel's title bar to split or tab-merge regions, including dropping at the window's outer edge to span the whole dock area. |
 | [`tabs_demo.py`](python/examples/tabs_demo.py) | Multiple `Panel`s sharing one `DockArea` region via `Tabs`, switched by clicking a header segment. |
@@ -127,6 +129,10 @@ All under [`python/examples/`](python/examples/), runnable directly once install
   `Grid` (CSS Grid equal columns), `Splitter` (draggable divider between two panes),
   `ScrollArea` (scrollable, clipped viewport), `Popup` (menus, dropdowns, tooltips, modal
   dialogs — anchored overlays drawn above everything).
+- **Menus / chrome**: `MenuBar`, `Menu`, `MenuItem`, `MenuSeparator`, `Toolbar`, `StatusBar`,
+  `Dialog`, `GroupBox`, `CollapsibleSection`, `StackedWidget` (Python composition);
+  `open_file_dialog` / `save_file_dialog` (native via `rfd`), `pick_color` (in-app);
+  `tooltip=` / `context_menu=`; keyboard accelerators from menu shortcuts.
 - **Data views**: `ListView` (virtualized: only visible rows are laid out and drawn).
 - **Theming**: `Theme` (`dark()`, `light()`, `replace(...)`), `set_theme` / `get_theme`,
   `Window.set_theme`. Colors, font sizes and the font family default to the current theme;
