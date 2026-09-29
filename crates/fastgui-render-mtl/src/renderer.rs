@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use fastgui_core::widget::Rect;
-use fastgui_core::{ChromeFrame, ChromeQuads, CpuFrame};
+use fastgui_app::ViewportDraw;
+use fastgui_core::{ChromeFrame, ChromeQuad, ChromeQuads, CpuFrame};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::ClassType;
@@ -31,6 +31,8 @@ pub(crate) struct QuadChrome {
     /// `None` when there are no quads.
     instances: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
     count: usize,
+    /// `ChromeQuads::overlay_start`.
+    overlay_start: usize,
     atlas: ViewportTexture,
     /// Physical size the quads were built for (their coordinate space).
     width: u32,
@@ -64,19 +66,36 @@ impl QuadChrome {
             };
             Some(buffer.ok_or(Error::NoBuffer)?)
         };
-        Ok(Self { instances, count: frame.quads.len(), atlas, width: frame.width, height: frame.height })
+        Ok(Self {
+            instances,
+            count: frame.quads.len(),
+            overlay_start: frame.overlay_start.min(frame.quads.len()),
+            atlas,
+            width: frame.width,
+            height: frame.height,
+        })
     }
 
     /// One instanced draw of every quad (a 4-vertex strip per instance) into a `target_width` x
     /// `target_height` attachment, in the quads' own pixel space.
+    /// Draw the quads before the overlay (`overlay: false`) or the overlay quads (`true`).
     pub(crate) fn encode(
         &self,
         encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
         pipeline: &QuadPipeline,
         target_width: u32,
         target_height: u32,
+        overlay: bool,
     ) {
         let Some(instances) = &self.instances else { return };
+        let (first, count) = if overlay {
+            (self.overlay_start, self.count - self.overlay_start)
+        } else {
+            (0, self.overlay_start)
+        };
+        if count == 0 {
+            return;
+        }
         encoder.setRenderPipelineState(pipeline.state());
         encoder.setViewport(MTLViewport {
             originX: 0.0,
@@ -89,14 +108,14 @@ impl QuadChrome {
         encoder.setScissorRect(MTLScissorRect { x: 0, y: 0, width: target_width as usize, height: target_height as usize });
         let size = [self.width as f32, self.height as f32];
         unsafe {
-            encoder.setVertexBuffer_offset_atIndex(Some(instances), 0, 0);
+            encoder.setVertexBuffer_offset_atIndex(Some(instances), first * std::mem::size_of::<ChromeQuad>(), 0);
             encoder.setVertexBytes_length_atIndex(NonNull::from(&size).cast(), std::mem::size_of_val(&size), 1);
             encoder.setFragmentTexture_atIndex(Some(&self.atlas.texture), 0);
             encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
                 MTLPrimitiveType::TriangleStrip,
                 0,
                 4,
-                self.count,
+                count,
             );
         }
     }
@@ -279,7 +298,7 @@ impl MetalRenderer {
         &mut self,
         clear_color: [f32; 4],
         draw_chrome: bool,
-        viewports: &[(u64, Rect)],
+        viewports: &[ViewportDraw],
     ) -> Result<(), Error> {
         if self.width == 0 || self.height == 0 {
             return Ok(());
@@ -312,7 +331,7 @@ impl MetalRenderer {
 
         if draw_chrome {
             if let Some(chrome) = &self.quad_chrome {
-                chrome.encode(&encoder, &self.quad_pipeline, self.width, self.height);
+                chrome.encode(&encoder, &self.quad_pipeline, self.width, self.height, false);
             }
             if let Some(chrome) = &self.chrome {
                 encoder.setRenderPipelineState(self.pipeline.state());
@@ -336,16 +355,30 @@ impl MetalRenderer {
                 );
             }
         }
-        if viewports.iter().any(|(id, _)| self.layers.contains_key(id)) {
+        if viewports.iter().any(|draw| self.layers.contains_key(&draw.viewport_id)) {
             encoder.setRenderPipelineState(self.pipeline.state());
         }
-        for (viewport_id, rect) in viewports {
-            let Some(layer) = self.layers.get(viewport_id) else { continue };
-            let Some((viewport, scissor)) = widget_rect_to_mtl(*rect, self.width, self.height)
-            else {
+        for draw in viewports {
+            let Some(layer) = self.layers.get(&draw.viewport_id) else { continue };
+            let Some(([x, y, w, h], [sx, sy, sw, sh])) = draw.viewport_and_scissor(self.width, self.height) else {
                 continue;
             };
+            let viewport = MTLViewport {
+                originX: f64::from(x),
+                originY: f64::from(y),
+                width: f64::from(w),
+                height: f64::from(h),
+                znear: 0.0,
+                zfar: 1.0,
+            };
+            let scissor = MTLScissorRect { x: sx as usize, y: sy as usize, width: sw as usize, height: sh as usize };
             self.draw_sampled(&encoder, layer, viewport, scissor);
+        }
+        // Popups go over video too.
+        if draw_chrome {
+            if let Some(chrome) = &self.quad_chrome {
+                chrome.encode(&encoder, &self.quad_pipeline, self.width, self.height, true);
+            }
         }
 
         encoder.endEncoding();
@@ -372,37 +405,6 @@ impl MetalRenderer {
     }
 }
 
-fn widget_rect_to_mtl(
-    rect: Rect,
-    width: u32,
-    height: u32,
-) -> Option<(MTLViewport, MTLScissorRect)> {
-    let x = rect.x.round().max(0.0);
-    let y = rect.y.round().max(0.0);
-    let w = rect.width.round().max(0.0);
-    let h = rect.height.round().max(0.0);
-    if w < 1.0 || h < 1.0 {
-        return None;
-    }
-    let x = (x as u32).min(width);
-    let y = (y as u32).min(height);
-    let w = (w as u32).min(width.saturating_sub(x));
-    let h = (h as u32).min(height.saturating_sub(y));
-    if w == 0 || h == 0 {
-        return None;
-    }
-    Some((
-        MTLViewport {
-            originX: x as f64,
-            originY: y as f64,
-            width: w as f64,
-            height: h as f64,
-            znear: 0.0,
-            zfar: 1.0,
-        },
-        MTLScissorRect { x: x as usize, y: y as usize, width: w as usize, height: h as usize },
-    ))
-}
 
 impl fastgui_app::SurfaceBackend for MetalRenderer {
     type Error = Error;
@@ -435,11 +437,15 @@ impl fastgui_app::SurfaceBackend for MetalRenderer {
         MetalRenderer::retain_layers(self, live_ids)
     }
 
+    fn surface_size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     fn render_frame(
         &mut self,
         clear: [f32; 4],
         draw_chrome: bool,
-        draws: &[(u64, Rect)],
+        draws: &[ViewportDraw],
     ) -> Result<(), Self::Error> {
         MetalRenderer::render_frame(self, clear, draw_chrome, draws)
     }

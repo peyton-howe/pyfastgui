@@ -5,8 +5,12 @@ use fastgui_core::taffy::prelude::*;
 use fastgui_core::taffy::style::LengthPercentage;
 use fastgui_core::widget::{
     ChangeCallback, ClickCallback, Color, PanelCloseCallback, PanelDropCallback, SplitDirection, TabSelectCallback,
-    WidgetId, WidgetKind, WidgetTree,
+    IndexCallback, PopupAnchor, PopupSide, TextCallback, WidgetId, WidgetKind, WidgetTree,
 };
+use fastgui_core::text_edit::TextEdit;
+
+use crate::theme::{FontSize, Spacing};
+use fastgui_core::Readback;
 use crate::backend::{Command, CommandDispatch};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -52,6 +56,16 @@ fn wrap_callback1(callback: Py<PyAny>) -> ChangeCallback {
     Arc::new(move |value: f32| {
         Python::attach(|py| {
             if let Err(err) = callback.call1(py, (value,)) {
+                err.print(py);
+            }
+        });
+    })
+}
+
+fn wrap_callback_text(callback: Py<PyAny>) -> TextCallback {
+    Arc::new(move |text: String| {
+        Python::attach(|py| {
+            if let Err(err) = callback.call1(py, (text,)) {
                 err.print(py);
             }
         });
@@ -130,6 +144,8 @@ struct StyleParams {
     /// already qualifies as "closest positioned ancestor" without needing to say so explicitly)
     /// instead of taking part in normal flex flow. `None` (everything else) is ordinary flow.
     absolute: Option<(f32, f32)>,
+    /// Let children flow onto further rows/columns when they don't fit (`Box(wrap=True)`).
+    wrap: bool,
 }
 
 impl StyleParams {
@@ -144,6 +160,7 @@ impl StyleParams {
             fill: false,
             align_items: None,
             absolute: None,
+            wrap: false,
         }
     }
 
@@ -185,6 +202,7 @@ impl StyleParams {
             padding: Rect { left: lp_padding, right: lp_padding, top: lp_padding, bottom: lp_padding },
             size,
             align_items: self.align_items,
+            flex_wrap: if self.wrap { FlexWrap::Wrap } else { FlexWrap::NoWrap },
             position,
             inset,
             ..Default::default()
@@ -269,6 +287,18 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
     if let Ok(w) = obj.cast::<Slider>() {
         return Ok(w.borrow().describe());
     }
+    if let Ok(w) = obj.cast::<TextInput>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<ScrollArea>() {
+        return w.borrow().describe();
+    }
+    if let Ok(w) = obj.cast::<ListView>() {
+        return Ok(w.borrow().describe());
+    }
+    if obj.cast::<Popup>().is_ok() {
+        return Err(PyTypeError::new_err("a Popup isn't placed in the layout; open it with popup.show(anchor)"));
+    }
     if let Ok(w) = obj.cast::<BoxWidget>() {
         return w.borrow().describe();
     }
@@ -292,7 +322,7 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
         return Ok(w.borrow().describe_widget());
     }
     Err(PyTypeError::new_err(
-        "expected a fastgui widget (Box, Label, Button, Slider, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
+        "expected a fastgui widget (Box, Label, Button, Slider, TextInput, ScrollArea, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
     ))
 }
 
@@ -320,6 +350,10 @@ pub(crate) fn bind_dispatch(obj: &Bound<'_, PyAny>, dispatch: &CommandDispatch) 
     }
     if let Ok(panel) = obj.cast::<Panel>() {
         Python::attach(|py| bind_dispatch(panel.borrow().content.bind(py), dispatch));
+        return;
+    }
+    if let Ok(scroll) = obj.cast::<ScrollArea>() {
+        Python::attach(|py| bind_dispatch(scroll.borrow().content.bind(py), dispatch));
         return;
     }
     if let Ok(tabs) = obj.cast::<Tabs>() {
@@ -371,7 +405,7 @@ pub(crate) fn attach(
             width: (bar_spec.direction == SplitDirection::Row).then_some(bar_spec.thickness),
             height: (bar_spec.direction == SplitDirection::Column).then_some(bar_spec.thickness),
             fill: false,
-            align_items: None, absolute: None,
+            align_items: None, absolute: None, wrap: false,
         };
         let bar_kind = WidgetKind::Splitter {
             direction: bar_spec.direction,
@@ -406,7 +440,7 @@ pub(crate) fn attach(
             width: None,
             height: Some(bar_spec.height),
             fill: false,
-            align_items: None, absolute: None,
+            align_items: None, absolute: None, wrap: false,
         };
         let active = bar_spec.active;
         let bar_kind = WidgetKind::TabBar {
@@ -454,7 +488,23 @@ pub(crate) fn attach(
             }
         }
     }
+    if let Some(WidgetKind::ScrollArea { .. }) = tree.kind(id) {
+        tree.set_scroll_container(id);
+    }
     id
+}
+
+/// Send a whole-tree `mutation` through `sender` to the window it belongs to (the main window,
+/// or the floating panel's own window).
+fn send_tree_mutation(
+    sender: &CommandDispatch,
+    mutation: impl FnOnce(&mut WidgetTree) + Send + 'static,
+) -> PyResult<()> {
+    let command = match sender.floating_region {
+        Some(region_id) => Command::MutateFloatingTree { region_id, mutation: Box::new(mutation) },
+        None => Command::MutateWidgetTree(Box::new(mutation)),
+    };
+    sender.send(command).map_err(|_| PyRuntimeError::new_err("window has already closed"))
 }
 
 /// Send `mutation` to whichever window `id_cell`/`sender_cell` are attached to, no-op if the
@@ -490,15 +540,15 @@ pub(crate) struct Label {
     id: IdCell,
     sender: SenderCell,
     text: String,
-    font_size: f32,
-    color: (f32, f32, f32, f32),
+    font_size: Option<FontSize>,
+    color: Option<(f32, f32, f32, f32)>,
 }
 
 #[pymethods]
 impl Label {
     #[new]
-    #[pyo3(signature = (text, font_size=16.0, color=(1.0, 1.0, 1.0, 1.0)))]
-    fn new(text: String, font_size: f32, color: (f32, f32, f32, f32)) -> Self {
+    #[pyo3(signature = (text, font_size=None, color=None))]
+    fn new(text: String, font_size: Option<FontSize>, color: Option<(f32, f32, f32, f32)>) -> Self {
         Self { id: Arc::new(Mutex::new(None)), sender: Arc::new(Mutex::new(None)), text, font_size, color }
     }
 
@@ -517,7 +567,7 @@ impl Label {
     fn describe(&self) -> DescribedWidget {
         DescribedWidget {
             style: StyleParams::leaf(0.0, None, None),
-            kind: WidgetKind::Label { text: self.text.clone(), font_size: self.font_size, color: rgba(self.color) },
+            kind: WidgetKind::Label { text: self.text.clone(), font_size: self.font_size.unwrap_or(FontSize::Body).resolve(), color: rgba(self.color.unwrap_or(crate::theme::palette().text)) },
             id_cell: self.id.clone(),
             sender_cell: self.sender.clone(),
             children: Vec::new(),
@@ -533,22 +583,22 @@ pub(crate) struct Button {
     id: IdCell,
     sender: SenderCell,
     text: String,
-    font_size: f32,
-    text_color: (f32, f32, f32, f32),
-    background: (f32, f32, f32, f32),
+    font_size: Option<FontSize>,
+    text_color: Option<(f32, f32, f32, f32)>,
+    background: Option<(f32, f32, f32, f32)>,
     on_click: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl Button {
     #[new]
-    #[pyo3(signature = (text, on_click=None, font_size=16.0, text_color=(1.0, 1.0, 1.0, 1.0), background=(0.25, 0.35, 0.85, 1.0)))]
+    #[pyo3(signature = (text, on_click=None, font_size=None, text_color=None, background=None))]
     fn new(
         text: String,
         on_click: Option<Py<PyAny>>,
-        font_size: f32,
-        text_color: (f32, f32, f32, f32),
-        background: (f32, f32, f32, f32),
+        font_size: Option<FontSize>,
+        text_color: Option<(f32, f32, f32, f32)>,
+        background: Option<(f32, f32, f32, f32)>,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
@@ -577,9 +627,9 @@ impl Button {
             style: StyleParams::leaf(0.0, None, None),
             kind: WidgetKind::Button {
                 text: self.text.clone(),
-                font_size: self.font_size,
-                text_color: rgba(self.text_color),
-                background: rgba(self.background),
+                font_size: self.font_size.unwrap_or(FontSize::Body).resolve(),
+                text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().button_text)),
+                background: rgba(self.background.unwrap_or(crate::theme::palette().button)),
                 on_click: on_click.map(wrap_callback0),
             },
             id_cell: self.id.clone(),
@@ -599,8 +649,8 @@ pub(crate) struct Slider {
     value: f32,
     min: f32,
     max: f32,
-    track_color: (f32, f32, f32, f32),
-    thumb_color: (f32, f32, f32, f32),
+    track_color: Option<(f32, f32, f32, f32)>,
+    thumb_color: Option<(f32, f32, f32, f32)>,
     on_change: Option<Py<PyAny>>,
 }
 
@@ -612,16 +662,16 @@ impl Slider {
         min=0.0,
         max=1.0,
         on_change=None,
-        track_color=(0.3, 0.3, 0.35, 1.0),
-        thumb_color=(0.4, 0.7, 1.0, 1.0),
+        track_color=None,
+        thumb_color=None,
     ))]
     fn new(
         value: f32,
         min: f32,
         max: f32,
         on_change: Option<Py<PyAny>>,
-        track_color: (f32, f32, f32, f32),
-        thumb_color: (f32, f32, f32, f32),
+        track_color: Option<(f32, f32, f32, f32)>,
+        thumb_color: Option<(f32, f32, f32, f32)>,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
@@ -655,8 +705,8 @@ impl Slider {
                 value: self.value,
                 min: self.min,
                 max: self.max,
-                track_color: rgba(self.track_color),
-                thumb_color: rgba(self.thumb_color),
+                track_color: rgba(self.track_color.unwrap_or(crate::theme::palette().track)),
+                thumb_color: rgba(self.thumb_color.unwrap_or(crate::theme::palette().accent)),
                 on_change: on_change.map(wrap_callback1),
             },
             id_cell: self.id.clone(),
@@ -668,6 +718,519 @@ impl Slider {
     }
 }
 
+/// A single-line editable text field.
+#[pyclass]
+pub(crate) struct TextInput {
+    id: IdCell,
+    sender: SenderCell,
+    /// The current text, published by the render thread on every edit (and by `set_text`), so
+    /// `.text` never waits on it. Also what `describe` builds from, so the text survives a
+    /// rebuild (e.g. a `DockArea` rearrange).
+    text: Readback<String>,
+    placeholder: String,
+    font_size: Option<FontSize>,
+    width: Option<f32>,
+    flex_grow: f32,
+    text_color: Option<(f32, f32, f32, f32)>,
+    placeholder_color: Option<(f32, f32, f32, f32)>,
+    background: Option<(f32, f32, f32, f32)>,
+    selection_color: Option<(f32, f32, f32, f32)>,
+    on_change: Option<Py<PyAny>>,
+    on_submit: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl TextInput {
+    #[new]
+    #[pyo3(signature = (
+        text="",
+        placeholder="",
+        on_change=None,
+        on_submit=None,
+        font_size=None,
+        width=None,
+        flex_grow=0.0,
+        text_color=None,
+        placeholder_color=None,
+        background=None,
+        selection_color=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        text: &str,
+        placeholder: &str,
+        on_change: Option<Py<PyAny>>,
+        on_submit: Option<Py<PyAny>>,
+        font_size: Option<FontSize>,
+        width: Option<f32>,
+        flex_grow: f32,
+        text_color: Option<(f32, f32, f32, f32)>,
+        placeholder_color: Option<(f32, f32, f32, f32)>,
+        background: Option<(f32, f32, f32, f32)>,
+        selection_color: Option<(f32, f32, f32, f32)>,
+    ) -> Self {
+        Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            text: Readback::new(TextEdit::new(text).text().to_owned()),
+            placeholder: placeholder.to_owned(),
+            font_size,
+            width,
+            flex_grow,
+            text_color,
+            placeholder_color,
+            background,
+            selection_color,
+            on_change,
+            on_submit,
+        }
+    }
+
+    /// The field's current text, including edits the user just made. Safe from any thread.
+    #[getter]
+    fn text(&self) -> String {
+        self.text.get()
+    }
+
+    /// Replace the text (caret to the end, undo history cleared). Doesn't call `on_change`,
+    /// which is for user edits. Works before the field is attached, too.
+    fn set_text(&self, text: &str) -> PyResult<()> {
+        let text = TextEdit::new(text).text().to_owned();
+        self.text.set(text.clone());
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::TextInput { edit, scroll, preedit, .. } = kind {
+                edit.set_text(&text);
+                *scroll = 0.0;
+                *preedit = None;
+            }
+        })
+    }
+}
+
+impl TextInput {
+    fn describe(&self) -> DescribedWidget {
+        let (on_change, on_submit) = Python::attach(|py| {
+            (
+                self.on_change.as_ref().map(|cb| cb.clone_ref(py)),
+                self.on_submit.as_ref().map(|cb| cb.clone_ref(py)),
+            )
+        });
+        DescribedWidget {
+            style: StyleParams::leaf(self.flex_grow, self.width, None),
+            kind: WidgetKind::TextInput {
+                edit: TextEdit::new(&self.text.get()),
+                placeholder: self.placeholder.clone(),
+                font_size: self.font_size.unwrap_or(FontSize::Body).resolve(),
+                text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
+                placeholder_color: rgba(self.placeholder_color.unwrap_or(crate::theme::palette().text_muted)),
+                background: rgba(self.background.unwrap_or(crate::theme::palette().surface_alt)),
+                selection_color: rgba(self.selection_color.unwrap_or(crate::theme::palette().selection)),
+                scroll: 0.0,
+                preedit: None,
+                on_change: on_change.map(wrap_callback_text),
+                on_submit: on_submit.map(wrap_callback_text),
+                mirror: Some(self.text.clone()),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+        }
+    }
+}
+
+/// A virtualized list of text rows: only the rows in view are drawn, so it handles millions.
+#[pyclass]
+pub(crate) struct ListView {
+    id: IdCell,
+    sender: SenderCell,
+    /// The current items — what `describe` builds from, kept in sync by `set_items`.
+    items: Arc<Mutex<Arc<Vec<String>>>>,
+    selected: Readback<Option<usize>>,
+    row_height: f32,
+    font_size: Option<FontSize>,
+    flex_grow: f32,
+    width: Option<f32>,
+    height: Option<f32>,
+    text_color: Option<(f32, f32, f32, f32)>,
+    background: Option<(f32, f32, f32, f32)>,
+    selection_color: Option<(f32, f32, f32, f32)>,
+    on_select: Option<Py<PyAny>>,
+    on_activate: Option<Py<PyAny>>,
+}
+
+fn wrap_index_callback(callback: Py<PyAny>) -> IndexCallback {
+    Arc::new(move |index: usize| {
+        Python::attach(|py| {
+            if let Err(err) = callback.call1(py, (index,)) {
+                err.print(py);
+            }
+        });
+    })
+}
+
+#[pymethods]
+impl ListView {
+    #[new]
+    #[pyo3(signature = (
+        items,
+        on_select=None,
+        on_activate=None,
+        row_height=24.0,
+        font_size=None,
+        flex_grow=1.0,
+        width=None,
+        height=None,
+        text_color=None,
+        background=None,
+        selection_color=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        items: Vec<String>,
+        on_select: Option<Py<PyAny>>,
+        on_activate: Option<Py<PyAny>>,
+        row_height: f32,
+        font_size: Option<FontSize>,
+        flex_grow: f32,
+        width: Option<f32>,
+        height: Option<f32>,
+        text_color: Option<(f32, f32, f32, f32)>,
+        background: Option<(f32, f32, f32, f32)>,
+        selection_color: Option<(f32, f32, f32, f32)>,
+    ) -> PyResult<Self> {
+        if row_height <= 0.0 {
+            return Err(PyValueError::new_err("row_height must be positive"));
+        }
+        Ok(Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            items: Arc::new(Mutex::new(Arc::new(items))),
+            selected: Readback::new(None),
+            row_height,
+            font_size,
+            flex_grow,
+            width,
+            height,
+            text_color,
+            background,
+            selection_color,
+            on_select,
+            on_activate,
+        })
+    }
+
+    /// Replace the rows (clears the selection and scrolls to the top). Works before attaching.
+    fn set_items(&self, items: Vec<String>) -> PyResult<()> {
+        let items = Arc::new(items);
+        *self.items.lock().unwrap_or_else(|p| p.into_inner()) = items.clone();
+        self.selected.set(None);
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::ListView { items: current, selected, scroll, .. } = kind {
+                *current = Arc::unwrap_or_clone(items);
+                *selected = None;
+                *scroll = 0.0;
+            }
+        })
+    }
+
+    /// Select row `index` (clamped) and scroll it into view, calling `on_select`; `None`
+    /// clears the selection.
+    #[pyo3(signature = (index))]
+    /// Works before the list is shown, too (the selection applies when it is).
+    fn select(&self, index: Option<usize>) -> PyResult<()> {
+        let id = *self.id.lock().unwrap_or_else(|p| p.into_inner());
+        let sender = self.sender.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let (Some(id), Some(sender)) = (id, sender) else {
+            let len = self.items.lock().unwrap_or_else(|p| p.into_inner()).len();
+            self.selected.set(index.filter(|_| len > 0).map(|i| i.min(len - 1)));
+            return Ok(());
+        };
+        send_tree_mutation(&sender, move |tree| tree.list_select(id, index))
+    }
+
+    /// The selected row, or `None`. Safe from any thread.
+    #[getter]
+    fn selected(&self) -> Option<usize> {
+        self.selected.get()
+    }
+
+    fn __len__(&self) -> usize {
+        self.items.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+}
+
+impl ListView {
+    fn describe(&self) -> DescribedWidget {
+        let (on_select, on_activate) = Python::attach(|py| {
+            (
+                self.on_select.as_ref().map(|cb| cb.clone_ref(py)),
+                self.on_activate.as_ref().map(|cb| cb.clone_ref(py)),
+            )
+        });
+        let items = self.items.lock().unwrap_or_else(|p| p.into_inner()).as_ref().clone();
+        let selected = self.selected.get().filter(|&i| i < items.len());
+        DescribedWidget {
+            style: StyleParams::leaf(self.flex_grow, self.width, self.height),
+            kind: WidgetKind::ListView {
+                items,
+                row_height: self.row_height,
+                font_size: self.font_size.unwrap_or(FontSize::Small).resolve(),
+                scroll: 0.0,
+                selected,
+                text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
+                background: rgba(self.background.unwrap_or(crate::theme::palette().surface_alt)),
+                selection_color: rgba(self.selection_color.unwrap_or(crate::theme::palette().selection)),
+                on_select: on_select.map(wrap_index_callback),
+                on_activate: on_activate.map(wrap_index_callback),
+                mirror: Some(self.selected.clone()),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+        }
+    }
+}
+
+/// An overlay shown on demand — a menu, dropdown list, tooltip or dialog. `show(anchor)` opens
+/// it next to an attached widget (in that widget's window); `Window.show_popup` opens it at a
+/// point or centered. A click outside a non-modal popup, or Escape, dismisses it (`on_dismiss`
+/// fires); a modal one dims the window and only closes from code (`close()`) or Escape.
+#[pyclass]
+pub(crate) struct Popup {
+    content: Py<PyAny>,
+    modal: bool,
+    padding: Spacing,
+    background: Option<(f32, f32, f32, f32)>,
+    border: Option<(f32, f32, f32, f32)>,
+    on_dismiss: Option<Py<PyAny>>,
+    /// The open popup node, and the window it's in.
+    id: IdCell,
+    sender: SenderCell,
+    open: Readback<bool>,
+}
+
+#[pymethods]
+impl Popup {
+    #[new]
+    #[pyo3(signature = (
+        content,
+        modal=false,
+        on_dismiss=None,
+        padding=Spacing::Units(6.0),
+        background=None,
+        border=None,
+    ))]
+    fn new(
+        content: Py<PyAny>,
+        modal: bool,
+        on_dismiss: Option<Py<PyAny>>,
+        padding: Spacing,
+        background: Option<(f32, f32, f32, f32)>,
+        border: Option<(f32, f32, f32, f32)>,
+    ) -> Self {
+        Self {
+            content,
+            modal,
+            padding,
+            background,
+            border,
+            on_dismiss,
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            open: Readback::new(false),
+        }
+    }
+
+    /// Open next to `anchor` (a widget already shown in a window) on `side`: "below" (the
+    /// default), "above", "right" or "left" — flipped when there's no room. Reopening moves it.
+    #[pyo3(signature = (anchor, side="below"))]
+    fn show(&self, anchor: &Bound<'_, PyAny>, side: &str) -> PyResult<()> {
+        let side = match side {
+            "below" => PopupSide::Below,
+            "above" => PopupSide::Above,
+            "right" => PopupSide::Right,
+            "left" => PopupSide::Left,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "side must be \"below\", \"above\", \"right\" or \"left\", got {other:?}"
+                )))
+            }
+        };
+        let described = describe(anchor)?;
+        let not_attached = || PyRuntimeError::new_err("the anchor widget isn't shown in a window yet");
+        let anchor_id = described.id_cell.lock().unwrap_or_else(|p| p.into_inner()).ok_or_else(not_attached)?;
+        let sender = described.sender_cell.lock().unwrap_or_else(|p| p.into_inner()).clone().ok_or_else(not_attached)?;
+        self.open_in(&sender, PopupAnchor::Widget(anchor_id, side))
+    }
+
+    /// Close it (without calling `on_dismiss`). No-op when it isn't open.
+    fn close(&self) -> PyResult<()> {
+        let Some(sender) = self.sender.lock().unwrap_or_else(|p| p.into_inner()).clone() else { return Ok(()) };
+        let id_cell = self.id.clone();
+        send_tree_mutation(&sender, move |tree| {
+            if let Some(id) = id_cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                tree.close_popup(id);
+            }
+        })
+    }
+
+    /// Whether it's showing. Safe from any thread.
+    #[getter]
+    fn is_open(&self) -> bool {
+        self.open.get()
+    }
+}
+
+impl Popup {
+    /// Open (or move) this popup in `sender`'s window at `anchor`.
+    pub(crate) fn open_in(&self, sender: &CommandDispatch, anchor: PopupAnchor) -> PyResult<()> {
+        let (content, on_dismiss) = Python::attach(|py| -> PyResult<_> {
+            let content = self.content.bind(py);
+            bind_dispatch(content, sender);
+            Ok((describe(content)?, self.on_dismiss.as_ref().map(|cb| cb.clone_ref(py))))
+        })?;
+        // The content sits in a padded column inside the popup node.
+        let wrapper = DescribedWidget {
+            style: StyleParams { padding: self.padding.resolve(), ..StyleParams::leaf(0.0, None, None) },
+            kind: WidgetKind::Container { background: transparent(), region_id: None },
+            id_cell: Arc::new(Mutex::new(None)),
+            sender_cell: Arc::new(Mutex::new(None)),
+            children: vec![content],
+            splitter_bar: None,
+            tab_bar: None,
+        };
+        let kind = WidgetKind::Popup {
+            anchor,
+            modal: self.modal,
+            background: rgba(self.background.unwrap_or(crate::theme::palette().surface_alt)),
+            border: rgba(self.border.unwrap_or(crate::theme::palette().border)),
+            on_dismiss: on_dismiss.map(wrap_callback0),
+            restore_focus: None,
+            open: Some(self.open.clone()),
+        };
+        // Reopening in another window closes it in the old one first.
+        let previous = self.sender.lock().unwrap_or_else(|p| p.into_inner()).replace(sender.clone());
+        if let Some(previous) = previous.filter(|p| p.floating_region != sender.floating_region) {
+            let id_cell = self.id.clone();
+            send_tree_mutation(&previous, move |tree| {
+                if let Some(id) = id_cell.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    tree.close_popup(id);
+                }
+            })?;
+        }
+        let (id_cell, attach_sender) = (self.id.clone(), sender.clone());
+        send_tree_mutation(sender, move |tree| {
+            let mut id = id_cell.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(old) = id.take() {
+                tree.close_popup(old);
+            }
+            // An anchor that's no longer shown (its window's content was replaced) has nowhere
+            // to put the popup: leave it closed rather than open it in the corner.
+            if let WidgetKind::Popup { anchor: PopupAnchor::Widget(anchor, _), .. } = &kind {
+                if tree.kind(*anchor).is_none() {
+                    return;
+                }
+            }
+            *id = Some(tree.open_popup(kind, |tree, popup| {
+                attach(tree, popup, wrapper, &attach_sender);
+            }));
+        })
+    }
+}
+
+/// A scrollable viewport onto `content`: the wheel/trackpad scrolls it, overlay scrollbars
+/// appear on overflowing axes and can be dragged, and content outside it is clipped.
+#[pyclass]
+pub(crate) struct ScrollArea {
+    id: IdCell,
+    sender: SenderCell,
+    content: Py<PyAny>,
+    flex_grow: f32,
+    width: Option<f32>,
+    height: Option<f32>,
+    background: (f32, f32, f32, f32),
+    bar_color: Option<(f32, f32, f32, f32)>,
+    /// The last `scroll_to`, applied when (re)built too — so it works before the area is shown.
+    initial_offset: Arc<Mutex<(f32, f32)>>,
+}
+
+#[pymethods]
+impl ScrollArea {
+    #[new]
+    #[pyo3(signature = (
+        content,
+        flex_grow=1.0,
+        width=None,
+        height=None,
+        background=(0.0, 0.0, 0.0, 0.0),
+        bar_color=None,
+    ))]
+    fn new(
+        content: Py<PyAny>,
+        flex_grow: f32,
+        width: Option<f32>,
+        height: Option<f32>,
+        background: (f32, f32, f32, f32),
+        bar_color: Option<(f32, f32, f32, f32)>,
+    ) -> Self {
+        Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            content,
+            flex_grow,
+            width,
+            height,
+            background,
+            bar_color,
+            initial_offset: Arc::new(Mutex::new((0.0, 0.0))),
+        }
+    }
+
+    /// Scroll so the content's point `(x, y)` is at the top-left (clamped to what can scroll).
+    /// Works before the area is shown, too.
+    fn scroll_to(&self, x: f32, y: f32) -> PyResult<()> {
+        *self.initial_offset.lock().unwrap_or_else(|p| p.into_inner()) = (x.max(0.0), y.max(0.0));
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::ScrollArea { offset, .. } = kind {
+                // Clamped to the content at the next layout.
+                *offset = (x.max(0.0), y.max(0.0));
+            }
+        })
+    }
+}
+
+impl ScrollArea {
+    fn describe(&self) -> PyResult<DescribedWidget> {
+        let content = Python::attach(|py| describe(self.content.bind(py)))?;
+        Ok(DescribedWidget {
+            style: StyleParams::leaf(self.flex_grow, self.width, self.height),
+            kind: WidgetKind::ScrollArea {
+                offset: *self.initial_offset.lock().unwrap_or_else(|p| p.into_inner()),
+                background: rgba(self.background),
+                bar_color: rgba(self.bar_color.unwrap_or(crate::theme::palette().scrollbar)),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: vec![content],
+            splitter_bar: None,
+            tab_bar: None,
+        })
+    }
+}
+
 /// A layout container: lays its children out in a row or column via flexbox (see `taffy`).
 /// `Box` in the Python API, `BoxWidget` here since `Box` is a reserved word in Rust.
 #[pyclass(name = "Box")]
@@ -675,12 +1238,13 @@ pub(crate) struct BoxWidget {
     id: IdCell,
     sender: SenderCell,
     direction: FlexDirection,
-    gap: f32,
-    padding: f32,
+    gap: Spacing,
+    padding: Spacing,
     flex_grow: f32,
     width: Option<f32>,
     height: Option<f32>,
     background: (f32, f32, f32, f32),
+    wrap: bool,
     children: Py<PyList>,
 }
 
@@ -690,23 +1254,25 @@ impl BoxWidget {
     #[pyo3(signature = (
         children,
         direction="column",
-        gap=0.0,
-        padding=0.0,
+        gap=Spacing::Units(0.0),
+        padding=Spacing::Units(0.0),
         flex_grow=0.0,
         width=None,
         height=None,
         background=(0.0, 0.0, 0.0, 0.0),
+        wrap=false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         children: Py<PyList>,
         direction: &str,
-        gap: f32,
-        padding: f32,
+        gap: Spacing,
+        padding: Spacing,
         flex_grow: f32,
         width: Option<f32>,
         height: Option<f32>,
         background: (f32, f32, f32, f32),
+        wrap: bool,
     ) -> PyResult<Self> {
         let direction = match direction {
             "row" => FlexDirection::Row,
@@ -727,6 +1293,7 @@ impl BoxWidget {
             width,
             height,
             background,
+            wrap,
             children,
         })
     }
@@ -735,7 +1302,7 @@ impl BoxWidget {
 impl BoxWidget {
     fn describe(&self) -> PyResult<DescribedWidget> {
         let style =
-            StyleParams { direction: self.direction, gap: self.gap, padding: self.padding, flex_grow: self.flex_grow, width: self.width, height: self.height, fill: false, align_items: None, absolute: None };
+            StyleParams { direction: self.direction, gap: self.gap.resolve(), padding: self.padding.resolve(), flex_grow: self.flex_grow, width: self.width, height: self.height, fill: false, align_items: None, absolute: None, wrap: self.wrap };
 
         let children = Python::attach(|py| -> PyResult<Vec<DescribedWidget>> {
             self.children.bind(py).iter().map(|child| describe(&child)).collect()
@@ -783,20 +1350,20 @@ pub(crate) struct Splitter {
     second: Py<PyAny>,
     direction: SplitDirection,
     ratio: f32,
-    bar_color: (f32, f32, f32, f32),
+    bar_color: Option<(f32, f32, f32, f32)>,
     thickness: f32,
 }
 
 #[pymethods]
 impl Splitter {
     #[new]
-    #[pyo3(signature = (first, second, direction="row", ratio=0.5, bar_color=(0.2, 0.21, 0.24, 1.0), thickness=6.0))]
+    #[pyo3(signature = (first, second, direction="row", ratio=0.5, bar_color=None, thickness=6.0))]
     fn new(
         first: Py<PyAny>,
         second: Py<PyAny>,
         direction: &str,
         ratio: f32,
-        bar_color: (f32, f32, f32, f32),
+        bar_color: Option<(f32, f32, f32, f32)>,
         thickness: f32,
     ) -> PyResult<Self> {
         if !(0.0..=1.0).contains(&ratio) {
@@ -835,7 +1402,7 @@ impl Splitter {
                 width: None,
                 height: None,
                 fill: false,
-                align_items: None, absolute: None,
+                align_items: None, absolute: None, wrap: false,
             },
             kind: WidgetKind::Container { background: transparent(), region_id: None },
             id_cell: self.id.clone(),
@@ -844,7 +1411,7 @@ impl Splitter {
             splitter_bar: Some(SplitterBarSpec {
                 direction: self.direction,
                 ratio: self.ratio,
-                bar_color: rgba(self.bar_color),
+                bar_color: rgba(self.bar_color.unwrap_or(crate::theme::palette().divider)),
                 thickness: self.thickness,
             }),
             tab_bar: None,
@@ -872,10 +1439,10 @@ pub(crate) struct Panel {
     floating: Arc<std::sync::atomic::AtomicBool>,
     title: String,
     content: Py<PyAny>,
-    title_font_size: f32,
-    title_color: (f32, f32, f32, f32),
-    title_background: (f32, f32, f32, f32),
-    background: (f32, f32, f32, f32),
+    title_font_size: Option<FontSize>,
+    title_color: Option<(f32, f32, f32, f32)>,
+    title_background: Option<(f32, f32, f32, f32)>,
+    background: Option<(f32, f32, f32, f32)>,
     title_height: f32,
 }
 
@@ -885,20 +1452,20 @@ impl Panel {
     #[pyo3(signature = (
         title,
         content,
-        title_font_size=14.0,
-        title_color=(0.92, 0.93, 0.95, 1.0),
-        title_background=(0.16, 0.17, 0.20, 1.0),
-        background=(0.12, 0.13, 0.15, 1.0),
+        title_font_size=None,
+        title_color=None,
+        title_background=None,
+        background=None,
         title_height=28.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         title: String,
         content: Py<PyAny>,
-        title_font_size: f32,
-        title_color: (f32, f32, f32, f32),
-        title_background: (f32, f32, f32, f32),
-        background: (f32, f32, f32, f32),
+        title_font_size: Option<FontSize>,
+        title_color: Option<(f32, f32, f32, f32)>,
+        title_background: Option<(f32, f32, f32, f32)>,
+        background: Option<(f32, f32, f32, f32)>,
         title_height: f32,
     ) -> Self {
         Self {
@@ -1037,13 +1604,13 @@ impl Panel {
             .map(|cb| Python::attach(|py| cb.clone_ref(py)));
 
         let title_bar = DescribedWidget {
-            style: StyleParams { direction: FlexDirection::Row, gap: 0.0, padding: 0.0, flex_grow: 0.0, width: None, height: Some(self.title_height), fill: false, align_items: None, absolute: None },
+            style: StyleParams { direction: FlexDirection::Row, gap: 0.0, padding: 0.0, flex_grow: 0.0, width: None, height: Some(self.title_height), fill: false, align_items: None, absolute: None, wrap: false },
             kind: WidgetKind::PanelTitleBar {
                 panel_id: self.region_id,
                 title: self.title.clone(),
-                font_size: self.title_font_size,
-                text_color: rgba(self.title_color),
-                background: rgba(self.title_background),
+                font_size: self.title_font_size.unwrap_or(FontSize::Small).resolve(),
+                text_color: rgba(self.title_color.unwrap_or(crate::theme::palette().text)),
+                background: rgba(self.title_background.unwrap_or(crate::theme::palette().surface_alt)),
                 on_drop: on_drop.map(wrap_panel_drop_callback),
                 on_close: on_close.map(wrap_panel_close_callback),
                 floating: self.floating.load(Ordering::Relaxed),
@@ -1067,9 +1634,9 @@ impl Panel {
                 width: None,
                 height: None,
                 fill: false,
-                align_items: None, absolute: None,
+                align_items: None, absolute: None, wrap: false,
             },
-            kind: WidgetKind::Container { background: rgba(self.background), region_id: Some(self.region_id) },
+            kind: WidgetKind::Container { background: rgba(self.background.unwrap_or(crate::theme::palette().surface)), region_id: Some(self.region_id) },
             id_cell: self.id.clone(),
             sender_cell: self.sender.clone(),
             children: vec![title_bar, content_described],
@@ -1093,10 +1660,10 @@ pub(crate) struct Tabs {
     region_id: u64,
     panels: Py<PyList>,
     active: usize,
-    font_size: f32,
-    text_color: (f32, f32, f32, f32),
-    active_color: (f32, f32, f32, f32),
-    inactive_color: (f32, f32, f32, f32),
+    font_size: Option<FontSize>,
+    text_color: Option<(f32, f32, f32, f32)>,
+    active_color: Option<(f32, f32, f32, f32)>,
+    inactive_color: Option<(f32, f32, f32, f32)>,
     height: f32,
     on_select: Option<Py<PyAny>>,
 }
@@ -1107,10 +1674,10 @@ impl Tabs {
     #[pyo3(signature = (
         panels,
         active=0,
-        font_size=14.0,
-        text_color=(0.92, 0.93, 0.95, 1.0),
-        active_color=(0.20, 0.22, 0.26, 1.0),
-        inactive_color=(0.14, 0.15, 0.18, 1.0),
+        font_size=None,
+        text_color=None,
+        active_color=None,
+        inactive_color=None,
         height=28.0,
         on_select=None,
     ))]
@@ -1118,10 +1685,10 @@ impl Tabs {
     fn new(
         panels: Py<PyList>,
         active: usize,
-        font_size: f32,
-        text_color: (f32, f32, f32, f32),
-        active_color: (f32, f32, f32, f32),
-        inactive_color: (f32, f32, f32, f32),
+        font_size: Option<FontSize>,
+        text_color: Option<(f32, f32, f32, f32)>,
+        active_color: Option<(f32, f32, f32, f32)>,
+        inactive_color: Option<(f32, f32, f32, f32)>,
         height: f32,
         on_select: Option<Py<PyAny>>,
     ) -> Self {
@@ -1211,7 +1778,7 @@ impl Tabs {
                 width: None,
                 height: None,
                 fill: false,
-                align_items: None, absolute: None,
+                align_items: None, absolute: None, wrap: false,
             },
             kind: WidgetKind::Container { background: transparent(), region_id: Some(self.region_id) },
             id_cell: self.id.clone(),
@@ -1221,10 +1788,10 @@ impl Tabs {
             tab_bar: Some(TabBarSpec {
                 titles,
                 active,
-                font_size: self.font_size,
-                text_color: rgba(self.text_color),
-                active_color: rgba(self.active_color),
-                inactive_color: rgba(self.inactive_color),
+                font_size: self.font_size.unwrap_or(FontSize::Small).resolve(),
+                text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
+                active_color: rgba(self.active_color.unwrap_or(crate::theme::palette().surface_active)),
+                inactive_color: rgba(self.inactive_color.unwrap_or(crate::theme::palette().surface_alt)),
                 height: self.height,
                 on_select: on_select.map(wrap_callback_usize),
                 panel_ids,
@@ -1239,6 +1806,10 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Label>()?;
     m.add_class::<Button>()?;
     m.add_class::<Slider>()?;
+    m.add_class::<TextInput>()?;
+    m.add_class::<ScrollArea>()?;
+    m.add_class::<Popup>()?;
+    m.add_class::<ListView>()?;
     m.add_class::<BoxWidget>()?;
     m.add_class::<Splitter>()?;
     m.add_class::<Panel>()?;

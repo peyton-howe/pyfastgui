@@ -1208,6 +1208,176 @@ Concrete and fully achievable/verifiable on this machine (at least the Windows l
   session or a different machine needs to redo the M0 toolchain setup (Rust, MSVC, Vulkan
   SDK, both venvs) before any of this builds.
 
+## M7 — Widget set: Qt parity and beyond (in progress — 7A done, see below)
+
+Goal: match Qt's everyday widget coverage, then go past it where fastgui's architecture
+(GPU-native chrome, CUDA interop, no-GIL cross-thread mutation) gives a real advantage.
+
+**Current set:** `Box` (flex), `Label`, `Button`, `Slider`, `Splitter`, `Panel`, `Tabs`,
+`DockArea`, floating panels, `Viewport` (CPU/CUDA frames). See `WidgetKind` in
+`fastgui-core/src/widget.rs`.
+
+Order matters: most missing widgets are blocked on infrastructure, not on the widget code
+itself. Adding widgets before 7A lands means more `Slider`-style self-contained one-offs.
+
+### 7A. Foundations (do first)
+
+1. **Keyboard focus + routing** — a focused-widget id, Tab/Shift+Tab traversal, key events
+   delivered to the focused widget. Prerequisite for every input widget. **Done (2026-09-27):** focus
+   lives in `WidgetTree` (`set_focus`, `focus_next`, per window, cleared on `reset`);
+   `WidgetKind::is_focusable` is currently `Button` + `Slider`. `fastgui-app/src/keyboard.rs`
+   handles Tab/Shift+Tab, Escape (clear), Enter/Space (click a button), and arrows / PageUp /
+   PageDown / Home / End (slider). Click focuses a focusable widget and clears focus otherwise.
+   Chrome draws a 2pt accent ring inside the focused widget. Unit-tested in core, app and
+   chrome; not yet driven interactively (macOS automation permissions were unavailable).
+2. **Text editing core** — build on `cosmic-text`'s `Editor` (cursor, selection, undo,
+   clipboard, IME via winit's `Ime` events). Also replace the `measure_text` heuristic with real
+   `cosmic-text` shaping, and add text wrapping. **Single-line editing done (2026-09-27):** rather than
+   `cosmic-text`'s `Editor` (which wants to own the font system and a buffer per field),
+   `fastgui-core::text_edit::TextEdit` is a font-free model — grapheme-aware caret/selection,
+   word motion, undo/redo with typing runs merged — and chrome implements `TextMeasure` from real
+   shaping for caret x / click-to-caret. `WidgetKind::TextInput` / Python `fg.TextInput`
+   (`text` getter via a `Readback` mirror, `set_text`, `on_change`, `on_submit`); platform
+   shortcuts (Cmd on macOS, Ctrl elsewhere), clipboard via `arboard`, IME preedit/commit with the
+   candidate window placed at the caret, horizontal scroll with glyph-clipped line sprites (no
+   clip rects needed). Demo: `text_input_demo.py`. Unit-tested and render-checked to PNG; not yet
+   driven interactively. **Layout now measures label/button text with real shaping**
+   (`WidgetTree::compute_layout_measured` via chrome's `TextMeasure`, 2026-09-28 — labels had
+   been losing their last word to the 0.55×size estimate). **Still open:** text wrapping / multi-line `TextEdit`, caret blink, RTL/bidi caret placement (stops
+   are per glyph cluster, correct for LTR only).
+3. **Scroll container + clipping** — needs per-quad clip rects in the GPU quad pipeline (Vulkan
+   and Metal). The GPU chrome path already makes scroll cheap (~128 KiB/frame upload in
+   `chrome_bench`'s table scene vs 24 MiB on the CPU path). **Done (2026-09-27):** `WidgetKind::ScrollArea` /
+   Python `fg.ScrollArea(content)` (`scroll_to`). Turned out not to need per-quad clip rects:
+   chrome clips per op (fills intersected, straddling text/circles carry a whole-pixel `Clip`),
+   the GPU builder shrinks clipped sprite quads and emits a new `QUAD_CIRCLE_CLIPPED` kind (one
+   extra shader branch on each backend, SPIR-V rebuilt). Wheel/trackpad scrolling with nested
+   hand-off, draggable overlay scrollbars, clipped hit-testing, Tab scrolls focus into view.
+   `Viewport`s inside keep their size and are scissored (fixed a latent squash: backends used to
+   clamp a partly off-window viewport's rect). The CPU chrome path clips too (sprite blits honor
+   the clip). Verified: core/chrome unit tests, GPU-emulation vs CPU-painter parity at fractional
+   offsets and 1×/1.5×/2×, and the shared real-GPU scenario on Metal and MoltenVK (with
+   validation) including a clipped thumb. Demo: `scroll_demo.py`. **Still open:** click on the
+   scrollbar track to page, kinetic/momentum scrolling beyond what the OS reports, and
+   virtualization (7A.5) for very long lists.
+4. **Overlay / popup layer** — z-ordered layer above content, dismiss-on-outside-click. Grow it
+   out of the floating-panel machinery. Unblocks menus, combos, tooltips, dialogs.
+   **Done (2026-09-27):** not from the floating-panel machinery (those are OS windows) but as
+   `WidgetKind::Popup` nodes appended to the root and placed after layout (anchored below/above/
+   right/left of a widget with flip + clamp, at a point, or centered). Outside click dismisses
+   (`on_dismiss`), modal popups dim the window and swallow outside clicks, Escape closes the
+   topmost, Tab is trapped inside, focus restored on close. Chrome's popup items form an overlay
+   quad range drawn after `Viewport` layers on Metal and Vulkan, so popups cover video. Python:
+   `fg.Popup(content, modal=, on_dismiss=)`, `popup.show(anchor, side=)`, `window.show_popup(popup,
+   x, y)`, `close()`, `is_open`. Also fixed: a `Viewport` inside a `ScrollArea` never got its
+   wake handle (`bind_dispatch` skipped scroll areas). Tests: core placement/dismiss/focus trap,
+   chrome overlay range, Escape; real-GPU scenario gained a modal popup step (Metal + MoltenVK).
+   Demo: `popup_demo.py`. Tooltips (hover delay) still to build on this in 7C.
+5. **Virtualization** — build only visible rows; required for lists/trees/tables to scale.
+   **Done (2026-09-28):** `WidgetKind::ListView` / Python `fg.ListView(items, on_select=,
+   on_activate=)` (`set_items`, `select`, `selected`, `len()`). Data-driven (one node, plain
+   rows) rather than a node per row: chrome draws only `list_visible_rows`, so 1,000,000 rows
+   shape ~6 strings per frame. Shares `ScrollArea`'s scroll machinery (wheel hand-off, draggable
+   scrollbar) via `scroll_offset`/`set_scroll_offset`. Click selects, double-click / Enter
+   activates, arrows / PageUp / PageDown / Home / End move the selection and keep it in view.
+   Also fixed: clipping an already-clipped op (a list inside a scroll area) now keeps the
+   overlap of both clips. Demo: `list_demo.py`. Fixed row height only; tables/trees (7D) build
+   on `list_visible_rows`.
+6. **Theming** — shared palette/font/spacing tokens instead of per-widget color arguments.
+   **Done (2026-09-28), colors only:** `fg.Theme` (16 named tokens; `dark()` — the previous
+   defaults, with a few near-identical surface shades unified and plain labels now the same
+   off-white as other text — and `light()`; `replace(**colors)`), `fg.set_theme` / `get_theme`,
+   `Window.set_theme` (rebuilds the content; text/selection survive via their mirrors, scroll
+   and focus reset). Every existing widget's color arguments default to `None` → the current
+   theme at describe time; chrome's own colors (background, focus ring/caret, scrim, drop
+   preview, list scrollbar) moved from constants to `fastgui_core::theme`. Demo:
+   `theme_demo.py` (light = grey buttons, dark = blue, orange accent recolors buttons too);
+   Python tests in `python/tests/test_theme.py`. **Font + spacing tokens done (2026-09-28):**
+   `font_family` (shaped by chrome; part of text cache keys; unknown names fall back),
+   `font_size_small/font_size/font_size_large` (14/16/22) and `spacing_small/spacing/
+   spacing_large` (4/8/16). Every `font_size` argument takes points or `"small"|"body"|"large"`
+   and defaults by role (body text 16, lists/tabs/panel titles 14 — unchanged); `Box(gap=,
+   padding=)` and `Popup(padding=)` take units or `"small"|"medium"|"large"` (numeric
+   defaults unchanged). Bad names/values raise at construction. Follow-ups from trying the
+   demo: dock regions (`Panel` / `Tabs`) now clip their contents, so a too-wide pane is cut
+   off instead of drawn over its neighbour (and the hidden part isn't clickable); `Box(wrap=
+   True)` flows children onto more lines (taffy flex-wrap); theme_demo gained Smaller / Bigger /
+   Reset sizes. **Not yet:** floating panels restyle on their next
+   rebuild rather than immediately; the 7B widgets added concurrently still take explicit
+   colors and should adopt `palette()` the same way.
+
+### 7A follow-ups from Linux testing (2026-09-28)
+
+- `WidgetTree::reset` cleared rather than replaced, so ids held from before a `set_content`
+  (off-screen widgets, popups) can't alias new widgets (`popup.close()` closed the wrong popup;
+  a removed label's `set_text` changed a new one).
+- `scroll_into_view` through nested scroll areas no longer overshoots the outer one; a target
+  bigger than its area shows its start.
+- Labels and buttons are sized by real text shaping (see 7A.2), fixing truncated labels.
+- Viewport remap during a debounced resize uses the backend's real surface size
+  (`SurfaceBackend::surface_size`): on X11 a swapchain rebuilt after `OUT_OF_DATE` is already
+  at the new size, so remapping to the last *requested* size still overshot. Not reproducible
+  on MoltenVK; needs a Linux re-check.
+- `popup.show(anchor)` with an anchor no longer on screen leaves the popup closed.
+- Buttons click on release over themselves (press + drag off cancels); a slider dragged
+  against its stop no longer repeats `on_change`; `ScrollArea.scroll_to` and
+  `ListView.select` work before the widget is shown; `ListView` defaults to the raised
+  `surface_alt` background so it has an edge inside panels; `list_demo` filters plain digits.
+- Python tests for `TextInput`, `ListView`, `Popup`, `ScrollArea` (`tests/test_widgets.py`).
+
+### 7B. Tier 1 — core form controls
+
+- Single-line and multi-line text input (`QLineEdit` / `QTextEdit`)
+- Checkbox, radio group, toggle switch
+- Spin box (int/float) and a drag-to-scrub numeric field
+- Combo box / dropdown (needs 7A.4)
+- Progress bar
+- Scroll area (needs 7A.3)
+- Grid layout — `taffy` already supports CSS Grid, so this is mostly bindings
+- Image widget
+
+### 7C. Tier 2 — application structure
+
+- Menu bar, context menus, keyboard shortcuts / accelerators
+- Toolbar, status bar
+- Tooltips
+- Modal and modeless dialogs; native file/color pickers via the OS (e.g. the `rfd` crate)
+- Group box, collapsible section, stacked widget (one child visible at a time)
+
+### 7D. Tier 3 — data views
+
+- Virtualized list, tree, and table views. Simpler than Qt's model/view: accept numpy arrays or
+  Arrow columns directly for tables.
+- Property inspector (label + editor per row)
+
+### 7E. Tier 4 — beyond Qt (fastgui's differentiators)
+
+- **GPU plot widgets** (line, scatter, heatmap) fed straight from numpy or CUDA buffers —
+  pyqtgraph-class functionality built in, at better frame rates. Recommended headline feature
+  once 7A–7C are in.
+- **Image/tensor viewer** on `Viewport`: zoom, pan, pixel-value readout, colormaps. Requires the
+  still-missing `Viewport` aspect-ratio preservation (see M4 known simplifications).
+- **Node graph editor** — no built-in Qt equivalent.
+- **Log/console view** appendable from any thread without locks; code editor with syntax
+  highlighting.
+- **Timeline / sequencer**; gauges and meters for live telemetry.
+- **Command palette** (Ctrl+K-style search over app commands).
+- **Reactive data binding** — widgets bound to Python values/observables instead of manual
+  callback wiring.
+
+### 7F. Cross-cutting (plan early, don't bolt on)
+
+- **Accessibility** via `accesskit` (has a winit adapter). Qt has screen-reader support;
+  skipping this is where fastgui would fall short of it.
+- **HiDPI** scale factor applied to chrome.
+- **Drag-and-drop** between widgets and from the OS, generalizing the docking drag code.
+
+### Suggested order
+
+7A.1–7A.2 (focus + text input) → 7A.3–7A.4 (scroll + popups) → 7B → 7C → GPU plotting (7E) →
+7D → rest of 7E. Keep 7F in mind throughout, especially focus traversal (it doubles as the
+accessibility tree's navigation order).
+
 ## How this project has been built (read before continuing)
 
 - **No per-milestone re-planning ceremony** — implement directly using the architecture

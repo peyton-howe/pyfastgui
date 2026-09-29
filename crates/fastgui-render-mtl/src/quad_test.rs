@@ -60,7 +60,10 @@ impl Gpu {
         attachment.setClearColor(MTLClearColor { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 });
         let commands = self.queue.commandBuffer().unwrap();
         let encoder = commands.renderCommandEncoderWithDescriptor(&pass).unwrap();
-        self.chrome.as_ref().unwrap().encode(&encoder, &self.pipeline, self.width, self.height);
+        // Base range, then the overlay range, as `MetalRenderer::render_frame` draws them.
+        for overlay in [false, true] {
+            self.chrome.as_ref().unwrap().encode(&encoder, &self.pipeline, self.width, self.height, overlay);
+        }
         encoder.endEncoding();
         commands.commit();
         unsafe { commands.waitUntilCompleted() };

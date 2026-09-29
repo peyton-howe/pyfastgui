@@ -1,6 +1,10 @@
-from typing import Any, Callable, Sequence, Union
+from typing import Any, Callable, Literal, Sequence, Union
 
 RGBA = tuple[float, float, float, float]
+# A font size in points, or a theme size by name.
+FontSize = Union[float, Literal["small", "body", "large"]]
+# A gap/padding in layout units, or a theme spacing by name.
+Spacing = Union[float, Literal["small", "medium", "large"]]
 
 class CudaSurface:
     """Unverified: see Viewport.create_cuda_surface."""
@@ -29,7 +33,7 @@ class Viewport:
         ...
 
 class Label:
-    def __init__(self, text: str, font_size: float = 16.0, color: RGBA = (1.0, 1.0, 1.0, 1.0)) -> None: ...
+    def __init__(self, text: str, font_size: FontSize | None = None, color: RGBA | None = None) -> None: ...
     def set_text(self, text: str) -> None: ...
 
 class Button:
@@ -37,9 +41,9 @@ class Button:
         self,
         text: str,
         on_click: Callable[[], None] | None = None,
-        font_size: float = 16.0,
-        text_color: RGBA = (1.0, 1.0, 1.0, 1.0),
-        background: RGBA = (0.25, 0.35, 0.85, 1.0),
+        font_size: FontSize | None = None,
+        text_color: RGBA | None = None,
+        background: RGBA | None = None,
     ) -> None: ...
     def set_text(self, text: str) -> None: ...
 
@@ -50,24 +54,155 @@ class Slider:
         min: float = 0.0,
         max: float = 1.0,
         on_change: Callable[[float], None] | None = None,
-        track_color: RGBA = (0.3, 0.3, 0.35, 1.0),
-        thumb_color: RGBA = (0.4, 0.7, 1.0, 1.0),
+        track_color: RGBA | None = None,
+        thumb_color: RGBA | None = None,
     ) -> None: ...
     def set_value(self, value: float) -> None: ...
 
-Widget = Union[Label, Button, Slider, "Box", "Splitter", "Panel", "Tabs", "DockArea", Viewport]
+class TextInput:
+    """A single-line editable text field. Click or Tab to focus; supports selection, word
+    motion, undo/redo, the system clipboard and IME input."""
+    def __init__(
+        self,
+        text: str = "",
+        placeholder: str = "",
+        on_change: Callable[[str], None] | None = None,
+        on_submit: Callable[[str], None] | None = None,
+        font_size: FontSize | None = None,
+        width: float | None = None,
+        flex_grow: float = 0.0,
+        text_color: RGBA | None = None,
+        placeholder_color: RGBA | None = None,
+        background: RGBA | None = None,
+        selection_color: RGBA | None = None,
+    ) -> None: ...
+    @property
+    def text(self) -> str:
+        """The current text, including the user's latest edits. Safe from any thread."""
+    def set_text(self, text: str) -> None:
+        """Replace the text without calling `on_change`. Works before the field is attached."""
+
+class ScrollArea:
+    """A scrollable viewport onto `content`. The mouse wheel / trackpad scrolls it (the innermost
+    scroll area that can still move takes the scroll), overflowing axes get draggable overlay
+    scrollbars, and content outside it is clipped. Tab-focusing a widget scrolls it into view."""
+    def __init__(
+        self,
+        content: Widget,
+        flex_grow: float = 1.0,
+        width: float | None = None,
+        height: float | None = None,
+        background: RGBA = (0.0, 0.0, 0.0, 0.0),
+        bar_color: RGBA | None = None,
+    ) -> None: ...
+    def scroll_to(self, x: float, y: float) -> None:
+        """Scroll so content point `(x, y)` is at the top-left (clamped)."""
+
+class Theme:
+    """Named colors, font sizes and spacings. Widgets use them when their own arguments are left
+    out (colors, font sizes) or given by name (`font_size="large"`, `gap="medium"`), and chrome
+    draws its own colors and all text with them. `Theme()` is the dark default with any keyword
+    tokens replaced."""
+    background: RGBA
+    surface: RGBA
+    surface_alt: RGBA
+    surface_active: RGBA
+    border: RGBA
+    divider: RGBA
+    track: RGBA
+    text: RGBA
+    text_muted: RGBA
+    accent: RGBA
+    button: RGBA
+    button_text: RGBA
+    selection: RGBA
+    scrollbar: RGBA
+    scrim: RGBA
+    drop_indicator: RGBA
+    font_family: str | None
+    font_size_small: float
+    font_size: float
+    font_size_large: float
+    spacing_small: float
+    spacing: float
+    spacing_large: float
+    def __init__(self, **tokens: Any) -> None: ...
+    @staticmethod
+    def dark() -> Theme: ...
+    @staticmethod
+    def light() -> Theme: ...
+    def replace(self, **tokens: Any) -> Theme:
+        """A copy with the given tokens changed (colors, font sizes/family, spacings)."""
+
+def set_theme(theme: Theme) -> None:
+    """Make `theme` current for widgets described from now on (and chrome's next rebuild).
+    Use `Window.set_theme` to restyle a window that's already showing."""
+
+def get_theme() -> Theme: ...
+
+class ListView:
+    """A virtualized list of text rows: only the rows in view are drawn, so it handles millions.
+    Click or arrow keys select (`on_select(index)`); double-click or Enter activates
+    (`on_activate(index)`). Scrolls with the wheel/trackpad and a draggable scrollbar."""
+    def __init__(
+        self,
+        items: Sequence[str],
+        on_select: Callable[[int], None] | None = None,
+        on_activate: Callable[[int], None] | None = None,
+        row_height: float = 24.0,
+        font_size: FontSize | None = None,
+        flex_grow: float = 1.0,
+        width: float | None = None,
+        height: float | None = None,
+        text_color: RGBA | None = None,
+        background: RGBA | None = None,
+        selection_color: RGBA | None = None,
+    ) -> None: ...
+    def set_items(self, items: Sequence[str]) -> None:
+        """Replace the rows (clears the selection). Works before attaching."""
+    def select(self, index: int | None) -> None:
+        """Select a row (clamped) and scroll it into view, calling `on_select`."""
+    @property
+    def selected(self) -> int | None: ...
+    def __len__(self) -> int: ...
+
+class Popup:
+    """An overlay shown on demand: a menu, dropdown list, tooltip or dialog. Not placed in the
+    layout; open it with `show(anchor)` or `Window.show_popup`. A click outside a non-modal popup,
+    or Escape, dismisses it (calling `on_dismiss`); a modal one dims the window and blocks clicks
+    behind it. Tab stays inside the open popup; focus returns where it was when it closes. Drawn
+    above everything, including `Viewport` video."""
+    def __init__(
+        self,
+        content: Widget,
+        modal: bool = False,
+        on_dismiss: Callable[[], None] | None = None,
+        padding: Spacing = 6.0,
+        background: RGBA | None = None,
+        border: RGBA | None = None,
+    ) -> None: ...
+    def show(self, anchor: Widget, side: str = "below") -> None:
+        """Open next to `anchor` (already shown in a window): "below", "above", "right" or "left",
+        flipped when there's no room. Reopening moves it."""
+    def close(self) -> None:
+        """Close without calling `on_dismiss`."""
+    @property
+    def is_open(self) -> bool: ...
+
+Widget = Union[Label, Button, Slider, TextInput, "ListView", "ScrollArea", "Box", "Splitter", "Panel", "Tabs", "DockArea", Viewport]
 
 class Box:
     def __init__(
         self,
         children: Sequence[Widget],
         direction: str = "column",
-        gap: float = 0.0,
-        padding: float = 0.0,
+        gap: Spacing = 0.0,
+        padding: Spacing = 0.0,
         flex_grow: float = 0.0,
         width: float | None = None,
         height: float | None = None,
         background: RGBA = (0.0, 0.0, 0.0, 0.0),
+        wrap: bool = False,
     ) -> None: ...
 
 class Splitter:
@@ -80,7 +215,7 @@ class Splitter:
         second: Widget,
         direction: str = "row",
         ratio: float = 0.5,
-        bar_color: RGBA = (0.2, 0.21, 0.24, 1.0),
+        bar_color: RGBA | None = None,
         thickness: float = 6.0,
     ) -> None: ...
 
@@ -94,10 +229,10 @@ class Panel:
         self,
         title: str,
         content: Widget,
-        title_font_size: float = 14.0,
-        title_color: RGBA = (0.92, 0.93, 0.95, 1.0),
-        title_background: RGBA = (0.16, 0.17, 0.20, 1.0),
-        background: RGBA = (0.12, 0.13, 0.15, 1.0),
+        title_font_size: FontSize | None = None,
+        title_color: RGBA | None = None,
+        title_background: RGBA | None = None,
+        background: RGBA | None = None,
         title_height: float = 28.0,
     ) -> None: ...
     @property
@@ -122,10 +257,10 @@ class Tabs:
         self,
         panels: Sequence[Panel],
         active: int = 0,
-        font_size: float = 14.0,
-        text_color: RGBA = (0.92, 0.93, 0.95, 1.0),
-        active_color: RGBA = (0.20, 0.22, 0.26, 1.0),
-        inactive_color: RGBA = (0.14, 0.15, 0.18, 1.0),
+        font_size: FontSize | None = None,
+        text_color: RGBA | None = None,
+        active_color: RGBA | None = None,
+        inactive_color: RGBA | None = None,
         height: float = 28.0,
         on_select: Callable[[int], None] | None = None,
     ) -> None: ...
@@ -157,6 +292,10 @@ class Window:
     def set_clear_color(self, r: float, g: float, b: float, a: float) -> None: ...
     def set_viewport(self, viewport: Viewport) -> None: ...
     def set_content(self, widget: Widget) -> None: ...
+    def set_theme(self, theme: Theme) -> None:
+        """Make `theme` current and rebuild this window's content so it shows at once."""
+    def show_popup(self, popup: Popup, x: float | None = None, y: float | None = None) -> None:
+        """Open `popup` with its top-left at `(x, y)`, or centered when both are omitted."""
     def add_floating_panel(self, panel: Panel, x: float, y: float, width: float, height: float) -> None:
         """Open `panel` as a real OS window at `(x, y)` relative to this window's inner origin,
         sized `(width, height)`. Draggable anywhere on screen; resize via edge/corner drag; if

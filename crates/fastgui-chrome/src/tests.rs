@@ -15,10 +15,10 @@ fn cached_run_blit_matches_per_pixel_fill_rect() {
     let mut chrome = ChromeRenderer::new();
     let mut ops = Vec::new();
     chrome.push_text(&mut ops, rect, text, font_size, color);
-    let [Op::Text { run, x, y }] = ops.as_slice() else { panic!("expected one text op") };
+    let [Op::Text { run, x, y, .. }] = ops.as_slice() else { panic!("expected one text op") };
     let mut blitted = Pixmap::new(260, 40).unwrap();
     blitted.fill(background);
-    blit_sprite(&mut blitted, run, x + run.x, y + run.y);
+    blit_sprite(&mut blitted, run, x + run.x, y + run.y, None);
 
     let mut per_pixel = Pixmap::new(260, 40).unwrap();
     per_pixel.fill(background);
@@ -278,7 +278,7 @@ fn check_gpu_matches_cpu(
         .gpu
         .quads
         .iter()
-        .filter(|q| q.kind == fastgui_core::QUAD_CIRCLE)
+        .filter(|q| q.kind == fastgui_core::QUAD_CIRCLE || q.kind == fastgui_core::QUAD_CIRCLE_CLIPPED)
         .map(|q| pixel_bounds(q.rect[0], q.rect[1], q.rect[2], q.rect[3], PixelRect { x: 0, y: 0, width: w, height: h }))
         .collect();
     for (i, (a, b)) in drawn.as_chunks::<4>().0.iter().zip(reference.as_chunks::<4>().0).enumerate() {
@@ -428,4 +428,396 @@ fn hidden_slider_does_not_draw_thumb_at_origin() {
         corner[2] < 80,
         "top-left pixel looks like the slider thumb: {corner:?}"
     );
+}
+
+#[test]
+fn focus_ring_adds_four_quads_and_rebuilds() {
+    let mut tree = WidgetTree::new();
+    let root = tree.root();
+    let button = tree.new_node(
+        Style { size: Size { width: Dimension::length(80.0), height: Dimension::length(30.0) }, ..Default::default() },
+        WidgetKind::Button {
+            text: "Go".into(),
+            font_size: 14.0,
+            text_color: Color([1.0; 4]),
+            background: Color([0.2, 0.2, 0.2, 1.0]),
+            on_click: None,
+        },
+    );
+    tree.add_child(root, button);
+    tree.compute_layout(200.0, 100.0);
+
+    let mut chrome = ChromeRenderer::new();
+    let unfocused = chrome.build_quads(&tree, 200, 100, None, 1.0).expect("first frame").quads.len();
+    assert!(chrome.build_quads(&tree, 200, 100, None, 1.0).is_none(), "no change, no rebuild");
+    tree.set_focus(Some(button));
+    let focused = chrome.build_quads(&tree, 200, 100, None, 1.0).expect("focus change rebuilds").quads.len();
+    assert_eq!(focused, unfocused + 4);
+}
+
+#[test]
+fn caret_stops_are_monotonic_and_round_trip() {
+    let mut chrome = ChromeRenderer::new();
+    let text = "Hello wörld 👍🏽!";
+    let stops = chrome.line_stops(text, 16.0);
+    assert_eq!(stops.last().map(|s| s.0), Some(text.len()));
+    assert!(stops.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].1), "{stops:?}");
+    for &(index, x) in stops.iter() {
+        assert_eq!(chrome.index_at(text, 16.0, x + 0.2), index);
+        assert_eq!(chrome.caret_x(text, 16.0, index), x);
+    }
+    assert_eq!(chrome.index_at(text, 16.0, -50.0), 0);
+    assert_eq!(chrome.index_at(text, 16.0, 1e6), text.len());
+    assert_eq!(chrome.caret_x("", 16.0, 0), 0.0);
+}
+
+fn text_input_tree(text: &str, width: f32, scroll: f32) -> (WidgetTree, WidgetId) {
+    let mut tree = WidgetTree::new();
+    let root = tree.root();
+    let input = tree.new_node(
+        Style { size: Size { width: Dimension::length(width), height: Dimension::length(32.0) }, ..Default::default() },
+        WidgetKind::TextInput {
+            edit: fastgui_core::text_edit::TextEdit::new(text),
+            placeholder: "type here".into(),
+            font_size: 16.0,
+            text_color: Color([1.0; 4]),
+            placeholder_color: Color([0.5, 0.5, 0.5, 1.0]),
+            background: Color([0.2, 0.2, 0.2, 1.0]),
+            selection_color: Color([0.2, 0.4, 0.8, 1.0]),
+            scroll,
+            preedit: None,
+            on_change: None,
+            on_submit: None,
+            mirror: None,
+        },
+    );
+    tree.add_child(root, input);
+    tree.compute_layout(400.0, 100.0);
+    (tree, input)
+}
+
+#[test]
+fn long_text_input_line_is_clipped_to_its_field_at_any_scroll() {
+    let text = "a long line of text that is much wider than the little field it sits in";
+    for scroll in [0.0, 120.0] {
+        let (mut tree, input) = text_input_tree(text, 100.0, scroll);
+        tree.set_focus(Some(input));
+        let mut chrome = ChromeRenderer::new();
+        let items = chrome.build_items(&tree, None, 2.0, PixelRect { x: 0, y: 0, width: 800, height: 200 });
+        let field = &items.iter().find(|item| item.key == u64::from(input)).expect("field item").ops;
+        let text_ops: Vec<_> = field.iter().filter_map(|op| match op { Op::Text { run, x, .. } => Some((run, *x)), _ => None }).collect();
+        assert_eq!(text_ops.len(), 1, "one line of text at scroll {scroll}");
+        let (run, x) = text_ops[0];
+        let padding = (TEXT_INPUT_PADDING * 2.0) as i32;
+        assert!(x + run.x >= padding && x + run.x + run.width as i32 <= 200 - padding, "scroll {scroll}: text spills out");
+        // Background, focus ring (4), text, caret — no selection.
+        assert_eq!(field.len(), 7, "scroll {scroll}");
+    }
+}
+
+#[test]
+fn empty_unfocused_text_input_shows_placeholder_without_caret() {
+    let (tree, input) = text_input_tree("", 200.0, 0.0);
+    let mut chrome = ChromeRenderer::new();
+    let items = chrome.build_items(&tree, None, 1.0, PixelRect { x: 0, y: 0, width: 400, height: 100 });
+    let field = &items.iter().find(|item| item.key == u64::from(input)).unwrap().ops;
+    assert!(matches!(field.as_slice(), [Op::Fill { .. }, Op::Text { .. }]), "background + placeholder only");
+}
+
+/// A 200×90 scroll area at (10, 10) over a column taller than it: labels, a button and a slider
+/// whose thumb the clip edge cuts through at some offsets.
+fn scroll_scene() -> (WidgetTree, WidgetId) {
+    let mut tree = WidgetTree::new();
+    let root = tree.root();
+    let area = tree.new_node(
+        Style {
+            flex_direction: FlexDirection::Column,
+            size: Size { width: Dimension::length(200.0), height: Dimension::length(90.0) },
+            margin: fastgui_core::taffy::prelude::Rect {
+                left: LengthPercentageAuto::length(10.0),
+                top: LengthPercentageAuto::length(10.0),
+                right: LengthPercentageAuto::length(0.0),
+                bottom: LengthPercentageAuto::length(0.0),
+            },
+            ..Default::default()
+        },
+        WidgetKind::ScrollArea {
+            offset: (0.0, 0.0),
+            background: Color([0.15, 0.16, 0.2, 1.0]),
+            bar_color: Color([1.0, 1.0, 1.0, 0.35]),
+        },
+    );
+    let column = tree.new_node(
+        Style { flex_direction: FlexDirection::Column, gap: Size { width: LengthPercentage::length(6.0), height: LengthPercentage::length(6.0) }, ..Default::default() },
+        WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+    );
+    tree.add_child(root, area);
+    tree.add_child(area, column);
+    for i in 0..4 {
+        let label = tree.new_node(
+            Style::default(),
+            WidgetKind::Label { text: format!("Row {i} — clipped text"), font_size: 15.0, color: Color([0.9, 0.9, 0.95, 1.0]) },
+        );
+        tree.add_child(column, label);
+    }
+    let button = tree.new_node(
+        Style { size: Size { width: Dimension::length(120.0), height: Dimension::length(28.0) }, ..Default::default() },
+        WidgetKind::Button {
+            text: "Button".into(),
+            font_size: 14.0,
+            text_color: Color([1.0; 4]),
+            background: Color([0.3, 0.4, 0.7, 1.0]),
+            on_click: None,
+        },
+    );
+    let slider = tree.new_node(
+        Style { size: Size { width: Dimension::auto(), height: Dimension::length(24.0) }, ..Default::default() },
+        WidgetKind::Slider {
+            value: 0.3,
+            min: 0.0,
+            max: 1.0,
+            track_color: Color([0.3, 0.3, 0.35, 1.0]),
+            thumb_color: Color([0.4, 0.7, 1.0, 1.0]),
+            on_change: None,
+        },
+    );
+    tree.add_child(column, button);
+    tree.add_child(column, slider);
+    tree.set_scroll_container(area);
+    tree.compute_layout(240.0, 130.0);
+    (tree, area)
+}
+
+#[test]
+fn clipped_scroll_content_matches_cpu_painter_and_stays_inside() {
+    for scale in [1.0f32, 1.5, 2.0] {
+        let size = ((240.0 * scale) as u32, (130.0 * scale) as u32);
+        let (mut tree, area) = scroll_scene();
+        let max = tree.scroll_extent(area).unwrap().1;
+        assert!(max > 30.0, "the column overflows: {max}");
+        let (mut gpu, mut cpu, mut atlas) = (ChromeRenderer::new(), ChromeRenderer::new(), Vec::new());
+        for offset in [0.0, 7.5, 13.25, 41.0, max] {
+            tree.set_scroll_offset(area, 0.0, offset);
+            check_gpu_matches_cpu(&mut gpu, &mut cpu, &mut atlas, &mut tree, size, None, scale);
+            let clip = Clip::from_rect(scale_rect(tree.absolute_rect(area).unwrap(), scale));
+            // Everything but the window background is inside the area.
+            for quad in &gpu.gpu.quads[1..] {
+                let [l, t, r, b] = quad.rect;
+                let inside = l >= clip.left as f32 && t >= clip.top as f32 && r <= clip.right as f32 && b <= clip.bottom as f32;
+                assert!(inside, "scale {scale} offset {offset}: quad {quad:?} leaves the scroll area {clip:?}");
+            }
+        }
+        assert!(
+            gpu.gpu.quads.iter().any(|q| q.kind == fastgui_core::QUAD_SPRITE),
+            "some text is still drawn at the end"
+        );
+    }
+}
+
+#[test]
+fn clip_ops_cuts_fills_and_tags_straddling_sprites() {
+    let mut chrome = ChromeRenderer::new();
+    let mut ops = Vec::new();
+    push_fill(&mut ops, WidgetRect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 }, Color([1.0; 4]));
+    push_fill(&mut ops, WidgetRect { x: 200.0, y: 0.0, width: 10.0, height: 10.0 }, Color([1.0; 4]));
+    chrome.push_text(&mut ops, WidgetRect { x: 30.0, y: 40.0, width: 200.0, height: 30.0 }, "straddles", 16.0, Color([1.0; 4]));
+    chrome.push_text(&mut ops, WidgetRect { x: 12.0, y: 12.0, width: 200.0, height: 30.0 }, "in", 16.0, Color([1.0; 4]));
+    let clip = Clip { left: 10, top: 10, right: 60, bottom: 50 };
+    let ops = clip_ops(ops, clip);
+    assert_eq!(ops.len(), 3, "the fill outside the clip is dropped");
+    assert!(matches!(ops[0], Op::Fill { left: 10.0, top: 10.0, right: 60.0, bottom: 50.0, .. }));
+    assert!(matches!(ops[1], Op::Text { clip: Some(c), .. } if c == clip), "partly outside: carries the clip");
+    assert!(matches!(ops[2], Op::Text { clip: None, .. }), "wholly inside: no clip needed");
+}
+
+#[test]
+fn popup_quads_form_the_overlay_range() {
+    use fastgui_core::widget::PopupAnchor;
+    let (mut tree, area) = scroll_scene();
+    let mut chrome = ChromeRenderer::new();
+    let base = chrome.build_quads(&tree, 240, 130, None, 1.0).expect("first frame");
+    assert_eq!(base.overlay_start, base.quads.len(), "no popup: nothing in the overlay range");
+    let base_len = base.quads.len();
+
+    let popup_kind = |modal| WidgetKind::Popup {
+        anchor: PopupAnchor::Center,
+        modal,
+        background: Color([0.14, 0.15, 0.18, 1.0]),
+        border: Color([0.3, 0.3, 0.4, 1.0]),
+        on_dismiss: None,
+        restore_focus: None,
+        open: None,
+    };
+    let popup = tree.open_popup(popup_kind(true), |tree, popup| {
+        let label = tree.new_node(
+            Style::default(),
+            WidgetKind::Label { text: "In a popup".into(), font_size: 14.0, color: Color([1.0; 4]) },
+        );
+        tree.add_child(popup, label);
+    });
+    tree.compute_layout(240.0, 130.0);
+    let frame = chrome.build_quads(&tree, 240, 130, None, 1.0).expect("popup opened");
+    let overlay = &frame.quads[frame.overlay_start..];
+    assert_eq!(frame.overlay_start, base_len, "the base content is unchanged and comes first");
+    assert_eq!(overlay[0].rect, [0.0, 0.0, 240.0, 130.0], "a modal popup dims the whole window first");
+    assert!(overlay.iter().any(|q| q.kind == fastgui_core::QUAD_SPRITE), "its text is in the overlay");
+    let r = tree.absolute_rect(popup).unwrap();
+    assert!((r.x + r.width / 2.0 - 120.0).abs() < 0.5 && (r.y + r.height / 2.0 - 65.0).abs() < 0.5, "centered");
+
+    tree.close_popup(popup);
+    tree.compute_layout(240.0, 130.0);
+    let _ = area;
+    let closed = chrome.build_quads(&tree, 240, 130, None, 1.0).expect("popup closed");
+    assert_eq!((closed.quads.len(), closed.overlay_start), (base_len, base_len));
+}
+
+#[test]
+fn clipping_twice_keeps_the_overlap() {
+    let mut chrome = ChromeRenderer::new();
+    let mut ops = Vec::new();
+    chrome.push_text(&mut ops, WidgetRect { x: 0.0, y: 0.0, width: 300.0, height: 30.0 }, "a long line of text", 16.0, Color([1.0; 4]));
+    let ops = clip_ops(ops, Clip { left: 0, top: 0, right: 60, bottom: 100 });
+    let ops = clip_ops(ops, Clip { left: 20, top: 0, right: 200, bottom: 100 });
+    assert!(matches!(ops[0], Op::Text { clip: Some(Clip { left: 20, right: 60, .. }), .. }), "both edges survive");
+}
+
+fn list_view_tree(n: usize, scroll: f32, selected: Option<usize>) -> (WidgetTree, WidgetId) {
+    let mut tree = WidgetTree::new();
+    let root = tree.root();
+    let list = tree.new_node(
+        Style { size: Size { width: Dimension::length(180.0), height: Dimension::length(100.0) }, ..Default::default() },
+        WidgetKind::ListView {
+            items: (0..n).map(|i| format!("Row number {i}")).collect(),
+            row_height: 22.0,
+            font_size: 14.0,
+            scroll,
+            selected,
+            text_color: Color([0.9, 0.9, 0.95, 1.0]),
+            background: Color([0.13, 0.14, 0.17, 1.0]),
+            selection_color: Color([0.25, 0.45, 0.8, 0.6]),
+            on_select: None,
+            on_activate: None,
+            mirror: None,
+        },
+    );
+    tree.add_child(root, list);
+    tree.compute_layout(200.0, 120.0);
+    (tree, list)
+}
+
+#[test]
+fn list_view_shapes_only_visible_rows_and_matches_cpu_painter() {
+    for scale in [1.0f32, 1.5, 2.0] {
+        let size = ((200.0 * scale) as u32, (120.0 * scale) as u32);
+        let (mut tree, list) = list_view_tree(1_000_000, 22.0 * 500_000.0 + 7.5, Some(500_002));
+        let (mut gpu, mut cpu, mut atlas) = (ChromeRenderer::new(), ChromeRenderer::new(), Vec::new());
+        check_gpu_matches_cpu(&mut gpu, &mut cpu, &mut atlas, &mut tree, size, None, scale);
+        let sprites = gpu.gpu.quads.iter().filter(|q| q.kind == fastgui_core::QUAD_SPRITE).count();
+        assert!(sprites <= 6, "only the ~6 rows in view are drawn, not a million: {sprites}");
+        assert!(gpu.text_cache.runs.values().map(|m| m.len()).sum::<usize>() <= 6, "and only they get shaped");
+        let clip = Clip::from_rect(scale_rect(tree.absolute_rect(list).unwrap(), scale));
+        for q in &gpu.gpu.quads[1..] {
+            assert!(q.rect[1] >= clip.top as f32 && q.rect[3] <= clip.bottom as f32, "scale {scale}: {q:?} leaves the list");
+        }
+    }
+}
+
+#[test]
+fn font_family_is_part_of_text_cache_keys_and_falls_back() {
+    let mut chrome = ChromeRenderer::new();
+    let rect = WidgetRect { x: 0.0, y: 0.0, width: 200.0, height: 24.0 };
+    let color = Color([1.0; 4]);
+    let run = |chrome: &mut ChromeRenderer| {
+        let mut ops = Vec::new();
+        chrome.push_text(&mut ops, rect, "Family", 16.0, color);
+        match ops.pop() {
+            Some(Op::Text { run, .. }) => run,
+            _ => panic!("expected a text run"),
+        }
+    };
+    let default = run(&mut chrome);
+    chrome.text_cache.family = Some("No Such Font Family 123".into());
+    let unknown = run(&mut chrome);
+    assert!(!Arc::ptr_eq(&default, &unknown), "a different family is a different cache entry");
+    assert!(unknown.width > 0, "an unknown family falls back to the default font");
+    chrome.text_cache.family = None;
+    assert!(Arc::ptr_eq(&default, &run(&mut chrome)), "switching back reuses the original run");
+}
+
+/// Labels sized only by their own text (a row with no stretch, as inside a popup or a wrapping
+/// row) must show all of it: layout measures with the same shaping chrome draws with.
+fn check_labels_draw_in_full(measured: bool) -> Result<(), String> {
+    for family in [None, Some("Menlo")] {
+        for scale in [1.0f32, 1.5, 2.0] {
+            let mut chrome = ChromeRenderer::new();
+            chrome.text_cache.family = family.map(Into::into);
+            let mut tree = WidgetTree::new();
+            let root = tree.root();
+            let row = tree.new_node(
+                Style { flex_direction: FlexDirection::Row, align_items: Some(AlignItems::FLEX_START), ..Default::default() },
+                WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+            );
+            tree.add_child(root, row);
+            let texts = ["Modal", "A themed popup", "WWW mmm iii", "WWWWWWWWWWWW"];
+            let labels: Vec<_> = texts
+                .iter()
+                .map(|t| {
+                    let id = tree.new_node(Style::default(), WidgetKind::Label { text: (*t).into(), font_size: 15.0, color: Color([1.0; 4]) });
+                    tree.add_child(row, id);
+                    id
+                })
+                .collect();
+            if measured {
+                // As the app does: the family the chrome draws with is the one layout measures.
+                let saved = chrome.text_cache.family.clone();
+                tree.compute_layout_measured(600.0, 100.0, &mut ChromeWithFamily(&mut chrome, saved.clone()));
+                chrome.text_cache.family = saved;
+            } else {
+                tree.compute_layout(600.0, 100.0);
+            }
+            let window = PixelRect { x: 0, y: 0, width: (600.0 * scale) as u32, height: (100.0 * scale) as u32 };
+            let family_now = chrome.text_cache.family.clone();
+            let items = chrome.build_items_with_family(&tree, scale, window, family_now.clone());
+            for (label, text) in labels.iter().zip(texts) {
+                let ops = &items.iter().find(|i| i.key == u64::from(*label)).unwrap().ops;
+                let Some(Op::Text { run, .. }) = ops.first() else { return Err(format!("{text}: no text drawn")) };
+                // Reference: the same text with all the room in the world, ink to ink.
+                chrome.text_cache.family = family_now.clone();
+                let mut reference = Vec::new();
+                let roomy = WidgetRect { x: 0.0, y: 0.0, width: 10_000.0, height: 15.0 * scale * 1.25 };
+                chrome.push_text(&mut reference, roomy, text, 15.0 * scale, Color([1.0; 4]));
+                let Some(Op::Text { run: full, .. }) = reference.first() else { unreachable!() };
+                if run.width + 1 < full.width {
+                    return Err(format!("{family:?} {scale}×: {text:?} drawn {}px of {}px", run.width, full.width));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Measures through a chrome with a fixed font family (the tests don't touch the global theme).
+struct ChromeWithFamily<'a>(&'a mut ChromeRenderer, Option<Arc<str>>);
+
+impl fastgui_core::text_edit::TextMeasure for ChromeWithFamily<'_> {
+    fn caret_x(&mut self, text: &str, font_size: f32, index: usize) -> f32 {
+        self.0.text_cache.family = self.1.clone();
+        let stops = self.0.line_stops(text, font_size);
+        stop_x(&stops, index)
+    }
+    fn index_at(&mut self, _: &str, _: f32, _: f32) -> usize {
+        0
+    }
+}
+
+#[test]
+fn measured_labels_draw_in_full_at_any_scale_and_font() {
+    check_labels_draw_in_full(true).unwrap();
+}
+
+#[test]
+fn estimated_label_widths_did_truncate() {
+    // The regression this guards: the old per-character estimate (0.55 × size) lost trailing
+    // text — for wide letters more than the drawing margin can absorb.
+    assert!(check_labels_draw_in_full(false).is_err());
 }

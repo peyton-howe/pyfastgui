@@ -15,7 +15,11 @@ crates/
     src/readback.rs          Readback<T> (mutex-cached last-committed value, for sync getters)
     src/frame.rs              FrameSlot<T> (latest-wins mailbox), CpuFrame, PixelFormat
     src/widget.rs             WidgetTree (wraps taffy::TaffyTree), WidgetKind (including
-                              Viewport), WidgetId, Color, hit_test / find_region_at, DropZone
+                              Viewport), WidgetId, Color, hit_test / find_region_at, DropZone,
+                              keyboard focus (set_focus / focus_next), ScrollArea offsets,
+                              clip rects, wheel scrolling and scrollbar geometry
+    src/text_edit.rs          TextEdit (text + caret/selection + undo, grapheme-aware, no
+                              fonts) and the TextMeasure trait chrome implements
 
   fastgui-app/            Shared winit ApplicationHandler: command queue, dock/float/ghost
                           input, chrome dirty checks, multi-window lifecycle. Layout/hit-test
@@ -23,7 +27,10 @@ crates/
                           boundary. Backends implement SurfaceBackend and call run().
     src/app.rs                App<B: SurfaceBackend>, ApplicationHandler, floaters, tear ghost
     src/command.rs            Command, EventWaker, CommandDispatch, RenderThreadHandles
-    src/surface.rs            SurfaceBackend trait + MainResizePolicy (Immediate vs Debounced)
+    src/surface.rs            SurfaceBackend trait + MainResizePolicy (Immediate vs Debounced),
+                              ViewportDraw (a Viewport's full rect + visible part → viewport/scissor)
+    src/keyboard.rs           Tab/Escape focus keys; routes key presses to the focused widget
+    src/text_input.rs         TextInput keys/mouse/IME/clipboard (arboard), caret scrolling
 
   fastgui-render-vk/      The Vulkan GPU backend (Windows + Linux). Thin `run()` wrapper with
                           Debounced main-window resize + CUDA surface create. Selected by
@@ -64,6 +71,8 @@ crates/
                           without a working CUDA driver.
 
   fastgui-py/             PyO3 bindings — the only crate that knows about Python.
+    src/theme.rs              fg.Theme (named colors) + the process-wide current theme; pushes
+                              chrome's own colors to fastgui-core::theme
     src/backend.rs            cfg-picks fastgui-render-mtl on macOS, fastgui-render-vk elsewhere
     src/lib.rs                Window, Viewport, CudaSurface pyclasses (create_cuda_surface is a
                               RuntimeError stub on macOS)
@@ -169,6 +178,42 @@ dirty-rect diffs and returns a `ChromeFrame`; `set_chrome_frame` copies only the
 host-visible `LINEAR` image, Metal `replaceRegion`). A patch must match a full repaint to the
 byte (unit test at 1×/1.5×/2×). This path is also the pixel reference GPU tests compare against.
 
+**Clipping (`ScrollArea`, dock regions).** Layout shifts a scroll area's children by its offset
+and records a clip rect for everything inside it (`WidgetTree::clip_rect`); dock regions (a
+`Panel`'s or `Tabs`' outer container) clip their contents the same way, without an offset, so
+content wider than its pane is cut off rather than drawn over the next pane. `hit_test` ignores
+clipped-out parts. Chrome clips per op rather than per draw call: fills are intersected with the clip,
+anything wholly outside is dropped, and text runs / circles that straddle the edge carry a
+whole-pixel `Clip`. On the GPU a clipped text quad shrinks and shifts its atlas offset (still a
+1:1 copy), and a clipped circle becomes `QUAD_CIRCLE_CLIPPED`, whose coverage the shader
+multiplies by its (clipped) rect's box coverage — so no shader-side clip state or extra draw
+calls. `Viewport` layers inside a scroll area keep their full-size GPU viewport and are cut by
+the scissor (`ViewportDraw::viewport_and_scissor`), so a partly scrolled-out frame is cut off,
+not squashed. Scrollbars are overlay thumbs drawn as extra items after all content.
+
+**Theming.** Widget colors and font sizes are resolved in Python-facing `describe` (an argument
+left as `None`, or a size named like `"large"` / a spacing like `"medium"`, takes the current
+`fg.Theme` token), so themes cost nothing at draw time and need no per-frame lookups. What
+chrome draws on its own — window background, focus ring/caret, modal scrim, drop preview, list
+scrollbars — and the font family all text is shaped in come from
+`fastgui_core::theme::chrome_theme()`, set by the same `fg.set_theme`. The family is part of
+the text-run and caret-stop cache keys, so a font switch never reuses runs shaped in the old
+one. `Window.set_theme` re-runs `set_content` so a live window restyles.
+
+**Virtualization (`ListView`).** A list is one widget node holding plain row data, not a node
+per row: chrome asks `WidgetTree::list_visible_rows` for the handful of rows in view and shapes
+and draws only those, clipped to the list. It scrolls through the same offset/extent/scrollbar
+code as `ScrollArea` (`WidgetTree::scroll_offset`), with its extent `rows × row_height`, so a
+million rows cost the same per frame as ten.
+
+**Overlays (`Popup`).** A popup is an absolutely positioned last child of the root (so it
+paints last and wins hit tests), moved next to its anchor by `WidgetTree::place_popups` after
+layout. Chrome puts every item inside a popup after the drop indicator and reports where they
+start (`ChromeQuads::overlay_start`); backends draw quads before that index, then `Viewport`
+layers, then the overlay range — so menus and dialogs cover video. Outside clicks go through
+`WidgetTree::popup_press` first (dismiss, or swallowed by a modal backdrop); Escape dismisses
+the topmost popup; Tab is trapped inside it and focus is restored on close.
+
 Layout and hit-testing stay in points; chrome is built at the window's backing scale so Retina
 matches the Python window size. Viewport layers still use the fullscreen-triangle path
 (`gl_VertexIndex` / MSL `vertex_id`) on top of chrome.
@@ -193,6 +238,8 @@ Roughly, the checklist an existing widget's implementation demonstrates:
    and wire any special attach-time cross-referencing into `attach()` if needed.
 4. Handle any new input behavior (click, drag) in `fastgui-app`'s shared
    `handle_mouse_press` / cursor-move / release dispatch (one place for both backends).
+   If it takes keyboard input, add it to `WidgetKind::is_focusable` (Tab order and
+   click-to-focus come with that) and handle its keys in `fastgui-app/src/keyboard.rs`.
 5. Add the type stub in `python/fastgui/__init__.pyi`.
 6. Verify by actually running an example — see ROADMAP.md's "How this project has been built"
    for why this step isn't optional.

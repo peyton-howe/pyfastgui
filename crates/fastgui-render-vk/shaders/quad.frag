@@ -27,12 +27,12 @@ void main() {
         out_color = texelFetch(atlas, ivec2(params.xy + (px - rect.xy)), 0);
         return;
     }
-    float coverage;
-    if (kind == 1u) {
-        coverage = clamp(params.z + 0.5 - distance(frag, params.xy), 0.0, 1.0);
-    } else {
-        vec2 c = clamp(min(px + 1.0, rect.zw) - max(px, rect.xy), 0.0, 1.0);
-        coverage = c.x * c.y;
+    // Box coverage of `rect`: the whole shape for solids, the clip for clipped circles (3).
+    vec2 c = clamp(min(px + 1.0, rect.zw) - max(px, rect.xy), 0.0, 1.0);
+    float coverage = c.x * c.y;
+    if (kind == 1u || kind == 3u) {
+        float circle = clamp(params.z + 0.5 - distance(frag, params.xy), 0.0, 1.0);
+        coverage = kind == 3u ? circle * coverage : circle;
     }
     float a = color.a * coverage;
     out_color = vec4(color.rgb * a, a);

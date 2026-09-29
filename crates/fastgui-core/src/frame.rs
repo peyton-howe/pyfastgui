@@ -42,6 +42,13 @@ impl PixelRect {
         self.y + self.height
     }
 
+    /// The overlap of two rects (empty when they don't overlap).
+    pub fn intersect(&self, other: &PixelRect) -> PixelRect {
+        let (x, y) = (self.x.max(other.x), self.y.max(other.y));
+        let (right, bottom) = (self.right().min(other.right()), self.bottom().min(other.bottom()));
+        PixelRect { x, y, width: right.saturating_sub(x), height: bottom.saturating_sub(y) }
+    }
+
     /// Smallest rect containing both (an empty rect contributes nothing).
     pub fn union(&self, other: &PixelRect) -> PixelRect {
         if self.is_empty() {
@@ -89,6 +96,9 @@ pub const QUAD_CIRCLE: u32 = 1;
 /// `ChromeQuad::kind`: premultiplied RGBA pixels from the chrome atlas, copied 1:1. `rect` is
 /// the whole-pixel destination and `params = [atlas_x, atlas_y, _, _]` its source origin.
 pub const QUAD_SPRITE: u32 = 2;
+/// A circle cut by a clip rect (inside a `ScrollArea`): `rect` is the clipped extent and the
+/// shader multiplies circle coverage by `rect`'s box coverage.
+pub const QUAD_CIRCLE_CLIPPED: u32 = 3;
 
 /// One instance of the chrome's instanced quad draw, in physical pixels, top-left origin.
 /// `#[repr(C)]` and 64 bytes: backends upload the slice as-is as instance data.
@@ -118,6 +128,9 @@ pub struct ChromeQuads<'a> {
     pub width: u32,
     pub height: u32,
     pub quads: &'a [ChromeQuad],
+    /// Quads from here on are popups (overlays): backends draw them after `Viewport` layers,
+    /// the rest before. Equal to `quads.len()` when no popup is open.
+    pub overlay_start: usize,
     pub atlas_size: u32,
     /// The atlas was repacked from scratch, so uploads may overwrite slots that quads already
     /// in flight on the GPU still sample: wait for the GPU before writing them.
