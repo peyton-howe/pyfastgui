@@ -116,6 +116,7 @@ struct FloatingWindow<B: SurfaceBackend> {
     dragging_splitter: Option<WidgetId>,
     dragging_text: Option<WidgetId>,
     dragging_scrollbar: Option<ScrollbarDrag>,
+    pressed_button: Option<WidgetId>,
     last_click: Option<(Instant, (f32, f32))>,
     ime_allowed: bool,
 }
@@ -159,6 +160,8 @@ struct App<B: SurfaceBackend> {
     /// A `TextInput` whose selection follows the cursor until mouse-up.
     dragging_text: Option<WidgetId>,
     dragging_scrollbar: Option<ScrollbarDrag>,
+    /// A `Button` pressed and not yet released; it clicks if released over itself.
+    pressed_button: Option<WidgetId>,
     /// Time and place of the last press on a `TextInput`, for double-click detection.
     last_click: Option<(Instant, (f32, f32))>,
     /// Whether the main window currently accepts IME input (a `TextInput` has focus).
@@ -407,6 +410,7 @@ impl<B: SurfaceBackend> App<B> {
             dragging_splitter: None,
             dragging_text: None,
             dragging_scrollbar: None,
+            pressed_button: None,
             last_click: None,
             ime_allowed: false,
         };
@@ -431,7 +435,7 @@ impl<B: SurfaceBackend> App<B> {
         // Only with a renderer to take the result: chrome keeps the frame it rasterized and
         // later sends just what changed, so a frame nobody uploaded would be lost for good.
         if let (true, Some(renderer)) = (chrome_dirty, &mut self.renderer) {
-            self.widget_tree.compute_layout(self.width as f32, self.height as f32);
+            self.widget_tree.compute_layout_measured(self.width as f32, self.height as f32, &mut self.chrome);
             let drop_indicator = self.hover_region.map(|(_, rect, zone)| (rect, zone));
             update_chrome(
                 &mut self.chrome,
@@ -477,7 +481,7 @@ impl<B: SurfaceBackend> App<B> {
         if chrome_dirty {
             floater
                 .widget_tree
-                .compute_layout(floater.width as f32, floater.height as f32);
+                .compute_layout_measured(floater.width as f32, floater.height as f32, &mut floater.chrome);
             // Drop indicator is drawn on the main window only.
             update_chrome(
                 &mut floater.chrome,
@@ -573,11 +577,9 @@ impl<B: SurfaceBackend> App<B> {
         let Some(id) = hit else { return };
         let Some(kind) = self.widget_tree.kind(id) else { return };
         match kind {
-            WidgetKind::Button { on_click, .. } => {
-                if let Some(callback) = on_click.clone() {
-                    callback();
-                }
-            }
+            // Clicks on release over the same button (see `release_button`), so pressing and
+            // dragging off cancels, as in every native toolkit.
+            WidgetKind::Button { .. } => self.pressed_button = Some(id),
             WidgetKind::Slider { .. } => {
                 self.dragging_slider = Some(id);
                 self.update_dragged_slider();
@@ -705,9 +707,9 @@ impl<B: SurfaceBackend> App<B> {
         let Some(id) = hit else { return };
         let Some(kind) = floater.widget_tree.kind(id) else { return };
         match kind {
-            WidgetKind::Button { on_click, .. } => {
-                if let Some(callback) = on_click.clone() {
-                    callback();
+            WidgetKind::Button { .. } => {
+                if let Some(floater) = self.floating.get_mut(&window_id) {
+                    floater.pressed_button = Some(id);
                 }
             }
             WidgetKind::Slider { .. } => {
@@ -1041,7 +1043,7 @@ impl<B: SurfaceBackend> App<B> {
         let mut renderer = B::new(&window, physical.width, physical.height).map_err(RunError::Renderer)?;
         let mut widget_tree = build_tear_ghost_tree(&title);
         let mut chrome = ChromeRenderer::new();
-        widget_tree.compute_layout(logical.width as f32, logical.height as f32);
+        widget_tree.compute_layout_measured(logical.width as f32, logical.height as f32, &mut chrome);
         update_chrome(
             &mut chrome,
             &mut renderer,
@@ -1339,8 +1341,12 @@ impl<B: SurfaceBackend> App<B> {
         let mut changed_value = None;
         self.widget_tree.mutate_kind(id, |kind| {
             if let WidgetKind::Slider { value, min, max, .. } = kind {
-                *value = *min + fraction * (*max - *min);
-                changed_value = Some(*value);
+                let new_value = *min + fraction * (*max - *min);
+                // Dragging along against a stop doesn't repeat `on_change` with the same value.
+                if new_value != *value {
+                    *value = new_value;
+                    changed_value = Some(new_value);
+                }
             }
         });
 
@@ -1364,8 +1370,12 @@ impl<B: SurfaceBackend> App<B> {
         let mut changed_value = None;
         floater.widget_tree.mutate_kind(id, |kind| {
             if let WidgetKind::Slider { value, min, max, .. } = kind {
-                *value = *min + fraction * (*max - *min);
-                changed_value = Some(*value);
+                let new_value = *min + fraction * (*max - *min);
+                // Dragging along against a stop doesn't repeat `on_change` with the same value.
+                if new_value != *value {
+                    *value = new_value;
+                    changed_value = Some(new_value);
+                }
             }
         });
 
@@ -1515,9 +1525,11 @@ impl<B: SurfaceBackend> App<B> {
         }
         // Mid debounced resize the layout is already at the new size but the surface isn't;
         // stretch viewport rects the same way chrome is stretched so they stay inside their
-        // panels instead of over/undershooting until the resize settles.
+        // panels instead of over/undershooting until the resize settles. The surface's real
+        // size, not the one last requested: a swapchain rebuilt after OUT_OF_DATE may already
+        // be at the new size (X11), and the chrome shader stretches to that real extent.
         let layout = (self.physical_width, self.physical_height);
-        let surface = self.last_applied_physical;
+        let surface = self.renderer.as_ref().map_or(self.last_applied_physical, |r| r.surface_size());
         if let Some(window) = &self.window {
             sync_ime(window, &self.widget_tree, &mut self.chrome, &mut self.ime_allowed);
         }
@@ -1736,6 +1748,7 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                     self.dragging_splitter = None;
                     self.dragging_text = None;
                     self.dragging_scrollbar = None;
+                    release_button(&self.widget_tree, self.pressed_button.take(), self.cursor);
                     // Floater OS-window drag is owned by the floater's mouse-up path.
                     if self.dragging_from_floating.is_none() {
                         self.handle_panel_drop();
@@ -1902,6 +1915,7 @@ impl<B: SurfaceBackend> App<B> {
                         floater.dragging_splitter = None;
                         floater.dragging_text = None;
                         floater.dragging_scrollbar = None;
+                        release_button(&floater.widget_tree, floater.pressed_button.take(), floater.cursor);
                     }
                     self.dragging_floating_panel = None;
                     self.dragging_floating_resize = None;
@@ -1993,6 +2007,17 @@ fn key_press(event: &KeyEvent, modifiers: ModifiersState) -> KeyPress<'_> {
     KeyPress { key: &event.logical_key, text: event.text.as_deref(), modifiers }
 }
 
+/// Mouse-up after pressing `pressed` (a `Button`): click it if the cursor is still over it.
+fn release_button(tree: &WidgetTree, pressed: Option<WidgetId>, cursor: (f32, f32)) {
+    let Some(id) = pressed else { return };
+    if tree.hit_test(cursor.0, cursor.1) != Some(id) {
+        return;
+    }
+    if let Some(WidgetKind::Button { on_click: Some(callback), .. }) = tree.kind(id) {
+        callback.clone()();
+    }
+}
+
 /// A press at window y in `ListView` `id`: select the row there, or activate it on a double-click.
 fn list_press(tree: &mut WidgetTree, id: WidgetId, y: f32, double: bool) {
     let Some(row) = tree.list_row_at(id, y) else { return };
@@ -2066,6 +2091,7 @@ pub fn run<B: SurfaceBackend>(
         dragging_splitter: None,
         dragging_text: None,
         dragging_scrollbar: None,
+        pressed_button: None,
         last_click: None,
         ime_allowed: false,
         dragging_panel_title: None,
@@ -2093,5 +2119,44 @@ pub fn run<B: SurfaceBackend>(
     match app.error {
         Some(err) => Err(err),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use fastgui_core::taffy::prelude::*;
+    use fastgui_core::widget::Color;
+
+    use super::*;
+
+    #[test]
+    fn button_clicks_on_release_over_itself_only() {
+        let clicks = Arc::new(AtomicUsize::new(0));
+        let counter = clicks.clone();
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let button = tree.new_node(
+            Style { size: Size { width: Dimension::length(80.0), height: Dimension::length(30.0) }, ..Default::default() },
+            WidgetKind::Button {
+                text: "Go".into(),
+                font_size: 14.0,
+                text_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                on_click: Some(Arc::new(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                })),
+            },
+        );
+        tree.add_child(root, button);
+        tree.compute_layout(200.0, 100.0);
+        release_button(&tree, Some(button), (40.0, 15.0));
+        assert_eq!(clicks.load(Ordering::SeqCst), 1, "released over the button: click");
+        release_button(&tree, Some(button), (150.0, 80.0));
+        assert_eq!(clicks.load(Ordering::SeqCst), 1, "dragged off before releasing: no click");
+        release_button(&tree, None, (40.0, 15.0));
+        assert_eq!(clicks.load(Ordering::SeqCst), 1, "nothing was pressed");
     }
 }

@@ -437,6 +437,10 @@ impl fastgui_app::SurfaceBackend for MetalRenderer {
         MetalRenderer::retain_layers(self, live_ids)
     }
 
+    fn surface_size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     fn render_frame(
         &mut self,
         clear: [f32; 4],

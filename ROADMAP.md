@@ -1208,7 +1208,7 @@ Concrete and fully achievable/verifiable on this machine (at least the Windows l
   session or a different machine needs to redo the M0 toolchain setup (Rust, MSVC, Vulkan
   SDK, both venvs) before any of this builds.
 
-## M7 — Widget set: Qt parity and beyond (planned, not started)
+## M7 — Widget set: Qt parity and beyond (in progress — 7A done, see below)
 
 Goal: match Qt's everyday widget coverage, then go past it where fastgui's architecture
 (GPU-native chrome, CUDA interop, no-GIL cross-thread mutation) gives a real advantage.
@@ -1241,8 +1241,9 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
    shortcuts (Cmd on macOS, Ctrl elsewhere), clipboard via `arboard`, IME preedit/commit with the
    candidate window placed at the caret, horizontal scroll with glyph-clipped line sprites (no
    clip rects needed). Demo: `text_input_demo.py`. Unit-tested and render-checked to PNG; not yet
-   driven interactively. **Still open:** replace layout's `measure_text` heuristic with real
-   shaping, text wrapping / multi-line `TextEdit`, caret blink, RTL/bidi caret placement (stops
+   driven interactively. **Layout now measures label/button text with real shaping**
+   (`WidgetTree::compute_layout_measured` via chrome's `TextMeasure`, 2026-09-28 — labels had
+   been losing their last word to the 0.55×size estimate). **Still open:** text wrapping / multi-line `TextEdit`, caret blink, RTL/bidi caret placement (stops
    are per glyph cluster, correct for LTR only).
 3. **Scroll container + clipping** — needs per-quad clip rects in the GPU quad pipeline (Vulkan
    and Metal). The GPU chrome path already makes scroll cheap (~128 KiB/frame upload in
@@ -1304,6 +1305,25 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
    Reset sizes. **Not yet:** floating panels restyle on their next
    rebuild rather than immediately; the 7B widgets added concurrently still take explicit
    colors and should adopt `palette()` the same way.
+
+### 7A follow-ups from Linux testing (2026-09-28)
+
+- `WidgetTree::reset` cleared rather than replaced, so ids held from before a `set_content`
+  (off-screen widgets, popups) can't alias new widgets (`popup.close()` closed the wrong popup;
+  a removed label's `set_text` changed a new one).
+- `scroll_into_view` through nested scroll areas no longer overshoots the outer one; a target
+  bigger than its area shows its start.
+- Labels and buttons are sized by real text shaping (see 7A.2), fixing truncated labels.
+- Viewport remap during a debounced resize uses the backend's real surface size
+  (`SurfaceBackend::surface_size`): on X11 a swapchain rebuilt after `OUT_OF_DATE` is already
+  at the new size, so remapping to the last *requested* size still overshot. Not reproducible
+  on MoltenVK; needs a Linux re-check.
+- `popup.show(anchor)` with an anchor no longer on screen leaves the popup closed.
+- Buttons click on release over themselves (press + drag off cancels); a slider dragged
+  against its stop no longer repeats `on_change`; `ScrollArea.scroll_to` and
+  `ListView.select` work before the widget is shown; `ListView` defaults to the raised
+  `surface_alt` background so it has an edge inside panels; `list_demo` filters plain digits.
+- Python tests for `TextInput`, `ListView`, `Popup`, `ScrollArea` (`tests/test_widgets.py`).
 
 ### 7B. Tier 1 — core form controls
 

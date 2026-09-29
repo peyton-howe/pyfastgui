@@ -6,7 +6,8 @@ box to narrow the list.
 
 import fastgui as fg
 
-ROWS = [f"Row {i:>7,} — item {i % 97:02d}" for i in range(1_000_000)]
+# Plain digits (no thousands separators) so filtering for e.g. "4242" finds row 4242.
+ROWS = [f"Row {i:>7} — item {i % 97:02d}" for i in range(1_000_000)]
 
 
 def main() -> None:

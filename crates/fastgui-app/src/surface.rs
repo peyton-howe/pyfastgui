@@ -79,6 +79,12 @@ pub trait SurfaceBackend: Sized {
 
     fn retain_layers(&mut self, live_ids: &[u64]);
 
+    /// The size of what `render_frame` actually draws into, in physical pixels. It can differ
+    /// from the last size passed to `resize`: a swapchain rebuilt after `OUT_OF_DATE` takes the
+    /// surface's current extent (X11 reports the new size mid-resize), so the app remaps
+    /// viewport rects against this rather than what it last asked for.
+    fn surface_size(&self) -> (u32, u32);
+
     fn render_frame(&mut self, clear: [f32; 4], draw_chrome: bool, draws: &[ViewportDraw]) -> Result<(), Self::Error>;
 
     /// Optional CUDA path — Vulkan implements; Metal returns an error string.

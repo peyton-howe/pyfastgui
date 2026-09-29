@@ -193,8 +193,26 @@ impl ChromeRenderer {
         scale: f32,
         window: PixelRect,
     ) -> Vec<Item> {
+        let family = chrome_theme().font_family;
+        self.build_items_in(tree, drop_indicator, scale, window, family)
+    }
+
+    /// `build_items` with an explicit font family instead of the theme's (tests).
+    #[cfg(test)]
+    fn build_items_with_family(&mut self, tree: &WidgetTree, scale: f32, window: PixelRect, family: Option<Arc<str>>) -> Vec<Item> {
+        self.build_items_in(tree, None, scale, window, family)
+    }
+
+    fn build_items_in(
+        &mut self,
+        tree: &WidgetTree,
+        drop_indicator: Option<(WidgetRect, DropZone)>,
+        scale: f32,
+        window: PixelRect,
+        family: Option<Arc<str>>,
+    ) -> Vec<Item> {
         let theme = chrome_theme();
-        self.text_cache.family = theme.font_family.clone();
+        self.text_cache.family = family;
         let mut items = Vec::new();
         // Popups are the root's last children, so once the walk reaches one, everything after
         // it is overlay content; it's collected separately and appended after the drop
@@ -215,7 +233,11 @@ impl ChromeRenderer {
             match kind {
                 WidgetKind::Container { background, .. } => push_fill(&mut ops, rect, *background),
                 WidgetKind::Label { text, font_size, color } => {
-                    self.push_text(&mut ops, rect, text, *font_size * scale, *color);
+                    // Layout sizes a label to its measured text; a font-size's worth of extra
+                    // room keeps a sub-pixel difference at this scale from wrapping the last
+                    // word onto a line the one-line box can't show.
+                    let size = *font_size * scale;
+                    self.push_text(&mut ops, WidgetRect { width: rect.width + size, ..rect }, text, size, *color);
                 }
                 WidgetKind::Button { text, font_size, text_color, background, .. } => {
                     push_fill(&mut ops, rect, *background);

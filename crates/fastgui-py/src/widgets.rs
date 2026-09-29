@@ -944,12 +944,15 @@ impl ListView {
     /// Select row `index` (clamped) and scroll it into view, calling `on_select`; `None`
     /// clears the selection.
     #[pyo3(signature = (index))]
+    /// Works before the list is shown, too (the selection applies when it is).
     fn select(&self, index: Option<usize>) -> PyResult<()> {
-        let id = self.id.lock().unwrap_or_else(|p| p.into_inner()).ok_or_else(|| {
-            PyRuntimeError::new_err("this widget hasn't been attached to a window yet (call window.set_content first)")
-        })?;
+        let id = *self.id.lock().unwrap_or_else(|p| p.into_inner());
         let sender = self.sender.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let sender = sender.ok_or_else(|| PyRuntimeError::new_err("this widget hasn't been attached to a window yet"))?;
+        let (Some(id), Some(sender)) = (id, sender) else {
+            let len = self.items.lock().unwrap_or_else(|p| p.into_inner()).len();
+            self.selected.set(index.filter(|_| len > 0).map(|i| i.min(len - 1)));
+            return Ok(());
+        };
         send_tree_mutation(&sender, move |tree| tree.list_select(id, index))
     }
 
@@ -983,7 +986,7 @@ impl ListView {
                 scroll: 0.0,
                 selected,
                 text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().text)),
-                background: rgba(self.background.unwrap_or(crate::theme::palette().surface)),
+                background: rgba(self.background.unwrap_or(crate::theme::palette().surface_alt)),
                 selection_color: rgba(self.selection_color.unwrap_or(crate::theme::palette().selection)),
                 on_select: on_select.map(wrap_index_callback),
                 on_activate: on_activate.map(wrap_index_callback),
@@ -1131,6 +1134,13 @@ impl Popup {
             if let Some(old) = id.take() {
                 tree.close_popup(old);
             }
+            // An anchor that's no longer shown (its window's content was replaced) has nowhere
+            // to put the popup: leave it closed rather than open it in the corner.
+            if let WidgetKind::Popup { anchor: PopupAnchor::Widget(anchor, _), .. } = &kind {
+                if tree.kind(*anchor).is_none() {
+                    return;
+                }
+            }
             *id = Some(tree.open_popup(kind, |tree, popup| {
                 attach(tree, popup, wrapper, &attach_sender);
             }));
@@ -1150,6 +1160,8 @@ pub(crate) struct ScrollArea {
     height: Option<f32>,
     background: (f32, f32, f32, f32),
     bar_color: Option<(f32, f32, f32, f32)>,
+    /// The last `scroll_to`, applied when (re)built too — so it works before the area is shown.
+    initial_offset: Arc<Mutex<(f32, f32)>>,
 }
 
 #[pymethods]
@@ -1180,11 +1192,17 @@ impl ScrollArea {
             height,
             background,
             bar_color,
+            initial_offset: Arc::new(Mutex::new((0.0, 0.0))),
         }
     }
 
     /// Scroll so the content's point `(x, y)` is at the top-left (clamped to what can scroll).
+    /// Works before the area is shown, too.
     fn scroll_to(&self, x: f32, y: f32) -> PyResult<()> {
+        *self.initial_offset.lock().unwrap_or_else(|p| p.into_inner()) = (x.max(0.0), y.max(0.0));
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
         mutate(&self.id, &self.sender, move |kind| {
             if let WidgetKind::ScrollArea { offset, .. } = kind {
                 // Clamped to the content at the next layout.
@@ -1200,7 +1218,7 @@ impl ScrollArea {
         Ok(DescribedWidget {
             style: StyleParams::leaf(self.flex_grow, self.width, self.height),
             kind: WidgetKind::ScrollArea {
-                offset: (0.0, 0.0),
+                offset: *self.initial_offset.lock().unwrap_or_else(|p| p.into_inner()),
                 background: rgba(self.background),
                 bar_color: rgba(self.bar_color.unwrap_or(crate::theme::palette().scrollbar)),
             },

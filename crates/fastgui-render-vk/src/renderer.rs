@@ -1002,6 +1002,10 @@ impl fastgui_app::SurfaceBackend for VulkanRenderer {
         VulkanRenderer::retain_layers(self, live_ids)
     }
 
+    fn surface_size(&self) -> (u32, u32) {
+        (self.extent.width, self.extent.height)
+    }
+
     fn render_frame(
         &mut self,
         clear: [f32; 4],

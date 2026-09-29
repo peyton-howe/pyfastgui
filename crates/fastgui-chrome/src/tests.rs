@@ -743,3 +743,81 @@ fn font_family_is_part_of_text_cache_keys_and_falls_back() {
     chrome.text_cache.family = None;
     assert!(Arc::ptr_eq(&default, &run(&mut chrome)), "switching back reuses the original run");
 }
+
+/// Labels sized only by their own text (a row with no stretch, as inside a popup or a wrapping
+/// row) must show all of it: layout measures with the same shaping chrome draws with.
+fn check_labels_draw_in_full(measured: bool) -> Result<(), String> {
+    for family in [None, Some("Menlo")] {
+        for scale in [1.0f32, 1.5, 2.0] {
+            let mut chrome = ChromeRenderer::new();
+            chrome.text_cache.family = family.map(Into::into);
+            let mut tree = WidgetTree::new();
+            let root = tree.root();
+            let row = tree.new_node(
+                Style { flex_direction: FlexDirection::Row, align_items: Some(AlignItems::FLEX_START), ..Default::default() },
+                WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+            );
+            tree.add_child(root, row);
+            let texts = ["Modal", "A themed popup", "WWW mmm iii", "WWWWWWWWWWWW"];
+            let labels: Vec<_> = texts
+                .iter()
+                .map(|t| {
+                    let id = tree.new_node(Style::default(), WidgetKind::Label { text: (*t).into(), font_size: 15.0, color: Color([1.0; 4]) });
+                    tree.add_child(row, id);
+                    id
+                })
+                .collect();
+            if measured {
+                // As the app does: the family the chrome draws with is the one layout measures.
+                let saved = chrome.text_cache.family.clone();
+                tree.compute_layout_measured(600.0, 100.0, &mut ChromeWithFamily(&mut chrome, saved.clone()));
+                chrome.text_cache.family = saved;
+            } else {
+                tree.compute_layout(600.0, 100.0);
+            }
+            let window = PixelRect { x: 0, y: 0, width: (600.0 * scale) as u32, height: (100.0 * scale) as u32 };
+            let family_now = chrome.text_cache.family.clone();
+            let items = chrome.build_items_with_family(&tree, scale, window, family_now.clone());
+            for (label, text) in labels.iter().zip(texts) {
+                let ops = &items.iter().find(|i| i.key == u64::from(*label)).unwrap().ops;
+                let Some(Op::Text { run, .. }) = ops.first() else { return Err(format!("{text}: no text drawn")) };
+                // Reference: the same text with all the room in the world, ink to ink.
+                chrome.text_cache.family = family_now.clone();
+                let mut reference = Vec::new();
+                let roomy = WidgetRect { x: 0.0, y: 0.0, width: 10_000.0, height: 15.0 * scale * 1.25 };
+                chrome.push_text(&mut reference, roomy, text, 15.0 * scale, Color([1.0; 4]));
+                let Some(Op::Text { run: full, .. }) = reference.first() else { unreachable!() };
+                if run.width + 1 < full.width {
+                    return Err(format!("{family:?} {scale}×: {text:?} drawn {}px of {}px", run.width, full.width));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Measures through a chrome with a fixed font family (the tests don't touch the global theme).
+struct ChromeWithFamily<'a>(&'a mut ChromeRenderer, Option<Arc<str>>);
+
+impl fastgui_core::text_edit::TextMeasure for ChromeWithFamily<'_> {
+    fn caret_x(&mut self, text: &str, font_size: f32, index: usize) -> f32 {
+        self.0.text_cache.family = self.1.clone();
+        let stops = self.0.line_stops(text, font_size);
+        stop_x(&stops, index)
+    }
+    fn index_at(&mut self, _: &str, _: f32, _: f32) -> usize {
+        0
+    }
+}
+
+#[test]
+fn measured_labels_draw_in_full_at_any_scale_and_font() {
+    check_labels_draw_in_full(true).unwrap();
+}
+
+#[test]
+fn estimated_label_widths_did_truncate() {
+    // The regression this guards: the old per-character estimate (0.55 × size) lost trailing
+    // text — for wide letters more than the drawing margin can absorb.
+    assert!(check_labels_draw_in_full(false).is_err());
+}

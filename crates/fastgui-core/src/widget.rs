@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use taffy::prelude::*;
 
-use crate::text_edit::TextEdit;
+use crate::text_edit::{TextEdit, TextMeasure};
 use crate::{FrameSlot, Readback};
 
 /// A node in a `WidgetTree` — just a taffy `NodeId`, since taffy already owns the
@@ -463,8 +463,14 @@ impl WidgetTree {
                 open.set(false);
             }
         }
-        self.taffy = TaffyTree::new();
+        // Clear the existing tree rather than replacing it: its slot versions carry on, so an
+        // id held from before (a closed popup, a label no longer shown) never matches a widget
+        // created after. A fresh `TaffyTree` would hand those same ids out again.
+        self.taffy.clear();
         self.kinds.clear();
+        self.absolute_rects.clear();
+        self.clip_rects.clear();
+        self.scroll_content.clear();
         self.root = self.taffy.new_leaf(root_style()).expect("creating the root node cannot fail");
         self.kinds.insert(self.root, WidgetKind::Container { background: Color::TRANSPARENT, region_id: None });
         self.focused = None;
@@ -580,13 +586,25 @@ impl WidgetTree {
     /// every node's absolute rect. Cheap to call unconditionally when `is_dirty()` is true —
     /// taffy caches unchanged subtrees internally (see `mark_dirty`'s doc).
     pub fn compute_layout(&mut self, width: f32, height: f32) {
+        self.layout(width, height, None);
+    }
+
+    /// `compute_layout`, sizing text-bearing widgets (labels, buttons) by real shaping through
+    /// `measure` instead of the rough per-character estimate — so a label is exactly as wide as
+    /// the text chrome draws, and never loses its last word to a wrap it has no room to show.
+    /// `fastgui-app` always lays out this way, with the window's `ChromeRenderer`.
+    pub fn compute_layout_measured(&mut self, width: f32, height: f32, measure: &mut dyn TextMeasure) {
+        self.layout(width, height, Some(measure));
+    }
+
+    fn layout(&mut self, width: f32, height: f32, mut measure: Option<&mut (dyn TextMeasure + '_)>) {
         let available = Size { width: AvailableSpace::Definite(width), height: AvailableSpace::Definite(height) };
         let kinds = &self.kinds;
         let _ = self.taffy.compute_layout_with_measure(
             self.root,
             available,
             |known_dimensions, _available_space, node_id, _node_context, _style| {
-                measure_leaf(known_dimensions, node_id, kinds)
+                measure_leaf(known_dimensions, node_id, kinds, measure.as_deref_mut())
             },
         );
 
@@ -781,7 +799,7 @@ impl WidgetTree {
     /// Scroll every `ScrollArea` around `id` just enough to bring `id`'s rect into view — used
     /// when keyboard focus moves to something scrolled out of sight.
     pub fn scroll_into_view(&mut self, id: WidgetId) {
-        let Some(target) = self.absolute_rect(id) else { return };
+        let Some(mut target) = self.absolute_rect(id) else { return };
         let mut node = id;
         while let Some(parent) = self.taffy.parent(node) {
             node = parent;
@@ -789,12 +807,22 @@ impl WidgetTree {
             else {
                 continue;
             };
-            let (mut ox, mut oy) = *offset;
+            let (before_x, before_y) = *offset;
             // Where the target sits in the area's content, and the part of it now in view.
-            let (tx, ty) = (target.x - view.x + ox, target.y - view.y + oy);
-            ox = ox.min(tx).max(tx + target.width - view.width);
-            oy = oy.min(ty).max(ty + target.height - view.height);
+            let (tx, ty) = (target.x - view.x + before_x, target.y - view.y + before_y);
+            // Scroll the least that shows all of it; something bigger than the area shows its
+            // start (top/left) rather than its end.
+            let reveal = |before: f32, start: f32, size: f32, view: f32| {
+                if size > view { start } else { before.min(start).max(start + size - view) }
+            };
+            let ox = reveal(before_x, tx, target.width, view.width);
+            let oy = reveal(before_y, ty, target.height, view.height);
             self.set_scroll_offset(node, ox, oy);
+            // Rects aren't recomputed until the next layout: move the target by what this area
+            // actually scrolled (after clamping) so the areas around it aim at where it now is.
+            let (after_x, after_y) = self.scroll_offset(node).unwrap_or((before_x, before_y));
+            target.x -= after_x - before_x;
+            target.y -= after_y - before_y;
         }
     }
 
@@ -1197,8 +1225,10 @@ impl Default for WidgetTree {
     }
 }
 
-/// Very rough text-extent estimate (average proportional-font advance width), used only to
-/// give `Label`/`Button` a sane intrinsic size for `taffy`'s layout pass. Not a substitute for
+/// Very rough text-extent estimate (average proportional-font advance width) — the fallback
+/// for `compute_layout` without a `TextMeasure`; the app always uses real shaping
+/// (`compute_layout_measured`), where this underestimated wide text and labels lost their last
+/// words. Not a substitute for
 /// real shaping — `fastgui-chrome` does that with `cosmic-text` when it actually rasterizes —
 /// this only has to be good enough that layout doesn't look broken before that happens. Good
 /// enough for M4; swap for measuring through `fastgui-chrome`'s font system if/when this
@@ -1211,18 +1241,31 @@ fn measure_text(text: &str, font_size: f32) -> Size<f32> {
     Size { width, height: font_size * LINE_HEIGHT_RATIO }
 }
 
+/// Real text extent via `measure`: the widest line's shaped width, rounded up to whole units,
+/// and one line height per line.
+fn measure_shaped(measure: &mut dyn TextMeasure, text: &str, font_size: f32) -> Size<f32> {
+    let width = text.split('\n').map(|line| measure.caret_x(line, font_size, line.len())).fold(0.0, f32::max);
+    let lines = text.split('\n').count().max(1) as f32;
+    Size { width: width.ceil(), height: font_size * LINE_HEIGHT_RATIO * lines }
+}
+
 /// taffy calls this once per leaf node during layout. `known_dimensions` is already `Some` for
 /// any axis the node's own style pins (explicit size, or a parent that stretched it) — we only
 /// need to supply the *intrinsic content* size for whichever axes are still `None`.
-fn measure_leaf(
+fn measure_leaf<'m>(
     known_dimensions: Size<Option<f32>>,
     node_id: NodeId,
     kinds: &HashMap<WidgetId, WidgetKind>,
+    mut measure: Option<&mut (dyn TextMeasure + 'm)>,
 ) -> Size<f32> {
+    let mut text_size = |text: &str, font_size: f32| match measure.as_deref_mut() {
+        Some(measure) => measure_shaped(measure, text, font_size),
+        None => measure_text(text, font_size),
+    };
     let content_size = match kinds.get(&node_id) {
-        Some(WidgetKind::Label { text, font_size, .. }) => measure_text(text, *font_size),
+        Some(WidgetKind::Label { text, font_size, .. }) => text_size(text, *font_size),
         Some(WidgetKind::Button { text, font_size, .. }) => {
-            let text_size = measure_text(text, *font_size);
+            let text_size = text_size(text, *font_size);
             // Room for the button's own padding beyond the text itself; real padding is
             // applied via the node's taffy `Style`, this is just the intrinsic minimum.
             const BUTTON_PADDING: f32 = 16.0;
@@ -1990,6 +2033,135 @@ mod tests {
                 assert!(!a.intersects(b), "wrapped buttons don't overlap: {a:?} {b:?}");
             }
         }
+    }
+
+    #[test]
+    fn reset_never_reuses_widget_ids() {
+        let (mut tree, a, label, hidden_button, b) = focus_tree();
+        let old: Vec<WidgetId> = tree.walk().collect();
+        tree.reset();
+        let (root, mut fresh) = (tree.root(), Vec::new());
+        for _ in 0..old.len() + 4 {
+            let id = tree.new_node(Style::default(), WidgetKind::Container { background: Color::TRANSPARENT, region_id: None });
+            tree.add_child(root, id);
+            fresh.push(id);
+        }
+        fresh.push(root);
+        for id in [a, label, hidden_button, b].into_iter().chain(old) {
+            assert!(!fresh.contains(&id), "stale id {id:?} aliases a node of the new tree");
+            assert!(tree.kind(id).is_none());
+            // A stale widget's `set_text` / a closed popup's `close()` reach nothing.
+            tree.mutate_kind(id, |_| panic!("mutating a stale id reaches nothing"));
+            tree.close_popup(id);
+        }
+    }
+
+    #[test]
+    fn scroll_into_view_through_nested_areas_lands_inside_both() {
+        let (mut tree, outer, inner, _) = scroll_tree();
+        // The inner area's only child: 120 tall inside a 60-tall area at the top of the outer one.
+        let inner_child = tree.walk_from(inner).nth(2).unwrap();
+        // Scroll the inner area to its end and the outer one so the inner sits partly above it:
+        // revealing the target moves both, and the outer must use where the inner put it.
+        tree.set_scroll_offset(inner, 0.0, 60.0);
+        tree.set_scroll_offset(outer, 0.0, 40.0);
+        tree.compute_layout(300.0, 300.0);
+        tree.scroll_into_view(inner_child);
+        tree.compute_layout(300.0, 300.0);
+        let target = tree.absolute_rect(inner_child).unwrap();
+        let (o, i) = (tree.absolute_rect(outer).unwrap(), tree.absolute_rect(inner).unwrap());
+        assert!(target.y >= o.y - 0.01 && target.y >= i.y - 0.01, "target top {target:?} is visible in outer {o:?} and inner {i:?}");
+        assert_eq!((tree.scroll_offset(inner), tree.scroll_offset(outer)), (Some((0.0, 0.0)), Some((0.0, 0.0))));
+    }
+
+    #[test]
+    fn scroll_into_view_does_not_overshoot_after_the_inner_area_scrolls() {
+        // Outer 100-tall area: 200 of spacer, then a 60-tall inner area (five 40-tall buttons,
+        // 200 of content), then 300 more spacer. Target: the inner's 4th button (content y 120).
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let area = |tree: &mut WidgetTree, h: f32| {
+            tree.new_node(
+                Style {
+                    flex_direction: FlexDirection::Column,
+                    size: Size { width: Dimension::length(100.0), height: Dimension::length(h) },
+                    flex_shrink: 0.0,
+                    ..Default::default()
+                },
+                WidgetKind::ScrollArea { offset: (0.0, 0.0), background: Color::TRANSPARENT, bar_color: Color::TRANSPARENT },
+            )
+        };
+        let column = |tree: &mut WidgetTree| {
+            tree.new_node(
+                Style { flex_direction: FlexDirection::Column, flex_shrink: 0.0, ..Default::default() },
+                WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+            )
+        };
+        let outer = area(&mut tree, 100.0);
+        let outer_column = column(&mut tree);
+        let inner = area(&mut tree, 60.0);
+        let inner_column = column(&mut tree);
+        tree.add_child(root, outer);
+        tree.add_child(outer, outer_column);
+        let top = sized_button(&mut tree, 80.0, 200.0);
+        tree.add_child(outer_column, top);
+        tree.add_child(outer_column, inner);
+        let bottom = sized_button(&mut tree, 80.0, 300.0);
+        tree.add_child(outer_column, bottom);
+        tree.add_child(inner, inner_column);
+        let buttons: Vec<_> = (0..5).map(|_| sized_button(&mut tree, 80.0, 40.0)).collect();
+        for &b in &buttons {
+            tree.add_child(inner_column, b);
+        }
+        tree.set_scroll_container(outer);
+        tree.set_scroll_container(inner);
+        tree.compute_layout(300.0, 300.0);
+
+        tree.scroll_into_view(buttons[3]);
+        tree.compute_layout(300.0, 300.0);
+        let target = tree.absolute_rect(buttons[3]).unwrap();
+        let (o, i) = (tree.absolute_rect(outer).unwrap(), tree.absolute_rect(inner).unwrap());
+        assert!(
+            target.y >= o.y && target.y + target.height <= o.y + o.height,
+            "target {target:?} inside the outer area {o:?}"
+        );
+        assert!(target.y >= i.y && target.y + target.height <= i.y + i.height, "and the inner area {i:?}");
+        assert_eq!(tree.scroll_offset(inner), Some((0.0, 100.0)));
+        assert_eq!(tree.scroll_offset(outer), Some((0.0, 160.0)), "not 260: the inner scroll is accounted for");
+    }
+
+    #[test]
+    fn measured_layout_sizes_labels_by_real_text_width() {
+        /// "Shaping" where every character is 20 wide — far wider than the 0.55 × 14 = 7.7
+        /// the estimate assumes — so the result shows which one layout used.
+        struct Wide;
+        impl TextMeasure for Wide {
+            fn caret_x(&mut self, text: &str, _: f32, index: usize) -> f32 {
+                text[..index].chars().count() as f32 * 20.0
+            }
+            fn index_at(&mut self, _: &str, _: f32, _: f32) -> usize {
+                0
+            }
+        }
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let row = tree.new_node(
+            Style { flex_direction: FlexDirection::Row, align_items: Some(AlignItems::FLEX_START), ..Default::default() },
+            WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+        );
+        let label = |tree: &mut WidgetTree, text: &str| {
+            tree.new_node(Style::default(), WidgetKind::Label { text: text.into(), font_size: 14.0, color: Color::TRANSPARENT })
+        };
+        let one = label(&mut tree, "Modal");
+        let two = label(&mut tree, "ab\nlonger");
+        tree.add_child(root, row);
+        tree.add_child(row, one);
+        tree.add_child(row, two);
+        tree.compute_layout_measured(400.0, 200.0, &mut Wide);
+        assert_eq!(tree.absolute_rect(one).unwrap().width, 100.0, "5 × 20, not the 5 × 7.7 estimate");
+        let r = tree.absolute_rect(two).unwrap();
+        assert_eq!(r.width, 120.0, "the widest line");
+        assert!((r.height - 14.0 * LINE_HEIGHT_RATIO * 2.0).abs() <= 0.5, "two lines tall (taffy rounds): {r:?}");
     }
 
     #[test]
