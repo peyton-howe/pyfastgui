@@ -800,6 +800,17 @@ impl WidgetTree {
                     self.scroll_content.insert(id, content);
                     *scroll = scroll.clamp(0.0, max_scroll(layout.size, content).1);
                 }
+                WidgetKind::TextArea { edit, font_size, scroll_y, .. } => {
+                    // Same height math as caret-follow scroll: line stack + vertical padding.
+                    let line_height = *font_size * LINE_HEIGHT_RATIO;
+                    let lines = edit.text().split('\n').count().max(1) as f32;
+                    let content = Size {
+                        width: layout.size.width,
+                        height: lines * line_height + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
+                    };
+                    self.scroll_content.insert(id, content);
+                    *scroll_y = scroll_y.clamp(0.0, max_scroll(layout.size, content).1);
+                }
                 _ => {}
             }
         }
@@ -932,11 +943,13 @@ impl WidgetTree {
         ((rect.height / row_height).floor() as usize).max(1)
     }
 
-    /// A scrollable widget's current offset (`ScrollArea`, or a `ListView`'s vertical scroll).
+    /// A scrollable widget's current offset (`ScrollArea`, a `ListView`'s vertical scroll, or a
+    /// `TextArea`'s `scroll_y`).
     pub fn scroll_offset(&self, id: WidgetId) -> Option<(f32, f32)> {
         match self.kind(id)? {
             WidgetKind::ScrollArea { offset, .. } => Some(*offset),
             WidgetKind::ListView { scroll, .. } => Some((0.0, *scroll)),
+            WidgetKind::TextArea { scroll_y, .. } => Some((0.0, *scroll_y)),
             _ => None,
         }
     }
@@ -951,6 +964,7 @@ impl WidgetTree {
         match self.kinds.get_mut(&id) {
             Some(WidgetKind::ScrollArea { offset, .. }) => *offset = target,
             Some(WidgetKind::ListView { scroll, .. }) => *scroll = target.1,
+            Some(WidgetKind::TextArea { scroll_y, .. }) => *scroll_y = target.1,
             _ => return false,
         }
         self.mark_dirty();
@@ -958,8 +972,9 @@ impl WidgetTree {
     }
 
     /// Scroll by `(dx, dy)` (layout units; positive reveals content further right/down) the
-    /// innermost `ScrollArea` under `(x, y)` that can still move that way; one at its limit
-    /// passes the scroll out to the one around it. Returns whether anything scrolled.
+    /// innermost scrollable under `(x, y)` (`ScrollArea`, `ListView`, `TextArea`) that can still
+    /// move that way; one at its limit passes the scroll out to the one around it. Returns
+    /// whether anything scrolled.
     pub fn scroll_at(&mut self, x: f32, y: f32, dx: f32, dy: f32) -> bool {
         let areas: Vec<WidgetId> =
             self.walk().filter(|&id| self.scroll_offset(id).is_some() && self.visible_at(id, x, y)).collect();
@@ -2496,5 +2511,43 @@ mod tests {
         let expected_h = 14.0 * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING;
         assert!((rect.height - expected_h).abs() < 1.0);
         assert!(tree.kind(id).unwrap().is_focusable());
+    }
+
+    #[test]
+    fn text_area_wheels_and_shows_a_scrollbar_when_it_overflows() {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let lines = (0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let id = tree.new_node(
+            Style {
+                size: Size { width: Dimension::length(200.0), height: Dimension::length(80.0) },
+                ..Default::default()
+            },
+            WidgetKind::TextArea {
+                edit: TextEdit::new_multiline(&lines),
+                placeholder: String::new(),
+                font_size: 14.0,
+                text_color: Color::TRANSPARENT,
+                placeholder_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                selection_color: Color::TRANSPARENT,
+                scroll_y: 0.0,
+                preedit: None,
+                on_change: None,
+                on_submit: None,
+                mirror: None,
+            },
+        );
+        tree.add_child(root, id);
+        tree.compute_layout(400.0, 300.0);
+        let max = tree.scroll_extent(id).expect("text area scrolls").1;
+        assert!(max > 0.0, "twenty lines in an 80-tall field must overflow");
+        assert_eq!(tree.scroll_offset(id), Some((0.0, 0.0)));
+        assert!(tree.scrollbar_thumbs(id).0.is_some(), "overflow draws a vertical thumb");
+        assert!(tree.scroll_at(10.0, 10.0, 0.0, 40.0));
+        let Some((_, y)) = tree.scroll_offset(id) else { panic!() };
+        assert!((y - 40.0).abs() < 0.5, "wheel moved scroll_y to {y}");
+        assert!(tree.set_scroll_offset(id, 0.0, 1e6));
+        assert_eq!(tree.scroll_offset(id), Some((0.0, max)));
     }
 }

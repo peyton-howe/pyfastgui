@@ -515,7 +515,7 @@ impl ChromeRenderer {
             in_overlay |= popups.contains(&id);
             let bar_color = match tree.kind(id) {
                 Some(WidgetKind::ScrollArea { bar_color, .. }) => bar_color,
-                Some(WidgetKind::ListView { .. }) => &theme.scrollbar,
+                Some(WidgetKind::ListView { .. } | WidgetKind::TextArea { .. }) => &theme.scrollbar,
                 _ => continue,
             };
             let mut ops = Vec::new();

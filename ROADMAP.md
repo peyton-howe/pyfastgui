@@ -1330,8 +1330,8 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 
 - Single-line and multi-line text input (`QLineEdit` / `QTextEdit`) — **Done (2026-09-28):**
   single-line (see 7A.2); multi-line `WidgetKind::TextArea` / `fg.TextArea` with hard
-  newlines, Up/Down by line, Home/End per line, vertical caret scroll, Cmd/Ctrl+Enter
-  submit. **Still open:** soft wrap.
+  newlines, Up/Down by line, Home/End per line, caret-follow + mouse-wheel/`ListView`-style
+  overlay scrollbar when content overflows, Cmd/Ctrl+Enter submit. **Still open:** soft wrap.
 - Checkbox, radio group, toggle switch — **Done (2026-09-27):** `Checkbox` / `Radio` (shared
   `group` id for exclusivity) / `Toggle`; click + Space/Enter; focusable.
 - Spin box (int/float) and a drag-to-scrub numeric field — **Done (2026-09-27):** `SpinBox`
