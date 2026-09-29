@@ -70,5 +70,122 @@ class ScrollAreaTests(unittest.TestCase):
         area.scroll_to(-5, -5)
 
 
+class CheckboxTests(unittest.TestCase):
+    def test_checked_and_set_checked_before_showing(self):
+        box = fg.Checkbox("Accept", checked=False)
+        self.assertFalse(box.checked)
+        box.set_checked(True)
+        self.assertTrue(box.checked)
+        box.set_checked(False)
+        self.assertFalse(box.checked)
+
+
+class RadioTests(unittest.TestCase):
+    def test_group_exclusivity_and_set_selected_before_showing(self):
+        a = fg.Radio("A", group=1, selected=True)
+        b = fg.Radio("B", group=1, selected=False)
+        self.assertEqual(a.group, b.group)
+        self.assertTrue(a.selected)
+        self.assertFalse(b.selected)
+        b.set_selected(True)
+        self.assertFalse(a.selected)
+        self.assertTrue(b.selected)
+        b.set_selected(False)
+        self.assertFalse(b.selected)
+
+    def test_auto_group_uses_high_bit_and_rejects_colliding_user_ids(self):
+        auto = fg.Radio("auto")
+        self.assertGreaterEqual(auto.group, 1 << 63)
+        with self.assertRaises(ValueError):
+            fg.Radio("bad", group=1 << 63)
+
+
+class ToggleTests(unittest.TestCase):
+    def test_checked_and_set_checked_before_showing(self):
+        toggle = fg.Toggle(checked=True)
+        self.assertTrue(toggle.checked)
+        toggle.set_checked(False)
+        self.assertFalse(toggle.checked)
+
+
+class SpinBoxTests(unittest.TestCase):
+    def test_value_clamps_rounds_and_rejects_bad_inputs(self):
+        spin = fg.SpinBox(value=3.6, min=0, max=10, step=1, decimals=0)
+        self.assertEqual(spin.value, 4.0)
+        spin.set_value(9.4)
+        self.assertEqual(spin.value, 9.0)
+        spin.set_value(99)
+        self.assertEqual(spin.value, 10.0)
+        with self.assertRaises(ValueError):
+            fg.SpinBox(value=float("nan"))
+        with self.assertRaises(ValueError):
+            fg.SpinBox(step=0)
+        with self.assertRaises(ValueError):
+            spin.set_value(float("nan"))
+
+
+class NumericScrubTests(unittest.TestCase):
+    def test_value_rounds_and_rejects_bad_speed(self):
+        scrub = fg.NumericScrub(value=1.24, min=0, max=10, speed=0.25, decimals=1)
+        self.assertAlmostEqual(scrub.value, 1.2)
+        scrub.set_value(2.26)
+        self.assertAlmostEqual(scrub.value, 2.3)
+        with self.assertRaises(ValueError):
+            fg.NumericScrub(speed=0)
+        with self.assertRaises(ValueError):
+            fg.NumericScrub(speed=float("nan"))
+        with self.assertRaises(ValueError):
+            scrub.set_value(float("nan"))
+
+
+class ProgressBarTests(unittest.TestCase):
+    def test_value_and_set_value_before_showing(self):
+        bar = fg.ProgressBar(value=0.25, min=0, max=1)
+        self.assertAlmostEqual(bar.value, 0.25)
+        bar.set_value(0.8)
+        self.assertAlmostEqual(bar.value, 0.8)
+        bar.set_value(2.0)
+        self.assertAlmostEqual(bar.value, 1.0)
+
+
+class ComboBoxTests(unittest.TestCase):
+    def test_items_select_and_set_items_before_showing(self):
+        combo = fg.ComboBox(["a", "b", "c"], selected=1)
+        self.assertEqual(combo.selected, 1)
+        combo.select(2)
+        self.assertEqual(combo.selected, 2)
+        combo.select(None)
+        self.assertIsNone(combo.selected)
+        combo.set_items(["x", "y"])
+        self.assertIsNone(combo.selected)
+        combo.select(0)
+        self.assertEqual(combo.selected, 0)
+
+
+class ImageTests(unittest.TestCase):
+    def test_constructs_and_rejects_empty_image(self):
+        import numpy as np
+
+        image = fg.Image(width=32, height=24)
+        with self.assertRaises(ValueError):
+            image.set_image(np.zeros((0, 8, 4), dtype=np.uint8))
+
+
+class TextAreaTests(unittest.TestCase):
+    def test_text_and_set_text_before_showing(self):
+        area = fg.TextArea("hello\nworld", placeholder="notes")
+        self.assertEqual(area.text, "hello\nworld")
+        area.set_text("replaced\r\nagain")
+        self.assertEqual(area.text, "replaced\nagain")
+
+
+class GridTests(unittest.TestCase):
+    def test_constructs_and_rejects_bad_columns(self):
+        grid = fg.Grid([fg.Label("a"), fg.Label("b")], columns=2)
+        self.assertIsNotNone(grid)
+        with self.assertRaises(ValueError):
+            fg.Grid([fg.Label("a")], columns=0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -214,6 +214,7 @@ class Popup:
     def is_open(self) -> bool: ...
 
 class Checkbox:
+    """Labeled on/off checkbox. Click or Space/Enter toggles; `set_checked` does not fire `on_change`."""
     def __init__(
         self,
         label: str,
@@ -229,7 +230,8 @@ class Checkbox:
     def set_checked(self, checked: bool) -> None: ...
 
 class Radio:
-    """One option in a radio group. Pass the same `group` id to peers so only one can be selected."""
+    """One option in a radio group. Pass the same `group` id to peers so only one can be selected.
+    Automatic groups use ids with the high bit set; user-supplied `group` must be `< 2**63`."""
     def __init__(
         self,
         label: str,
@@ -245,6 +247,8 @@ class Radio:
     def group(self) -> int: ...
     @property
     def selected(self) -> bool: ...
+    def set_selected(self, selected: bool) -> None:
+        """Select or clear without firing `on_select`. Selecting clears peers in the same group."""
 
 class Toggle:
     def __init__(

@@ -1382,6 +1382,9 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
   skipping this is where fastgui would fall short of it.
 - **HiDPI** scale factor applied to chrome.
 - **Drag-and-drop** between widgets and from the OS, generalizing the docking drag code.
+- **Disabled and hover states** for every control — a shared follow-up after 7B. Touches
+  every `WidgetKind`, input handling (skip presses / focus), and theming (`Theme` tokens for
+  disabled/hover fills). Do not bolt onto individual 7B widgets one at a time.
 
 ### Suggested order
 
