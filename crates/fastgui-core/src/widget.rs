@@ -38,6 +38,72 @@ pub type IndexCallback = Arc<dyn Fn(usize) + Send + Sync>;
 pub type TextCallback = Arc<dyn Fn(String) + Send + Sync>;
 /// Fired when the user clicks a panel/tab close control — argument is that panel's region id.
 pub type PanelCloseCallback = Arc<dyn Fn(u64) + Send + Sync>;
+/// Right-click context menu: window coordinates of the press.
+pub type PointCallback = Arc<dyn Fn(f32, f32) + Send + Sync>;
+
+/// A keyboard accelerator (`Ctrl+S`, `Cmd+Shift+N`, …). `primary` is Cmd on macOS and Ctrl
+/// elsewhere; both `Cmd` and `Ctrl` in the shortcut string set it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Accel {
+    pub key: AccelKey,
+    pub primary: bool,
+    pub shift: bool,
+    pub alt: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccelKey {
+    /// Lowercase letter or digit.
+    Char(char),
+    /// Function key 1..=12.
+    F(u8),
+}
+
+impl Accel {
+    /// Parse `"Ctrl+S"`, `"Cmd+Shift+N"`, `"Alt+F4"`, etc. Returns `None` for empty/unknown
+    /// tokens, or for `Alt+F4` (left to the OS).
+    pub fn parse(s: &str) -> Option<Self> {
+        let mut primary = false;
+        let mut shift = false;
+        let mut alt = false;
+        let mut key = None;
+        for raw in s.split('+') {
+            let token = raw.trim();
+            if token.is_empty() {
+                return None;
+            }
+            let lower = token.to_ascii_lowercase();
+            match lower.as_str() {
+                "ctrl" | "control" | "cmd" | "command" | "super" | "meta" => primary = true,
+                "shift" => shift = true,
+                "alt" | "option" => alt = true,
+                _ => {
+                    if key.is_some() {
+                        return None;
+                    }
+                    if let Some(n) = lower.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
+                        if (1..=12).contains(&n) {
+                            key = Some(AccelKey::F(n));
+                            continue;
+                        }
+                    }
+                    let mut chars = token.chars();
+                    let c = chars.next()?;
+                    if chars.next().is_some() {
+                        return None;
+                    }
+                    key = Some(AccelKey::Char(c.to_ascii_lowercase()));
+                }
+            }
+        }
+        let key = key?;
+        // Alt+F4 closes windows on common desktops — don't claim it as an app shortcut.
+        if alt && !primary && !shift && key == AccelKey::F(4) {
+            return None;
+        }
+        Some(Self { key, primary, shift, alt })
+    }
+}
 
 /// Width/height of the drawn × square in a title bar or tab segment (layout units).
 pub const CLOSE_BUTTON_SIZE: f32 = 22.0;
@@ -193,6 +259,9 @@ pub enum WidgetKind {
         font_size: f32,
         text_color: Color,
         background: Color,
+        /// Menu-bar / tool-strip style: compact padding, fill only while hovered (or when the
+        /// caller sets a non-transparent `background` for an open/selected state).
+        flat: bool,
         on_click: Option<ClickCallback>,
     },
     Slider {
@@ -454,10 +523,12 @@ pub enum WidgetKind {
 
 impl WidgetKind {
     /// Whether this widget can take keyboard focus (click or Tab to it).
+    /// Flat buttons (menu titles / rows) stay clickable and hoverable but skip focus so they
+    /// don't draw the accent focus ring — native menu chrome doesn't show that outline.
     pub fn is_focusable(&self) -> bool {
         matches!(
             self,
-            WidgetKind::Button { .. }
+            WidgetKind::Button { flat: false, .. }
                 | WidgetKind::Slider { .. }
                 | WidgetKind::TextInput { .. }
                 | WidgetKind::TextArea { .. }
@@ -625,6 +696,14 @@ pub struct WidgetTree {
     /// The widget keyboard input goes to (see `fastgui-app`'s key handling). Cleared by
     /// `reset`, so a `set_content` rebuild starts unfocused.
     focused: Option<WidgetId>,
+    /// Hover tooltips (`WidgetTree::set_tooltip`), cleared on `reset`.
+    tooltips: HashMap<WidgetId, String>,
+    /// Right-click handlers (`WidgetTree::set_context_menu`), cleared on `reset`.
+    context_menus: HashMap<WidgetId, PointCallback>,
+    /// Menu / MenuBar shortcuts registered at attach, cleared on `reset`.
+    accelerators: Vec<(Accel, ClickCallback)>,
+    /// Widget under the cursor (for hover fills). Cleared on `reset`.
+    hovered: Option<WidgetId>,
 }
 
 /// Always fills the window: whatever `Window.set_content(widget)` was given becomes this
@@ -652,6 +731,10 @@ impl WidgetTree {
             clip_rects: HashMap::new(),
             scroll_content: HashMap::new(),
             focused: None,
+            tooltips: HashMap::new(),
+            context_menus: HashMap::new(),
+            accelerators: Vec::new(),
+            hovered: None,
         }
     }
 
@@ -661,6 +744,10 @@ impl WidgetTree {
 
     pub fn kind(&self, id: WidgetId) -> Option<&WidgetKind> {
         self.kinds.get(&id)
+    }
+
+    pub fn parent(&self, id: WidgetId) -> Option<WidgetId> {
+        self.taffy.parent(id)
     }
 
     pub fn style(&self, id: WidgetId) -> Option<&Style> {
@@ -686,6 +773,10 @@ impl WidgetTree {
         self.absolute_rects.clear();
         self.clip_rects.clear();
         self.scroll_content.clear();
+        self.tooltips.clear();
+        self.context_menus.clear();
+        self.accelerators.clear();
+        self.hovered = None;
         self.root = self.taffy.new_leaf(root_style()).expect("creating the root node cannot fail");
         self.kinds.insert(self.root, WidgetKind::Container { background: Color::TRANSPARENT, region_id: None });
         self.focused = None;
@@ -1117,6 +1208,25 @@ impl WidgetTree {
     /// given) and focus its first focusable widget, remembering the current focus to restore on
     /// close. Returns the popup's id.
     pub fn open_popup(&mut self, kind: WidgetKind, build: impl FnOnce(&mut Self, WidgetId)) -> WidgetId {
+        self.open_popup_inner(kind, build, true)
+    }
+
+    /// Like `open_popup`, but leaves keyboard focus alone (tooltips). `restore_focus` stays
+    /// unset so close doesn't move focus either.
+    pub fn open_popup_no_focus(
+        &mut self,
+        kind: WidgetKind,
+        build: impl FnOnce(&mut Self, WidgetId),
+    ) -> WidgetId {
+        self.open_popup_inner(kind, build, false)
+    }
+
+    fn open_popup_inner(
+        &mut self,
+        kind: WidgetKind,
+        build: impl FnOnce(&mut Self, WidgetId),
+        steal_focus: bool,
+    ) -> WidgetId {
         let style = Style {
             position: Position::Absolute,
             flex_direction: FlexDirection::Column,
@@ -1128,7 +1238,7 @@ impl WidgetTree {
             },
             ..Default::default()
         };
-        let restore = self.focused;
+        let restore = steal_focus.then_some(self.focused).flatten();
         let id = self.new_node(style, kind);
         if let Some(WidgetKind::Popup { restore_focus, open, .. }) = self.kinds.get_mut(&id) {
             *restore_focus = restore;
@@ -1139,8 +1249,10 @@ impl WidgetTree {
         let root = self.root;
         self.add_child(root, id);
         build(self, id);
-        let first = self.walk_from(id).find(|&n| self.kind(n).is_some_and(WidgetKind::is_focusable));
-        self.focused = first;
+        if steal_focus {
+            let first = self.walk_from(id).find(|&n| self.kind(n).is_some_and(WidgetKind::is_focusable));
+            self.focused = first;
+        }
         id
     }
 
@@ -1160,10 +1272,69 @@ impl WidgetTree {
             self.kinds.remove(&node);
             self.absolute_rects.remove(&node);
             self.clip_rects.remove(&node);
+            self.tooltips.remove(&node);
+            self.context_menus.remove(&node);
         }
         let _ = self.taffy.remove_child(self.root, id);
         remove_subtree(&mut self.taffy, id);
         self.mark_dirty();
+    }
+
+    /// Set or clear the hover tooltip text for `id`.
+    pub fn set_tooltip(&mut self, id: WidgetId, text: Option<String>) {
+        match text {
+            Some(text) => {
+                self.tooltips.insert(id, text);
+            }
+            None => {
+                self.tooltips.remove(&id);
+            }
+        }
+        self.mark_dirty();
+    }
+
+    pub fn tooltip(&self, id: WidgetId) -> Option<&str> {
+        self.tooltips.get(&id).map(String::as_str)
+    }
+
+    /// Widget under the cursor, if any — chrome uses this for hover fills on buttons/menus.
+    pub fn hovered(&self) -> Option<WidgetId> {
+        self.hovered
+    }
+
+    /// Update the hovered widget. Returns whether it changed (caller should redraw).
+    pub fn set_hovered(&mut self, id: Option<WidgetId>) -> bool {
+        if self.hovered == id {
+            return false;
+        }
+        self.hovered = id;
+        self.mark_dirty();
+        true
+    }
+
+    /// Set or clear the right-click handler for `id` (window coordinates).
+    pub fn set_context_menu(&mut self, id: WidgetId, callback: Option<PointCallback>) {
+        match callback {
+            Some(callback) => {
+                self.context_menus.insert(id, callback);
+            }
+            None => {
+                self.context_menus.remove(&id);
+            }
+        }
+    }
+
+    pub fn context_menu(&self, id: WidgetId) -> Option<&PointCallback> {
+        self.context_menus.get(&id)
+    }
+
+    /// Register a keyboard shortcut. Cleared by `reset` (e.g. `set_content`).
+    pub fn register_accelerator(&mut self, accel: Accel, callback: ClickCallback) {
+        self.accelerators.push((accel, callback));
+    }
+
+    pub fn accelerators(&self) -> &[(Accel, ClickCallback)] {
+        &self.accelerators
     }
 
     /// Close the topmost popup as the user did (outside click, Escape): fires its `on_dismiss`.
@@ -1511,12 +1682,13 @@ fn measure_leaf<'m>(
     };
     let content_size = match kinds.get(&node_id) {
         Some(WidgetKind::Label { text, font_size, .. }) => text_size(text, *font_size),
-        Some(WidgetKind::Button { text, font_size, .. }) => {
+        Some(WidgetKind::Button { text, font_size, flat, .. }) => {
             let text_size = text_size(text, *font_size);
             // Room for the button's own padding beyond the text itself; real padding is
             // applied via the node's taffy `Style`, this is just the intrinsic minimum.
-            const BUTTON_PADDING: f32 = 16.0;
-            Size { width: text_size.width + BUTTON_PADDING, height: text_size.height + BUTTON_PADDING }
+            // Flat (menu titles / rows): compact so the strip reads as text, not chunky controls.
+            let (pad_x, pad_y) = if *flat { (16.0, 6.0) } else { (16.0, 16.0) };
+            Size { width: text_size.width + pad_x, height: text_size.height + pad_y }
         }
         Some(WidgetKind::TextInput { font_size, .. }) => Size {
             // Wide enough to type into when nothing stretches it; the height fits one line.
@@ -1800,6 +1972,7 @@ mod tests {
                 font_size: 14.0,
                 text_color: Color::TRANSPARENT,
                 background: Color::TRANSPARENT,
+                flat: false,
                 on_click: None,
             },
         );
@@ -1872,6 +2045,7 @@ mod tests {
                     font_size: 12.0,
                     text_color: Color::TRANSPARENT,
                     background: Color::TRANSPARENT,
+                    flat: false,
                     on_click: None,
                 },
             )
@@ -1953,6 +2127,7 @@ mod tests {
                     font_size: 12.0,
                     text_color: Color::TRANSPARENT,
                     background: Color::TRANSPARENT,
+                    flat: false,
                     on_click: None,
                 },
             )
@@ -2089,6 +2264,7 @@ mod tests {
                 font_size: 12.0,
                 text_color: Color::TRANSPARENT,
                 background: Color::TRANSPARENT,
+                flat: false,
                 on_click: None,
             },
         )
@@ -2643,5 +2819,68 @@ mod tests {
         assert!((y - 40.0).abs() < 0.5, "wheel moved scroll_y to {y}");
         assert!(tree.set_scroll_offset(id, 0.0, 1e6));
         assert_eq!(tree.scroll_offset(id), Some((0.0, max)));
+    }
+
+    #[test]
+    fn tooltip_side_table_set_get_and_reset() {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let id = sized_button(&mut tree, 40.0, 20.0);
+        tree.add_child(root, id);
+        assert_eq!(tree.tooltip(id), None);
+        tree.set_tooltip(id, Some("Save".into()));
+        assert_eq!(tree.tooltip(id), Some("Save"));
+        tree.set_tooltip(id, None);
+        assert_eq!(tree.tooltip(id), None);
+        tree.set_tooltip(id, Some("Again".into()));
+        tree.reset();
+        assert!(tree.tooltip(id).is_none());
+    }
+
+    #[test]
+    fn open_popup_no_focus_preserves_focus() {
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        tree.set_focus(Some(anchor));
+        let popup = tree.open_popup_no_focus(
+            popup_kind(PopupAnchor::Widget(anchor, PopupSide::Below), false, None),
+            |tree, popup| {
+                let label = tree.new_node(
+                    Style {
+                        size: Size { width: Dimension::length(40.0), height: Dimension::length(16.0) },
+                        ..Default::default()
+                    },
+                    WidgetKind::Label {
+                        text: "tip".into(),
+                        font_size: 12.0,
+                        color: Color::TRANSPARENT,
+                    },
+                );
+                tree.add_child(popup, label);
+            },
+        );
+        tree.compute_layout(200.0, 200.0);
+        assert_eq!(tree.focused(), Some(anchor), "tooltip must not steal focus");
+        if let Some(WidgetKind::Popup { restore_focus, .. }) = tree.kind(popup) {
+            assert_eq!(*restore_focus, None);
+        } else {
+            panic!("expected popup");
+        }
+        tree.close_popup(popup);
+        assert_eq!(tree.focused(), Some(anchor), "focus unchanged after tooltip close");
+    }
+
+    #[test]
+    fn accel_parse_primary_shift_and_skips_alt_f4() {
+        let s = Accel::parse("Ctrl+S").unwrap();
+        assert!(s.primary && !s.shift && !s.alt && s.key == AccelKey::Char('s'));
+        let s = Accel::parse("Cmd+S").unwrap();
+        assert!(s.primary && s.key == AccelKey::Char('s'));
+        let s = Accel::parse("Shift+Ctrl+N").unwrap();
+        assert!(s.primary && s.shift && s.key == AccelKey::Char('n'));
+        let s = Accel::parse("Alt+F1").unwrap();
+        assert!(s.alt && !s.primary && s.key == AccelKey::F(1));
+        assert!(Accel::parse("Alt+F4").is_none());
+        assert!(Accel::parse("").is_none());
+        assert!(Accel::parse("Ctrl+").is_none());
     }
 }
