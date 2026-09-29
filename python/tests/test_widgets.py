@@ -219,5 +219,51 @@ class AppChromeTests(unittest.TestCase):
         box.set_display(True)
 
 
+class MenuTests(unittest.TestCase):
+    def test_item_labels_for_check_radio_icon_submenu(self):
+        nested = fg.Menu([fg.MenuItem("Child")])
+        menu = fg.Menu(
+            [
+                fg.MenuItem("Save", checked=True),
+                fg.MenuItem("Plain", checked=False),
+                fg.MenuItem("Dark", radio_group="t", checked=True),
+                fg.MenuItem("Light", radio_group="t", checked=False),
+                fg.MenuItem("Doc", icon="📄"),
+                fg.MenuItem("Recent", submenu=nested),
+            ]
+        )
+        self.assertEqual(menu._item_label(menu.items[0]), "✓  Save")
+        self.assertEqual(menu._item_label(menu.items[1]), "   Plain")
+        self.assertEqual(menu._item_label(menu.items[2]), "●  Dark")
+        self.assertEqual(menu._item_label(menu.items[3]), "○  Light")
+        self.assertEqual(menu._item_label(menu.items[4]), "📄  Doc")
+        self.assertEqual(menu._item_label(menu.items[5]), "Recent    ▶")
+
+    def test_close_runs_on_dismiss_once(self):
+        hits = []
+        menu = fg.Menu([fg.MenuItem("Open", on_click=lambda: hits.append("click"))])
+        menu.as_popup(on_dismiss=lambda: hits.append("dismiss"))
+        menu.close()
+        self.assertEqual(hits, ["dismiss"])
+        menu.close()
+        self.assertEqual(hits, ["dismiss"], "second close must not re-fire dismiss")
+
+    def test_rejects_shortcut_with_submenu(self):
+        nested = fg.Menu([fg.MenuItem("Child")])
+        with self.assertRaises(ValueError):
+            fg.MenuItem("Recent", shortcut="Cmd+R", submenu=nested)
+
+    def test_menubar_collects_nested_accelerators(self):
+        nested = fg.Menu([fg.MenuItem("Deep", shortcut="Cmd+D", on_click=lambda: None)])
+        menu = fg.Menu(
+            [
+                fg.MenuItem("Top", shortcut="Cmd+T", on_click=lambda: None),
+                fg.MenuItem("More", submenu=nested),
+            ]
+        )
+        accels = fg._menu_accelerators(menu)
+        self.assertEqual([s for s, _ in accels], ["Cmd+T", "Cmd+D"])
+
+
 if __name__ == "__main__":
     unittest.main()

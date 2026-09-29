@@ -40,13 +40,37 @@ _ROOT_REGION_ID = 0
 
 
 class MenuItem:
-    """One actionable row in a `Menu` (`label`, optional `shortcut`, `on_click`)."""
+    """One actionable row in a `Menu`.
 
-    def __init__(self, label, shortcut=None, on_click=None, enabled=True):
+    Optional `checked` draws a leading checkmark (True) or an aligned blank (False).
+    Optional `radio_group` (string/id) draws ●/○ and groups exclusivity for the app to manage
+    on `on_click`. Optional `icon` is a short leading glyph. Optional `submenu` opens a nested
+    `Menu` to the right instead of firing `on_click` / closing the parent.
+    """
+
+    def __init__(
+        self,
+        label,
+        shortcut=None,
+        on_click=None,
+        enabled=True,
+        checked=None,
+        radio_group=None,
+        icon=None,
+        submenu=None,
+    ):
         self.label = label
         self.shortcut = shortcut
         self.on_click = on_click
         self.enabled = bool(enabled)
+        self.checked = checked
+        self.radio_group = radio_group
+        self.icon = icon
+        self.submenu = submenu
+        if submenu is not None and not isinstance(submenu, Menu):
+            raise TypeError(f"submenu must be a Menu, got {type(submenu)!r}")
+        if shortcut and submenu is not None:
+            raise ValueError("MenuItem cannot have both shortcut and submenu")
 
 
 class MenuSeparator:
@@ -60,6 +84,39 @@ class Menu:
     def __init__(self, items):
         self.items = list(items)
         self._popup = None
+        self._open_submenu = None
+        # Cleared after running once. Fired both on outside/Escape dismiss and on `close()`
+        # (menu-item clicks use `Popup.close`, which does not call the Popup's on_dismiss).
+        self._on_dismiss = None
+
+    def _item_label(self, item):
+        parts = []
+        if item.radio_group is not None:
+            parts.append("●" if item.checked else "○")
+        elif item.checked is not None:
+            parts.append("✓" if item.checked else " ")
+        if item.icon:
+            parts.append(str(item.icon))
+        parts.append(item.label)
+        text = "  ".join(parts)
+        if item.submenu is not None:
+            return f"{text}    ▶"
+        if item.shortcut:
+            return f"{text}    {item.shortcut}"
+        return text
+
+    def _close_submenu(self):
+        if self._open_submenu is not None:
+            self._open_submenu.close()
+            self._open_submenu = None
+
+    def _toggle_submenu(self, submenu, anchor_button):
+        if self._open_submenu is submenu and submenu.is_open:
+            self._close_submenu()
+            return
+        self._close_submenu()
+        self._open_submenu = submenu
+        submenu.show(anchor_button, side="right", on_dismiss=lambda: setattr(self, "_open_submenu", None))
 
     def _build_row(self, item):
         theme = get_theme()
@@ -81,32 +138,53 @@ class Menu:
         if not isinstance(item, MenuItem):
             raise TypeError(f"Menu items must be MenuItem or MenuSeparator, got {type(item)!r}")
 
-        def activate(it=item):
+        holder = {"btn": None}
+
+        def activate(it=item, h=holder):
             if not it.enabled:
+                return
+            if it.submenu is not None:
+                self._toggle_submenu(it.submenu, h["btn"])
                 return
             self.close()
             if it.on_click is not None:
                 it.on_click()
 
         label_color = theme.text if item.enabled else theme.text_muted
-        text = item.label if not item.shortcut else f"{item.label}    {item.shortcut}"
         # Flat rows: transparent until hover (`surface_active`), like a native menu.
-        return Button(
-            text,
+        btn = Button(
+            self._item_label(item),
             on_click=activate if item.enabled else None,
             font_size="small",
             text_color=label_color,
             background=None,
             flat=True,
         )
+        holder["btn"] = btn
+        return btn
+
+    def _take_dismiss(self):
+        callback = self._on_dismiss
+        self._on_dismiss = None
+        return callback
 
     def as_popup(self, on_dismiss=None):
         """Fresh `Popup` for `context_menu=` / `Window.show_popup` (rebuilds each call)."""
+        self._close_submenu()
         rows = [self._build_row(item) for item in self.items]
+
+        def wrapped_dismiss(cb=on_dismiss):
+            # Outside click / Escape: Popup fires this; drop our copy so `close()` won't re-run it.
+            self._close_submenu()
+            self._on_dismiss = None
+            if cb is not None:
+                cb()
+
+        self._on_dismiss = on_dismiss
         self._popup = Popup(
             Box(direction="column", gap=0.0, children=rows),
             padding=4.0,
-            on_dismiss=on_dismiss,
+            on_dismiss=wrapped_dismiss if on_dismiss is not None else None,
         )
         return self._popup
 
@@ -118,12 +196,31 @@ class Menu:
         self.as_popup(on_dismiss=on_dismiss).show_at(near, x, y)
 
     def close(self):
+        # Item clicks call this (not dismiss_popup), so run on_dismiss here too — e.g. MenuBar
+        # title open-highlight.
+        self._close_submenu()
+        callback = self._take_dismiss()
         if self._popup is not None:
             self._popup.close()
+        if callback is not None:
+            callback()
 
     @property
     def is_open(self):
         return bool(self._popup is not None and self._popup.is_open)
+
+
+def _menu_accelerators(menu):
+    """`(shortcut, on_click)` pairs from `menu` and nested submenus."""
+    out = []
+    for item in menu.items:
+        if not isinstance(item, MenuItem) or not item.enabled:
+            continue
+        if item.shortcut and item.on_click:
+            out.append((item.shortcut, item.on_click))
+        if item.submenu is not None:
+            out.extend(_menu_accelerators(item.submenu))
+    return out
 
 
 class MenuBar:
@@ -151,7 +248,7 @@ class MenuBar:
             menu.close()
             title_button.set_background(None)
         else:
-            # Clear open highlight if the menu is dismissed by outside click / Escape.
+            # Clear open highlight if the menu is dismissed by outside click / Escape / item click.
             menu.show(title_button, on_dismiss=lambda b=title_button: b.set_background(None))
             title_button.set_background(theme.surface_active)
 
@@ -180,9 +277,7 @@ class MenuBar:
             holder["btn"] = btn
             buttons.append(btn)
             self._titles.append((btn, menu))
-            for item in menu.items:
-                if isinstance(item, MenuItem) and item.enabled and item.shortcut and item.on_click:
-                    accelerators.append((item.shortcut, item.on_click))
+            accelerators.extend(_menu_accelerators(menu))
         # Row of titles + 1px bottom border — reads as a menubar, not a button toolbar.
         titles = Box(
             direction="row",

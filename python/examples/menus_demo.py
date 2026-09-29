@@ -16,24 +16,61 @@ def main() -> None:
         set_status("Quit")
         sys.exit(0)
 
+    recent = fg.Menu(
+        [
+            fg.MenuItem("report.py", icon="📄", on_click=lambda: set_status("Open recent: report.py")),
+            fg.MenuItem("notes.md", icon="📄", on_click=lambda: set_status("Open recent: notes.md")),
+            fg.MenuSeparator(),
+            fg.MenuItem("Clear recent", on_click=lambda: set_status("Recent cleared")),
+        ]
+    )
     file_menu = fg.Menu(
         [
             fg.MenuItem("New", shortcut="Cmd+N", on_click=lambda: set_status("New")),
             fg.MenuItem("Open…", shortcut="Cmd+O", on_click=lambda: set_status("Open")),
+            fg.MenuItem("Open recent", submenu=recent),
             fg.MenuSeparator(),
             fg.MenuItem("Save", shortcut="Cmd+S", on_click=lambda: set_status("Saved (Cmd/Ctrl+S)")),
             fg.MenuSeparator(),
             fg.MenuItem("Quit", shortcut="Cmd+Q", on_click=quit_app),
         ]
     )
+
+    wrap_item = fg.MenuItem("Word wrap", checked=True)
+
+    def toggle_wrap():
+        wrap_item.checked = not bool(wrap_item.checked)
+        set_status(f"Word wrap {'on' if wrap_item.checked else 'off'}")
+
+    wrap_item.on_click = toggle_wrap
+
+    dark_item = fg.MenuItem("Dark", radio_group="theme", checked=True)
+    light_item = fg.MenuItem("Light", radio_group="theme", checked=False)
+
+    def set_theme(name: str):
+        dark_item.checked = name == "dark"
+        light_item.checked = name == "light"
+        set_status(f"Theme: {name}")
+
+    dark_item.on_click = lambda: set_theme("dark")
+    light_item.on_click = lambda: set_theme("light")
+
+    view_menu = fg.Menu(
+        [
+            wrap_item,
+            fg.MenuSeparator(),
+            dark_item,
+            light_item,
+            fg.MenuItem("Disabled item", enabled=False),
+        ]
+    )
     edit_menu = fg.Menu(
         [
             fg.MenuItem("Copy status", shortcut="Cmd+Shift+C", on_click=lambda: set_status("Copied status line")),
             fg.MenuItem("Clear status", on_click=lambda: set_status("Ready.")),
-            fg.MenuItem("Disabled item", enabled=False),
         ]
     )
-    menubar = fg.MenuBar([("File", file_menu), ("Edit", edit_menu)])
+    menubar = fg.MenuBar([("File", file_menu), ("Edit", edit_menu), ("View", view_menu)])
     toolbar = fg.Toolbar(
         [
             fg.Button("New", on_click=lambda: set_status("Toolbar: New"), tooltip="New document"),
