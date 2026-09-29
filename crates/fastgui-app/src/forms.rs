@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use fastgui_core::taffy::prelude::*;
 use fastgui_core::widget::{
-    clamp_range, round_to_decimals, spin_down_rect, spin_up_rect, PopupAnchor, PopupSide, WidgetId,
-    WidgetKind, WidgetTree,
+    clamp_range, decimal_quantum, round_to_decimals, spin_down_rect, spin_up_rect, PopupAnchor,
+    PopupSide, WidgetId, WidgetKind, WidgetTree,
 };
 
 /// A change to the tree queued by a widget callback (see [`defer`]).
@@ -346,12 +346,21 @@ pub fn combo_for_list(tree: &WidgetTree, list_id: WidgetId) -> Option<WidgetId> 
     }
 }
 
-fn set_numeric_delta(tree: &mut WidgetTree, id: WidgetId, delta: f32) -> bool {
-    let current = match tree.kind(id) {
-        Some(WidgetKind::SpinBox { value, .. } | WidgetKind::NumericScrub { value, .. }) => *value,
+/// Add `delta` to a spin/scrub value. If rounding to `decimals` would leave the stored value
+/// unchanged (e.g. `step=0.4`, `decimals=0`), bump by at least one display unit in `delta`'s
+/// direction so arrows / ± buttons always move.
+pub fn set_numeric_delta(tree: &mut WidgetTree, id: WidgetId, delta: f32) -> bool {
+    let (current, min, max, decimals) = match tree.kind(id) {
+        Some(WidgetKind::SpinBox { value, min, max, decimals, .. }) => (*value, *min, *max, *decimals),
+        Some(WidgetKind::NumericScrub { value, min, max, decimals, .. }) => (*value, *min, *max, *decimals),
         _ => return false,
     };
-    set_numeric(tree, id, current + delta)
+    let mut target = current + delta;
+    let next = round_to_decimals(clamp_range(target, min, max), decimals);
+    if next == current && delta != 0.0 {
+        target = current + decimal_quantum(decimals).copysign(delta);
+    }
+    set_numeric(tree, id, target)
 }
 
 /// Apply a horizontal scrub from the press origin: `start_value + dx * speed`.
@@ -509,6 +518,78 @@ mod tests {
         assert!(set_numeric(&mut tree, id, 99.0));
         assert_eq!(mirror.get(), 10.0);
         assert!(!set_numeric(&mut tree, id, 10.0));
+    }
+
+    #[test]
+    fn spin_delta_steps_at_least_one_display_unit() {
+        // step=0.4 with decimals=0 used to round 0+0.4 back to 0 and stick.
+        let mirror = fastgui_core::Readback::new(0.0);
+        let mut tree = WidgetTree::new();
+        let id = tree.new_node(
+            fixed(100.0, 28.0),
+            WidgetKind::SpinBox {
+                value: 0.0,
+                min: 0.0,
+                max: 10.0,
+                step: 0.4,
+                decimals: 0,
+                font_size: 14.0,
+                text_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                button_color: Color::TRANSPARENT,
+                on_change: None,
+                mirror: Some(mirror.clone()),
+            },
+        );
+        tree.add_child(tree.root(), id);
+        assert!(set_numeric_delta(&mut tree, id, 0.4));
+        assert_eq!(mirror.get(), 1.0);
+        assert!(set_numeric_delta(&mut tree, id, 0.4));
+        assert_eq!(mirror.get(), 2.0);
+
+        // decimals=1, step below one tenth: bump by 0.1.
+        let mirror = fastgui_core::Readback::new(0.0);
+        let id = tree.new_node(
+            fixed(100.0, 28.0),
+            WidgetKind::SpinBox {
+                value: 0.0,
+                min: 0.0,
+                max: 10.0,
+                step: 0.04,
+                decimals: 1,
+                font_size: 14.0,
+                text_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                button_color: Color::TRANSPARENT,
+                on_change: None,
+                mirror: Some(mirror.clone()),
+            },
+        );
+        tree.add_child(tree.root(), id);
+        assert!(set_numeric_delta(&mut tree, id, 0.04));
+        assert!((mirror.get() - 0.1).abs() < 1e-5);
+
+        // step=0.6, decimals=0 already rounds to a 1-unit move.
+        let mirror = fastgui_core::Readback::new(0.0);
+        let id = tree.new_node(
+            fixed(100.0, 28.0),
+            WidgetKind::SpinBox {
+                value: 0.0,
+                min: 0.0,
+                max: 10.0,
+                step: 0.6,
+                decimals: 0,
+                font_size: 14.0,
+                text_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                button_color: Color::TRANSPARENT,
+                on_change: None,
+                mirror: Some(mirror.clone()),
+            },
+        );
+        tree.add_child(tree.root(), id);
+        assert!(set_numeric_delta(&mut tree, id, 0.6));
+        assert_eq!(mirror.get(), 1.0);
     }
 
     fn combo_kind(items: Vec<String>, selected: Option<usize>, on_change: Option<fastgui_core::widget::IndexCallback>) -> WidgetKind {

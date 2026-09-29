@@ -593,6 +593,16 @@ pub fn round_to_decimals(value: f32, decimals: u32) -> f32 {
     }
 }
 
+/// Smallest positive change `round_to_decimals` can represent at `decimals`
+/// (`0` → `1.0`, `1` → `0.1`, …).
+pub fn decimal_quantum(decimals: u32) -> f32 {
+    if decimals == 0 {
+        1.0
+    } else {
+        10f32.powi(-(decimals as i32))
+    }
+}
+
 /// The retained-mode widget tree: taffy owns layout (parent/child structure + style), this
 /// owns everything taffy doesn't (text, colors, callbacks) in a side-table keyed by the same
 /// `NodeId`s. Mutated exclusively on the render thread — every Python-facing setter reaches

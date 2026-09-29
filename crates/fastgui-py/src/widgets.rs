@@ -10,7 +10,7 @@ use fastgui_core::widget::{
     TextCallback, WidgetId, WidgetKind, WidgetTree,
 };
 use fastgui_core::text_edit::TextEdit;
-use fastgui_core::{CpuFrame, FrameSlot, PixelFormat, Readback};
+use fastgui_core::{CpuFrame, FrameSlot, PixelFormat, Readback, MAX_CPU_FRAME_EXTENT};
 use crate::theme::{FontSize, Spacing};
 use crate::backend::{Command, CommandDispatch};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -2374,6 +2374,11 @@ impl Image {
         }
         let height = shape[0] as u32;
         let width = shape[1] as u32;
+        if width > MAX_CPU_FRAME_EXTENT || height > MAX_CPU_FRAME_EXTENT {
+            return Err(PyValueError::new_err(format!(
+                "image edge must be <= {MAX_CPU_FRAME_EXTENT} pixels (got {width}x{height})"
+            )));
+        }
         let channels = shape[2];
         let raw = buffer.to_vec(data.py())?;
         let rgba = if channels == 4 {

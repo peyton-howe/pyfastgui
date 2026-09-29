@@ -26,7 +26,7 @@ def main() -> None:
     checkbox = fg.Checkbox("Enable notifications", on_change=lambda v: set_status(f"checkbox={v}"))
     toggle = fg.Toggle(checked=True, on_change=set_dark_mode)
     notes = fg.TextArea(
-        placeholder="Notes (Enter = newline, Cmd/Ctrl+Enter = submit)",
+        placeholder="Notes…",
         height=96.0,
         flex_grow=1.0,
         on_change=lambda t: set_status(f"notes={len(t)} chars"),

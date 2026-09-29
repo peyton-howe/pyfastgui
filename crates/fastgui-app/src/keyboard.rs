@@ -160,31 +160,37 @@ fn handle_key_inner(
             tree.set_focus(Some(target));
             true
         }
-        Some(WidgetKind::SpinBox { value, min, max, step, .. }) => {
-            let (value, min, max, step) = (*value, *min, *max, *step);
-            let target = match key {
-                Key::Named(NamedKey::ArrowUp | NamedKey::ArrowRight) => value + step,
-                Key::Named(NamedKey::ArrowDown | NamedKey::ArrowLeft) => value - step,
-                Key::Named(NamedKey::PageUp) => value + step * 10.0,
-                Key::Named(NamedKey::PageDown) => value - step * 10.0,
-                Key::Named(NamedKey::Home) => min,
-                Key::Named(NamedKey::End) => max,
-                _ => return false,
-            };
-            crate::forms::set_numeric(tree, id, target)
+        Some(WidgetKind::SpinBox { min, max, step, .. }) => {
+            let (min, max, step) = (*min, *max, *step);
+            match key {
+                Key::Named(NamedKey::ArrowUp | NamedKey::ArrowRight) => {
+                    crate::forms::set_numeric_delta(tree, id, step)
+                }
+                Key::Named(NamedKey::ArrowDown | NamedKey::ArrowLeft) => {
+                    crate::forms::set_numeric_delta(tree, id, -step)
+                }
+                Key::Named(NamedKey::PageUp) => crate::forms::set_numeric_delta(tree, id, step * 10.0),
+                Key::Named(NamedKey::PageDown) => crate::forms::set_numeric_delta(tree, id, -step * 10.0),
+                Key::Named(NamedKey::Home) => crate::forms::set_numeric(tree, id, min),
+                Key::Named(NamedKey::End) => crate::forms::set_numeric(tree, id, max),
+                _ => false,
+            }
         }
-        Some(WidgetKind::NumericScrub { value, min, max, speed, .. }) => {
-            let (value, min, max, speed) = (*value, *min, *max, *speed);
-            let target = match key {
-                Key::Named(NamedKey::ArrowUp | NamedKey::ArrowRight) => value + speed,
-                Key::Named(NamedKey::ArrowDown | NamedKey::ArrowLeft) => value - speed,
-                Key::Named(NamedKey::PageUp) => value + speed * 10.0,
-                Key::Named(NamedKey::PageDown) => value - speed * 10.0,
-                Key::Named(NamedKey::Home) => min,
-                Key::Named(NamedKey::End) => max,
-                _ => return false,
-            };
-            crate::forms::set_numeric(tree, id, target)
+        Some(WidgetKind::NumericScrub { min, max, speed, .. }) => {
+            let (min, max, speed) = (*min, *max, *speed);
+            match key {
+                Key::Named(NamedKey::ArrowUp | NamedKey::ArrowRight) => {
+                    crate::forms::set_numeric_delta(tree, id, speed)
+                }
+                Key::Named(NamedKey::ArrowDown | NamedKey::ArrowLeft) => {
+                    crate::forms::set_numeric_delta(tree, id, -speed)
+                }
+                Key::Named(NamedKey::PageUp) => crate::forms::set_numeric_delta(tree, id, speed * 10.0),
+                Key::Named(NamedKey::PageDown) => crate::forms::set_numeric_delta(tree, id, -speed * 10.0),
+                Key::Named(NamedKey::Home) => crate::forms::set_numeric(tree, id, min),
+                Key::Named(NamedKey::End) => crate::forms::set_numeric(tree, id, max),
+                _ => false,
+            }
         }
         Some(WidgetKind::ComboBox { .. }) => {
             let open = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space | NamedKey::ArrowDown))

@@ -8,6 +8,11 @@ pub enum PixelFormat {
     Rgba8,
 }
 
+/// Soft upper bound for a CPU `Image` / `Viewport` frame edge. Larger uploads exceed common
+/// GPU `maxImageDimension2D` limits (often 16384) and produce validation errors while still
+/// leaving the app running.
+pub const MAX_CPU_FRAME_EXTENT: u32 = 16384;
+
 /// A single CPU-side image, ready to be uploaded to a GPU texture.
 pub struct CpuFrame {
     pub width: u32,

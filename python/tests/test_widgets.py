@@ -163,12 +163,14 @@ class ComboBoxTests(unittest.TestCase):
 
 
 class ImageTests(unittest.TestCase):
-    def test_constructs_and_rejects_empty_image(self):
+    def test_constructs_and_rejects_empty_or_oversized_image(self):
         import numpy as np
 
         image = fg.Image(width=32, height=24)
         with self.assertRaises(ValueError):
             image.set_image(np.zeros((0, 8, 4), dtype=np.uint8))
+        with self.assertRaises(ValueError):
+            image.set_image(np.zeros((1, 16385, 4), dtype=np.uint8))
 
 
 class TextAreaTests(unittest.TestCase):

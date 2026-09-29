@@ -83,6 +83,14 @@ impl Viewport {
         }
         let height = shape[0] as u32;
         let width = shape[1] as u32;
+        if width > fastgui_core::MAX_CPU_FRAME_EXTENT || height > fastgui_core::MAX_CPU_FRAME_EXTENT {
+            return Err(PyValueError::new_err(format!(
+                "frame edge must be <= {} pixels (got {}x{})",
+                fastgui_core::MAX_CPU_FRAME_EXTENT,
+                width,
+                height,
+            )));
+        }
         let channels = shape[2];
         let raw = buffer.to_vec(data.py())?;
 
