@@ -30,7 +30,8 @@ crates/
     src/surface.rs            SurfaceBackend trait + MainResizePolicy (Immediate vs Debounced),
                               ViewportDraw (a Viewport's full rect + visible part → viewport/scissor)
     src/keyboard.rs           Tab/Escape focus keys; routes key presses to the focused widget
-    src/text_input.rs         TextInput keys/mouse/IME/clipboard (arboard), caret scrolling
+    src/text_input.rs         TextInput / TextArea keys/mouse/IME/clipboard (arboard), caret scrolling
+    src/forms.rs              Checkbox/Radio/Toggle/SpinBox/NumericScrub click, keyboard, scrub
 
   fastgui-render-vk/      The Vulkan GPU backend (Windows + Linux). Thin `run()` wrapper with
                           Debounced main-window resize + CUDA surface create. Selected by

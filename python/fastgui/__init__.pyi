@@ -82,6 +82,30 @@ class TextInput:
     def set_text(self, text: str) -> None:
         """Replace the text without calling `on_change`. Works before the field is attached."""
 
+class TextArea:
+    """A multi-line editable text field. Enter inserts a hard newline; Cmd/Ctrl+Enter fires
+    `on_submit`. Soft wrap is not implemented yet — long lines are clipped."""
+    def __init__(
+        self,
+        text: str = "",
+        placeholder: str = "",
+        on_change: Callable[[str], None] | None = None,
+        on_submit: Callable[[str], None] | None = None,
+        font_size: FontSize | None = None,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 0.0,
+        text_color: RGBA | None = None,
+        placeholder_color: RGBA | None = None,
+        background: RGBA | None = None,
+        selection_color: RGBA | None = None,
+    ) -> None: ...
+    @property
+    def text(self) -> str:
+        """The current text, including the user's latest edits. Safe from any thread."""
+    def set_text(self, text: str) -> None:
+        """Replace the text without calling `on_change`. Works before the field is attached."""
+
 class ScrollArea:
     """A scrollable viewport onto `content`. The mouse wheel / trackpad scrolls it (the innermost
     scroll area that can still move takes the scroll), overflowing axes get draggable overlay
@@ -189,7 +213,184 @@ class Popup:
     @property
     def is_open(self) -> bool: ...
 
-Widget = Union[Label, Button, Slider, TextInput, "ListView", "ScrollArea", "Box", "Splitter", "Panel", "Tabs", "DockArea", Viewport]
+class Checkbox:
+    """Labeled on/off checkbox. Click or Space/Enter toggles; `set_checked` does not fire `on_change`."""
+    def __init__(
+        self,
+        label: str,
+        checked: bool = False,
+        on_change: Callable[[bool], None] | None = None,
+        font_size: FontSize | None = None,
+        text_color: RGBA | None = None,
+        box_color: RGBA | None = None,
+        check_color: RGBA | None = None,
+    ) -> None: ...
+    @property
+    def checked(self) -> bool: ...
+    def set_checked(self, checked: bool) -> None: ...
+
+class Radio:
+    """One option in a radio group. Pass the same `group` id to peers so only one can be selected.
+    Automatic groups use ids with the high bit set; user-supplied `group` must be `< 2**63`."""
+    def __init__(
+        self,
+        label: str,
+        group: int | None = None,
+        selected: bool = False,
+        on_select: Callable[[], None] | None = None,
+        font_size: FontSize | None = None,
+        text_color: RGBA | None = None,
+        box_color: RGBA | None = None,
+        dot_color: RGBA | None = None,
+    ) -> None: ...
+    @property
+    def group(self) -> int: ...
+    @property
+    def selected(self) -> bool: ...
+    def set_selected(self, selected: bool) -> None:
+        """Select or clear without firing `on_select`. Selecting clears peers in the same group."""
+
+class Toggle:
+    def __init__(
+        self,
+        checked: bool = False,
+        on_change: Callable[[bool], None] | None = None,
+        track_off: RGBA | None = None,
+        track_on: RGBA | None = None,
+        thumb_color: RGBA | None = None,
+    ) -> None: ...
+    @property
+    def checked(self) -> bool: ...
+    def set_checked(self, checked: bool) -> None: ...
+
+class SpinBox:
+    def __init__(
+        self,
+        value: float = 0.0,
+        min: float = 0.0,
+        max: float = 100.0,
+        step: float = 1.0,
+        decimals: int = 0,
+        on_change: Callable[[float], None] | None = None,
+        font_size: FontSize | None = None,
+        width: float | None = None,
+        text_color: RGBA | None = None,
+        background: RGBA | None = None,
+        button_color: RGBA | None = None,
+    ) -> None: ...
+    @property
+    def value(self) -> float: ...
+    def set_value(self, value: float) -> None: ...
+
+class NumericScrub:
+    """Drag horizontally to change the value (`speed` units per logical pixel)."""
+    def __init__(
+        self,
+        value: float = 0.0,
+        min: float = 0.0,
+        max: float = 100.0,
+        speed: float = 0.25,
+        decimals: int = 1,
+        on_change: Callable[[float], None] | None = None,
+        font_size: FontSize | None = None,
+        width: float | None = None,
+        text_color: RGBA | None = None,
+        background: RGBA | None = None,
+    ) -> None: ...
+    @property
+    def value(self) -> float: ...
+    def set_value(self, value: float) -> None: ...
+
+class ProgressBar:
+    def __init__(
+        self,
+        value: float = 0.0,
+        min: float = 0.0,
+        max: float = 1.0,
+        track_color: RGBA | None = None,
+        fill_color: RGBA | None = None,
+        height: float = 8.0,
+        flex_grow: float = 1.0,
+    ) -> None: ...
+    @property
+    def value(self) -> float: ...
+    def set_value(self, value: float) -> None: ...
+
+class ComboBox:
+    """Closed dropdown field. Click / Space / ArrowDown opens a popup list; choosing a row
+    (or activating) sets the selection, fires `on_change(index)`, and closes the popup."""
+    def __init__(
+        self,
+        items: Sequence[str] | None = None,
+        selected: int | None = None,
+        placeholder: str = "",
+        on_change: Callable[[int], None] | None = None,
+        font_size: FontSize | None = None,
+        width: float | None = None,
+        flex_grow: float = 0.0,
+        text_color: RGBA | None = None,
+        placeholder_color: RGBA | None = None,
+        background: RGBA | None = None,
+        border: RGBA | None = None,
+    ) -> None: ...
+    def set_items(self, items: Sequence[str]) -> None:
+        """Replace the rows (clears the selection). Works before attaching."""
+    def select(self, index: int | None) -> None:
+        """Select a row (clamped) or clear with `None`."""
+    @property
+    def selected(self) -> int | None: ...
+
+class Image:
+    """Static CPU image composited like a `Viewport`. Feed pixels with `set_image`."""
+    def __init__(
+        self,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+    ) -> None: ...
+    def set_image(self, data: Any) -> None:
+        """Submit a (H, W, 3|4) uint8 array."""
+        ...
+
+class Grid:
+    """CSS Grid with `columns` equal-width tracks; children auto-flow into rows."""
+    def __init__(
+        self,
+        children: Sequence["Widget"],
+        columns: int = 2,
+        gap: Spacing = 0.0,
+        padding: Spacing = 0.0,
+        flex_grow: float = 0.0,
+        width: float | None = None,
+        height: float | None = None,
+        background: RGBA = (0.0, 0.0, 0.0, 0.0),
+    ) -> None: ...
+
+Widget = Union[
+    Label,
+    Button,
+    Slider,
+    TextInput,
+    TextArea,
+    "ListView",
+    "ScrollArea",
+    "Popup",
+    Checkbox,
+    Radio,
+    Toggle,
+    SpinBox,
+    NumericScrub,
+    ProgressBar,
+    ComboBox,
+    Image,
+    Grid,
+    "Box",
+    "Splitter",
+    "Panel",
+    "Tabs",
+    "DockArea",
+    Viewport,
+]
 
 class Box:
     def __init__(

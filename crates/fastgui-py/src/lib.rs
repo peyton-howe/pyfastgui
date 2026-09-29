@@ -23,7 +23,8 @@ use pyo3::types::PyAny;
 const DEFAULT_CLEAR_COLOR: [f32; 4] = [0.06, 0.07, 0.09, 1.0];
 
 static NEXT_VIEWPORT_ID: AtomicU64 = AtomicU64::new(1);
-fn next_viewport_id() -> u64 {
+/// Also used for `Image` layers: both key the renderer's per-window layer/texture map.
+pub(crate) fn next_viewport_id() -> u64 {
     NEXT_VIEWPORT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -75,8 +76,21 @@ impl Viewport {
             return Err(PyValueError::new_err("frame buffer must be C-contiguous"));
         }
 
+        // A 0-pixel frame becomes a 0-extent VkImage and a 0-byte allocation: validation
+        // errors, then a crash mapping the null memory.
+        if shape[0] == 0 || shape[1] == 0 {
+            return Err(PyValueError::new_err("frame must be at least 1x1 pixels"));
+        }
         let height = shape[0] as u32;
         let width = shape[1] as u32;
+        if width > fastgui_core::MAX_CPU_FRAME_EXTENT || height > fastgui_core::MAX_CPU_FRAME_EXTENT {
+            return Err(PyValueError::new_err(format!(
+                "frame edge must be <= {} pixels (got {}x{})",
+                fastgui_core::MAX_CPU_FRAME_EXTENT,
+                width,
+                height,
+            )));
+        }
         let channels = shape[2];
         let raw = buffer.to_vec(data.py())?;
 

@@ -27,7 +27,10 @@ pub mod testing;
 use cosmic_text::{Attrs, Buffer, Color as CosmicColor, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
 use fastgui_core::text_edit::{TextEdit, TextMeasure};
 use fastgui_core::theme::chrome_theme;
-use fastgui_core::widget::{Color, DropZone, WidgetKind, WidgetTree, TEXT_INPUT_PADDING};
+use fastgui_core::widget::{
+    Color, DropZone, WidgetKind, WidgetTree, LINE_HEIGHT_RATIO as LAYOUT_LINE_HEIGHT_RATIO,
+    TEXT_INPUT_PADDING, TEXT_INPUT_VERTICAL_PADDING,
+};
 use fastgui_core::{ChromeFrame, PixelRect};
 use tiny_skia::{Paint, Pixmap, Rect, Transform};
 
@@ -344,9 +347,158 @@ impl ChromeRenderer {
                     };
                     self.push_text_field(&mut ops, logical_rect, scale, &field);
                 }
-                WidgetKind::Viewport { .. } => {
+                WidgetKind::TextArea {
+                    edit,
+                    placeholder,
+                    font_size,
+                    text_color,
+                    placeholder_color,
+                    background,
+                    selection_color,
+                    scroll_x,
+                    scroll_y,
+                    preedit,
+                    ..
+                } => {
+                    push_fill(&mut ops, rect, *background);
+                    let field = TextAreaField {
+                        edit,
+                        placeholder,
+                        preedit: preedit.as_ref(),
+                        focused: tree.focused() == Some(id),
+                        font_size: *font_size,
+                        text_color: *text_color,
+                        placeholder_color: *placeholder_color,
+                        selection_color: *selection_color,
+                        caret_color: theme.accent,
+                        scroll_x: *scroll_x,
+                        scroll_y: *scroll_y,
+                    };
+                    self.push_text_area(&mut ops, logical_rect, scale, &field);
+                }
+                WidgetKind::Viewport { .. } | WidgetKind::Image { .. } => {
                     // Placeholder only — the GPU draws the real frame in this rect after chrome.
                     push_fill(&mut ops, rect, Color([0.05, 0.06, 0.08, 1.0]));
+                }
+                WidgetKind::Checkbox {
+                    checked,
+                    label,
+                    font_size,
+                    text_color,
+                    box_color,
+                    check_color,
+                    ..
+                } => {
+                    self.push_checkbox(
+                        &mut ops,
+                        logical_rect,
+                        scale,
+                        *checked,
+                        label,
+                        *font_size,
+                        *text_color,
+                        *box_color,
+                        *check_color,
+                    );
+                }
+                WidgetKind::Radio {
+                    selected,
+                    label,
+                    font_size,
+                    text_color,
+                    box_color,
+                    dot_color,
+                    ..
+                } => {
+                    self.push_radio(
+                        &mut ops,
+                        logical_rect,
+                        scale,
+                        *selected,
+                        label,
+                        *font_size,
+                        *text_color,
+                        *box_color,
+                        *dot_color,
+                    );
+                }
+                WidgetKind::Toggle { checked, track_off, track_on, thumb_color, .. } => {
+                    push_toggle(&mut ops, rect, *checked, *track_off, *track_on, *thumb_color, scale);
+                }
+                WidgetKind::SpinBox {
+                    value,
+                    decimals,
+                    font_size,
+                    text_color,
+                    background,
+                    button_color,
+                    ..
+                } => {
+                    self.push_spin_box(
+                        &mut ops,
+                        logical_rect,
+                        scale,
+                        *value,
+                        *decimals,
+                        *font_size,
+                        *text_color,
+                        *background,
+                        *button_color,
+                    );
+                }
+                WidgetKind::NumericScrub {
+                    value,
+                    decimals,
+                    font_size,
+                    text_color,
+                    background,
+                    ..
+                } => {
+                    push_fill(&mut ops, rect, *background);
+                    let text = fastgui_core::widget::format_decimal(*value, *decimals);
+                    self.push_centered_text(&mut ops, rect, &text, *font_size * scale, *text_color);
+                }
+                WidgetKind::ProgressBar { value, min, max, track_color, fill_color, .. } => {
+                    push_progress(&mut ops, rect, *value, *min, *max, *track_color, *fill_color, scale);
+                }
+                WidgetKind::ComboBox {
+                    items,
+                    selected,
+                    placeholder,
+                    font_size,
+                    text_color,
+                    placeholder_color,
+                    background,
+                    border,
+                    ..
+                } => {
+                    push_fill(&mut ops, rect, *background);
+                    push_outline(&mut ops, rect, scale.max(1.0), *border);
+                    const CHEVRON_WIDTH: f32 = 22.0;
+                    let pad = TEXT_INPUT_PADDING;
+                    let chevron = WidgetRect {
+                        x: logical_rect.x + logical_rect.width - CHEVRON_WIDTH,
+                        y: logical_rect.y,
+                        width: CHEVRON_WIDTH,
+                        height: logical_rect.height,
+                    };
+                    let text_box = WidgetRect {
+                        x: logical_rect.x + pad,
+                        y: logical_rect.y,
+                        width: (logical_rect.width - pad - CHEVRON_WIDTH).max(0.0),
+                        height: logical_rect.height,
+                    };
+                    let label = selected.and_then(|i| items.get(i).map(String::as_str)).unwrap_or(placeholder);
+                    let color = if selected.is_some() { *text_color } else { *placeholder_color };
+                    let line = font_size * LINE_HEIGHT_RATIO;
+                    let text_line = WidgetRect {
+                        x: text_box.x,
+                        y: text_box.y + (text_box.height - line) / 2.0,
+                        width: text_box.width,
+                        height: line.min(text_box.height),
+                    };
+                    self.push_text(&mut ops, scale_rect(text_line, scale), label, font_size * scale, color);
+                    self.push_centered_text(&mut ops, scale_rect(chevron, scale), "▾", font_size * scale * 0.85, color);
                 }
             }
             if tree.focused() == Some(id) {
@@ -365,7 +517,7 @@ impl ChromeRenderer {
             in_overlay |= popups.contains(&id);
             let bar_color = match tree.kind(id) {
                 Some(WidgetKind::ScrollArea { bar_color, .. }) => bar_color,
-                Some(WidgetKind::ListView { .. }) => &theme.scrollbar,
+                Some(WidgetKind::ListView { .. } | WidgetKind::TextArea { .. }) => &theme.scrollbar,
                 _ => continue,
             };
             let mut ops = Vec::new();
@@ -391,6 +543,111 @@ impl ChromeRenderer {
         self.overlay_items = items.len();
         items.extend(overlay);
         items
+    }
+
+    /// A `TextArea`'s contents: hard-newline lines, top-aligned, clipped to the padded interior,
+    /// with per-line selection and a caret on the current line. Soft wrap is not drawn.
+    fn push_text_area(&mut self, ops: &mut Vec<Op>, logical_rect: WidgetRect, scale: f32, field: &TextAreaField<'_>) {
+        let rect = scale_rect(logical_rect, scale);
+        let pad_x = TEXT_INPUT_PADDING * scale;
+        let pad_y = TEXT_INPUT_VERTICAL_PADDING * scale;
+        let font_size = field.font_size * scale;
+        let line_height = font_size * LAYOUT_LINE_HEIGHT_RATIO;
+        let inner = WidgetRect {
+            x: rect.x + pad_x,
+            y: rect.y + pad_y,
+            width: (rect.width - 2.0 * pad_x).max(0.0),
+            height: (rect.height - 2.0 * pad_y).max(0.0),
+        };
+        if inner.width <= 0.0 || inner.height <= 0.0 {
+            return;
+        }
+        let scroll_x = (field.scroll_x * scale).round();
+        let scroll_y = (field.scroll_y * scale).round();
+        let (display, caret, composing) = field.edit.composed(field.preedit.filter(|_| field.focused));
+        let selection = if composing.is_some() { 0..0 } else { field.edit.selection() };
+        let mut content = Vec::new();
+
+        if display.is_empty() {
+            if !field.placeholder.is_empty() {
+                let line_rect = WidgetRect { height: line_height.min(inner.height), ..inner };
+                self.push_line_text(&mut content, line_rect, field.placeholder, font_size, 0.0, field.placeholder_color);
+            }
+        } else {
+            let mut byte = 0usize;
+            for (line_i, line) in display.split('\n').enumerate() {
+                let line_start = byte;
+                let line_end = byte + line.len();
+                let y = inner.y + line_i as f32 * line_height - scroll_y;
+                let line_rect = WidgetRect { x: inner.x, y, width: inner.width, height: line_height };
+                let visible = y + line_height > inner.y && y < inner.y + inner.height;
+                if visible {
+                    if field.focused && !selection.is_empty() {
+                        let crosses = selection.start <= line_end && selection.end > line_start
+                            || (selection.end > line_end && selection.start <= line_start);
+                        let sel_start = selection.start.max(line_start);
+                        let sel_end = selection.end.min(line_end);
+                        if crosses && (sel_start < sel_end || line.is_empty() || selection.end > line_end) {
+                            let stops = self.line_stops(line, font_size);
+                            let x0 = if selection.start <= line_start {
+                                inner.x
+                            } else {
+                                inner.x + stop_x(&stops, sel_start - line_start) - scroll_x
+                            };
+                            let x1 = if selection.end > line_end {
+                                (inner.x + stop_x(&stops, line.len()) - scroll_x + font_size * 0.4)
+                                    .min(inner.x + inner.width)
+                            } else {
+                                inner.x + stop_x(&stops, sel_end - line_start) - scroll_x
+                            };
+                            let (x0, x1) = (x0.max(inner.x), x1.min(inner.x + inner.width));
+                            if x1 > x0 {
+                                push_fill(
+                                    &mut content,
+                                    WidgetRect { x: x0, y, width: x1 - x0, height: line_height },
+                                    field.selection_color,
+                                );
+                            }
+                        }
+                    }
+                    if !line.is_empty() {
+                        self.push_line_text(&mut content, line_rect, line, font_size, scroll_x, field.text_color);
+                    }
+                    if let Some(range) = &composing {
+                        let c0 = range.start.max(line_start);
+                        let c1 = range.end.min(line_end);
+                        if c0 < c1 {
+                            let stops = self.line_stops(line, font_size);
+                            let x0 = (inner.x + stop_x(&stops, c0 - line_start) - scroll_x).max(inner.x);
+                            let x1 = (inner.x + stop_x(&stops, c1 - line_start) - scroll_x).min(inner.x + inner.width);
+                            let thickness = scale.max(1.0);
+                            push_fill(
+                                &mut content,
+                                WidgetRect {
+                                    x: x0,
+                                    y: y + line_height - thickness,
+                                    width: (x1 - x0).max(0.0),
+                                    height: thickness,
+                                },
+                                field.text_color,
+                            );
+                        }
+                    }
+                    // Caret on this line's bytes, or on the trailing `\n` (drawn at end of line).
+                    if field.focused && caret >= line_start && caret <= line_end {
+                        let stops = self.line_stops(line, font_size);
+                        let width = (CARET_WIDTH * scale).max(1.0);
+                        let local = caret.saturating_sub(line_start).min(line.len());
+                        let x = (inner.x + stop_x(&stops, local) - scroll_x)
+                            .round()
+                            .clamp(inner.x, inner.x + inner.width - width);
+                        push_fill(&mut content, WidgetRect { x, y, width, height: line_height }, field.caret_color);
+                    }
+                }
+                byte = line_end + 1;
+            }
+        }
+        ops.extend(clip_ops(content, Clip::from_rect(inner)));
     }
 
     /// A `TextInput`'s contents inside its (already filled) `logical_rect`: selection highlight,
@@ -508,15 +765,145 @@ impl ChromeRenderer {
     /// closes. Uses the same rough advance/line-height ratios as layout's `measure_text`, which
     /// is plenty for a single glyph.
     fn push_close_glyph(&mut self, ops: &mut Vec<Op>, rect: WidgetRect, font_size: f32, color: Color) {
-        let glyph_width = font_size * 0.55;
+        self.push_centered_text(ops, rect, "×", font_size, color);
+    }
+
+    /// Centre `text` in `rect` using the same advance/line-height heuristics as layout measure.
+    fn push_centered_text(&mut self, ops: &mut Vec<Op>, rect: WidgetRect, text: &str, font_size: f32, color: Color) {
+        if text.is_empty() || rect.width <= 0.0 || rect.height <= 0.0 {
+            return;
+        }
+        let glyph_width = font_size * 0.55 * text.chars().count() as f32;
         let line_height = font_size * 1.25;
         let inset = WidgetRect {
             x: rect.x + ((rect.width - glyph_width) * 0.5).max(0.0),
             y: rect.y + ((rect.height - line_height) * 0.5).max(0.0),
-            width: rect.width.min(glyph_width * 2.0),
+            width: rect.width.min(glyph_width * 1.5).max(rect.width * 0.5),
             height: rect.height.max(line_height),
         };
-        self.push_text(ops, inset, "×", font_size, color);
+        self.push_text(ops, inset, text, font_size, color);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_checkbox(
+        &mut self,
+        ops: &mut Vec<Op>,
+        logical_rect: WidgetRect,
+        scale: f32,
+        checked: bool,
+        label: &str,
+        font_size: f32,
+        text_color: Color,
+        box_color: Color,
+        check_color: Color,
+    ) {
+        let box_logical = fastgui_core::widget::check_indicator_rect(logical_rect);
+        let box_rect = scale_rect(box_logical, scale);
+        push_fill(ops, box_rect, box_color);
+        push_outline(ops, box_rect, (1.5 * scale).max(1.0), check_color);
+        if checked {
+            let inset = WidgetRect {
+                x: box_rect.x + box_rect.width * 0.2,
+                y: box_rect.y + box_rect.height * 0.2,
+                width: box_rect.width * 0.6,
+                height: box_rect.height * 0.6,
+            };
+            push_fill(ops, inset, check_color);
+        }
+        let label_x = box_logical.x + box_logical.width + fastgui_core::widget::CHECK_LABEL_GAP;
+        let label_rect = scale_rect(
+            WidgetRect {
+                x: label_x,
+                y: logical_rect.y,
+                width: (logical_rect.x + logical_rect.width - label_x).max(0.0),
+                height: logical_rect.height,
+            },
+            scale,
+        );
+        self.push_text(ops, label_rect, label, font_size * scale, text_color);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_radio(
+        &mut self,
+        ops: &mut Vec<Op>,
+        logical_rect: WidgetRect,
+        scale: f32,
+        selected: bool,
+        label: &str,
+        font_size: f32,
+        text_color: Color,
+        box_color: Color,
+        dot_color: Color,
+    ) {
+        let box_logical = fastgui_core::widget::check_indicator_rect(logical_rect);
+        let cx = (box_logical.x + box_logical.width * 0.5) * scale;
+        let cy = (box_logical.y + box_logical.height * 0.5) * scale;
+        let radius = (box_logical.width * 0.5) * scale;
+        // Accent ring around a `box_color` disc, like the checkbox's outline + fill — both from
+        // the theme, so it reads in light themes too (the inner disc used to be fixed dark).
+        ops.push(Op::Circle { cx, cy, radius, color: dot_color, sprite: OnceLock::new(), clip: None });
+        ops.push(Op::Circle {
+            cx,
+            cy,
+            radius: (radius - (1.5 * scale).max(1.0)).max(1.0),
+            color: box_color,
+            sprite: OnceLock::new(),
+            clip: None,
+        });
+        if selected {
+            ops.push(Op::Circle {
+                cx,
+                cy,
+                radius: radius * 0.45,
+                color: dot_color,
+                sprite: OnceLock::new(),
+                clip: None,
+            });
+        }
+        let label_x = box_logical.x + box_logical.width + fastgui_core::widget::CHECK_LABEL_GAP;
+        let label_rect = scale_rect(
+            WidgetRect {
+                x: label_x,
+                y: logical_rect.y,
+                width: (logical_rect.x + logical_rect.width - label_x).max(0.0),
+                height: logical_rect.height,
+            },
+            scale,
+        );
+        self.push_text(ops, label_rect, label, font_size * scale, text_color);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_spin_box(
+        &mut self,
+        ops: &mut Vec<Op>,
+        logical_rect: WidgetRect,
+        scale: f32,
+        value: f32,
+        decimals: u32,
+        font_size: f32,
+        text_color: Color,
+        background: Color,
+        button_color: Color,
+    ) {
+        let rect = scale_rect(logical_rect, scale);
+        push_fill(ops, rect, background);
+        let value_rect = scale_rect(fastgui_core::widget::spin_value_rect(logical_rect), scale);
+        let buttons = scale_rect(fastgui_core::widget::spin_buttons_rect(logical_rect), scale);
+        let up = scale_rect(fastgui_core::widget::spin_up_rect(logical_rect), scale);
+        let down = scale_rect(fastgui_core::widget::spin_down_rect(logical_rect), scale);
+        push_fill(ops, buttons, button_color);
+        let divider = (1.0 * scale).max(1.0);
+        push_fill(
+            ops,
+            WidgetRect { x: buttons.x, y: buttons.y + buttons.height * 0.5 - divider * 0.5, width: buttons.width, height: divider },
+            text_color,
+        );
+        let text = fastgui_core::widget::format_decimal(value, decimals);
+        self.push_centered_text(ops, value_rect, &text, font_size * scale, text_color);
+        self.push_centered_text(ops, up, "▴", font_size * scale * 0.7, text_color);
+        self.push_centered_text(ops, down, "▾", font_size * scale * 0.7, text_color);
     }
 
     /// Bakes its own header segments (equal-width, one per title) directly rather than composing
@@ -595,6 +982,21 @@ struct TextField<'a> {
     selection_color: Color,
     caret_color: Color,
     scroll: f32,
+}
+
+/// What `push_text_area` needs from a `WidgetKind::TextArea`.
+struct TextAreaField<'a> {
+    edit: &'a TextEdit,
+    placeholder: &'a str,
+    preedit: Option<&'a (String, Option<(usize, usize)>)>,
+    focused: bool,
+    font_size: f32,
+    text_color: Color,
+    placeholder_color: Color,
+    selection_color: Color,
+    caret_color: Color,
+    scroll_x: f32,
+    scroll_y: f32,
 }
 
 /// X of the caret before byte `index`: the last stop at or before it (inside a multi-glyph
@@ -1058,6 +1460,79 @@ fn push_slider(
     let fraction = if max > min { ((value - min) / (max - min)).clamp(0.0, 1.0) } else { 0.0 };
     let (cx, cy, radius) = (rect.x + fraction * rect.width, rect.y + rect.height / 2.0, SLIDER_THUMB_RADIUS * scale);
     ops.push(Op::Circle { cx, cy, radius, color: thumb_color, sprite: OnceLock::new(), clip: None });
+}
+
+fn push_toggle(
+    ops: &mut Vec<Op>,
+    rect: WidgetRect,
+    checked: bool,
+    track_off: Color,
+    track_on: Color,
+    thumb_color: Color,
+    scale: f32,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let radius = rect.height * 0.5;
+    let track = if checked { track_on } else { track_off };
+    // Pill: circles at each end + a fill between their centres.
+    ops.push(Op::Circle {
+        cx: rect.x + radius,
+        cy: rect.y + radius,
+        radius,
+        color: track,
+        sprite: OnceLock::new(),
+        clip: None,
+    });
+    ops.push(Op::Circle {
+        cx: rect.x + rect.width - radius,
+        cy: rect.y + radius,
+        radius,
+        color: track,
+        sprite: OnceLock::new(),
+        clip: None,
+    });
+    push_fill(
+        ops,
+        WidgetRect { x: rect.x + radius, y: rect.y, width: (rect.width - 2.0 * radius).max(0.0), height: rect.height },
+        track,
+    );
+    let pad = 2.0 * scale;
+    let thumb_r = (radius - pad).max(1.0);
+    let thumb_cx = if checked { rect.x + rect.width - radius } else { rect.x + radius };
+    ops.push(Op::Circle {
+        cx: thumb_cx,
+        cy: rect.y + radius,
+        radius: thumb_r,
+        color: thumb_color,
+        sprite: OnceLock::new(),
+        clip: None,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_progress(
+    ops: &mut Vec<Op>,
+    rect: WidgetRect,
+    value: f32,
+    min: f32,
+    max: f32,
+    track_color: Color,
+    fill_color: Color,
+    scale: f32,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let track_height = rect.height.max(4.0 * scale);
+    let track_y = rect.y + (rect.height - track_height) / 2.0;
+    let track = WidgetRect { x: rect.x, y: track_y, width: rect.width, height: track_height };
+    push_fill(ops, track, track_color);
+    let fraction = if max > min { ((value - min) / (max - min)).clamp(0.0, 1.0) } else { 0.0 };
+    if fraction > 0.0 {
+        push_fill(ops, WidgetRect { width: track.width * fraction, ..track }, fill_color);
+    }
 }
 
 /// A `width`-thick border along the inside of `rect`, as four fills.

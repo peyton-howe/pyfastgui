@@ -1,7 +1,9 @@
-//! Editable single-line text: the string, caret and selection, and undo history, with no
-//! knowledge of fonts. Positions are byte offsets that always sit on grapheme-cluster
-//! boundaries, so an emoji or an accented letter moves and deletes as one unit.
-//! `fastgui-app` drives it from keys and clicks; `fastgui-chrome` draws it.
+//! Editable text: the string, caret and selection, and undo history, with no knowledge of fonts.
+//! Positions are byte offsets that always sit on grapheme-cluster boundaries, so an emoji or an
+//! accented letter moves and deletes as one unit. Single-line fields flatten newlines to spaces;
+//! multiline fields keep `\n` (normalizing `\r\n` / `\r`). Soft wrap is not modeled here — line
+//! geometry is `\n` splits only. `fastgui-app` drives it from keys and clicks; `fastgui-chrome`
+//! draws it.
 
 use std::ops::Range;
 
@@ -30,6 +32,8 @@ pub struct TextEdit {
     /// they're equal when nothing is selected.
     caret: usize,
     anchor: usize,
+    /// When true, `\n` is kept (after normalizing `\r\n`/`\r`); when false, newlines become spaces.
+    multiline: bool,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     /// The kind of the last edit, while consecutive edits of that kind still merge into one
@@ -38,11 +42,18 @@ pub struct TextEdit {
 }
 
 impl TextEdit {
-    /// A field holding `text`, caret at the end.
+    /// A single-line field holding `text` (newlines flattened), caret at the end.
     pub fn new(text: &str) -> Self {
         let text = single_line(text);
         let end = text.len();
-        Self { text, caret: end, anchor: end, ..Default::default() }
+        Self { text, caret: end, anchor: end, multiline: false, ..Default::default() }
+    }
+
+    /// A multiline field holding `text` (`\r\n`/`\r` → `\n`), caret at the end.
+    pub fn new_multiline(text: &str) -> Self {
+        let text = normalize_newlines(text);
+        let end = text.len();
+        Self { text, caret: end, anchor: end, multiline: true, ..Default::default() }
     }
 
     pub fn text(&self) -> &str {
@@ -57,6 +68,10 @@ impl TextEdit {
         self.anchor
     }
 
+    pub fn is_multiline(&self) -> bool {
+        self.multiline
+    }
+
     /// The selected byte range (start <= end); empty when nothing is selected.
     pub fn selection(&self) -> Range<usize> {
         self.caret.min(self.anchor)..self.caret.max(self.anchor)
@@ -67,8 +82,9 @@ impl TextEdit {
     }
 
     /// Replace the contents from code (not the user): caret to the end, history cleared.
+    /// Keeps the single-/multi-line mode of this field.
     pub fn set_text(&mut self, text: &str) {
-        *self = Self::new(text);
+        *self = if self.multiline { Self::new_multiline(text) } else { Self::new(text) };
     }
 
     /// Put the caret at `pos` (snapped to a grapheme boundary). With `extend`, the anchor
@@ -107,12 +123,58 @@ impl TextEdit {
         self.move_to(target, extend);
     }
 
+    /// Byte offset of the start of the line containing `byte` (after the previous `\n`, or 0).
+    pub fn line_start(&self, byte: usize) -> usize {
+        let byte = byte.min(self.text.len());
+        self.text[..byte].rfind('\n').map_or(0, |i| i + 1)
+    }
+
+    /// Byte offset of the end of the line containing `byte` (at the next `\n`, or `text.len()`).
+    pub fn line_end(&self, byte: usize) -> usize {
+        let byte = byte.min(self.text.len());
+        self.text[byte..].find('\n').map_or(self.text.len(), |i| byte + i)
+    }
+
+    /// Move up one hard line, preserving grapheme column as best-effort.
+    pub fn move_line_up(&mut self, extend: bool) {
+        let column = self.grapheme_column(self.caret);
+        let start = self.line_start(self.caret);
+        if start == 0 {
+            self.move_to_line_column(0, column, extend);
+            return;
+        }
+        let prev_start = self.line_start(start - 1);
+        self.move_to_line_column(prev_start, column, extend);
+    }
+
+    /// Move down one hard line, preserving grapheme column as best-effort.
+    pub fn move_line_down(&mut self, extend: bool) {
+        let column = self.grapheme_column(self.caret);
+        let end = self.line_end(self.caret);
+        if end >= self.text.len() {
+            self.move_to_line_column(self.line_start(self.caret), column, extend);
+            return;
+        }
+        let next_start = end + 1;
+        self.move_to_line_column(next_start, column, extend);
+    }
+
     pub fn home(&mut self, extend: bool) {
         self.move_to(0, extend);
     }
 
     pub fn end(&mut self, extend: bool) {
         self.move_to(self.text.len(), extend);
+    }
+
+    /// Move to the start of the current hard line.
+    pub fn line_home(&mut self, extend: bool) {
+        self.move_to(self.line_start(self.caret), extend);
+    }
+
+    /// Move to the end of the current hard line (before the trailing `\n`, if any).
+    pub fn line_end_move(&mut self, extend: bool) {
+        self.move_to(self.line_end(self.caret), extend);
     }
 
     pub fn select_all(&mut self) {
@@ -136,10 +198,10 @@ impl TextEdit {
         }
     }
 
-    /// Type or paste `text` over the selection. Newlines become spaces (single-line field).
-    /// Returns whether the contents changed.
+    /// Type or paste `text` over the selection. Single-line fields turn newlines into spaces;
+    /// multiline fields keep `\n` after normalizing `\r\n`/`\r`. Returns whether contents changed.
     pub fn insert(&mut self, text: &str) -> bool {
-        let text = single_line(text);
+        let text = if self.multiline { normalize_newlines(text) } else { single_line(text) };
         if text.is_empty() && self.selection().is_empty() {
             return false;
         }
@@ -219,6 +281,23 @@ impl TextEdit {
             }
             _ => (self.text.clone(), self.caret, None),
         }
+    }
+
+    fn grapheme_column(&self, pos: usize) -> usize {
+        let start = self.line_start(pos);
+        self.text[start..pos].graphemes(true).count()
+    }
+
+    fn move_to_line_column(&mut self, line_start: usize, column: usize, extend: bool) {
+        let line_end = self.line_end(line_start);
+        let mut pos = line_start;
+        for _ in 0..column {
+            if pos >= line_end {
+                break;
+            }
+            pos = self.next_grapheme(pos);
+        }
+        self.move_to(pos.min(line_end), extend);
     }
 
     fn delete_range(&mut self, range: Range<usize>) -> bool {
@@ -306,6 +385,10 @@ fn is_word(segment: &str) -> bool {
 
 fn single_line(text: &str) -> String {
     text.replace("\r\n", " ").replace(['\n', '\r'], " ")
+}
+
+fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Where text lands horizontally, for a font the caller owns — `fastgui-chrome` implements it
@@ -407,5 +490,48 @@ mod tests {
         edit.move_to(2, false);
         edit.move_to(99, true);
         assert_eq!(edit.selected_text(), "e two three", "out-of-range positions clamp");
+    }
+
+    #[test]
+    fn multiline_keeps_newlines_and_normalizes_crlf() {
+        let mut edit = TextEdit::new_multiline("");
+        assert!(edit.is_multiline());
+        edit.insert("one\ntwo\r\nthree\rfour");
+        assert_eq!(edit.text(), "one\ntwo\nthree\nfour");
+        edit.set_text("a\r\nb");
+        assert_eq!(edit.text(), "a\nb");
+        assert!(edit.is_multiline(), "set_text keeps multiline mode");
+    }
+
+    #[test]
+    fn multiline_line_motion_and_home_end() {
+        let mut edit = TextEdit::new_multiline("ab\ncde\nf");
+        // caret at end of "f"
+        assert_eq!(edit.caret(), edit.text().len());
+        edit.line_home(false);
+        assert_eq!(edit.caret(), 7); // start of "f"
+        edit.move_line_up(false);
+        assert_eq!(&edit.text()[edit.line_start(edit.caret())..edit.line_end(edit.caret())], "cde");
+        assert_eq!(edit.caret(), 3, "column 0 on the middle line");
+        edit.move_to(5, false); // on 'e' (column 2)
+        edit.move_line_up(false);
+        assert_eq!(edit.caret(), 2, "column 2 on first line lands on end of 'ab'");
+        edit.move_line_down(false);
+        assert_eq!(edit.caret(), 5, "back to 'e'");
+        edit.line_end_move(false);
+        assert_eq!(edit.caret(), 6);
+        edit.home(false);
+        assert_eq!(edit.caret(), 0);
+        edit.end(false);
+        assert_eq!(edit.caret(), edit.text().len());
+    }
+
+    #[test]
+    fn multiline_insert_newline_at_caret() {
+        let mut edit = TextEdit::new_multiline("hello");
+        edit.move_to(2, false);
+        assert!(edit.insert("\n"));
+        assert_eq!(edit.text(), "he\nllo");
+        assert_eq!(edit.caret(), 3);
     }
 }

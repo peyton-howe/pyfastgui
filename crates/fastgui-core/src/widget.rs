@@ -25,6 +25,7 @@ impl Color {
 /// never need to know Python exists.
 pub type ClickCallback = Arc<dyn Fn() + Send + Sync>;
 pub type ChangeCallback = Arc<dyn Fn(f32) + Send + Sync>;
+pub type BoolCallback = Arc<dyn Fn(bool) + Send + Sync>;
 pub type TabSelectCallback = Arc<dyn Fn(usize) + Send + Sync>;
 /// `(dragged_region_id, target_region_id, zone, float_rect)`.
 /// `float_rect` is `Some((x, y, width, height))` in main-window client coords when `zone` is
@@ -72,10 +73,23 @@ pub enum PopupSide {
 /// window's edges (layout units).
 const POPUP_GAP: f32 = 2.0;
 
-/// Horizontal space between a `TextInput`'s edge and its text (layout units). Shared by
-/// chrome's drawing and `fastgui-app`'s click-to-caret, so both agree on where text starts.
+/// Horizontal space between a `TextInput` / `TextArea`'s edge and its text (layout units).
+/// Shared by chrome's drawing and `fastgui-app`'s click-to-caret, so both agree on where text starts.
 pub const TEXT_INPUT_PADDING: f32 = 8.0;
-const TEXT_INPUT_VERTICAL_PADDING: f32 = 6.0;
+/// Vertical inset for `TextInput` / `TextArea` content (layout units).
+pub const TEXT_INPUT_VERTICAL_PADDING: f32 = 6.0;
+
+/// Drawn checkbox / radio indicator size (layout units). Shared by measure, chrome, and hit tests.
+pub const CHECK_SIZE: f32 = 18.0;
+/// Gap between the indicator and the label text on `Checkbox` / `Radio`.
+pub const CHECK_LABEL_GAP: f32 = 8.0;
+/// Intrinsic size of a `Toggle` track (layout units).
+pub const TOGGLE_WIDTH: f32 = 40.0;
+pub const TOGGLE_HEIGHT: f32 = 22.0;
+/// Width reserved for each ± button on a `SpinBox` (layout units).
+pub const SPIN_BUTTON_WIDTH: f32 = 22.0;
+/// Default track thickness for a `ProgressBar` when style doesn't pin height.
+pub const PROGRESS_HEIGHT: f32 = 8.0;
 
 /// Scrollbar thickness and inset from the scroll area's edge (layout units). Overlay bars:
 /// drawn over the content's edge rather than taking layout space.
@@ -270,6 +284,24 @@ pub enum WidgetKind {
         on_submit: Option<TextCallback>,
         mirror: Option<Readback<String>>,
     },
+    /// A multi-line editable text field (`QTextEdit`) with hard newlines only (no soft wrap yet).
+    /// Same editing/IME/`mirror` model as `TextInput`; `scroll_y` keeps the caret line in view
+    /// and `scroll_x` keeps the caret column in view on long unwrapped lines.
+    TextArea {
+        edit: TextEdit,
+        placeholder: String,
+        font_size: f32,
+        text_color: Color,
+        placeholder_color: Color,
+        background: Color,
+        selection_color: Color,
+        scroll_x: f32,
+        scroll_y: f32,
+        preedit: Option<(String, Option<(usize, usize)>)>,
+        on_change: Option<TextCallback>,
+        on_submit: Option<TextCallback>,
+        mirror: Option<Readback<String>>,
+    },
     /// A viewport onto its (usually single) child, scrolled by `offset` (layout units, both
     /// axes; clamped to the content's overflow at each layout). Children lay out at their
     /// natural size and are shifted by `-offset`; everything inside is clipped to this node's
@@ -318,6 +350,106 @@ pub enum WidgetKind {
         viewport_id: u64,
         frames: FrameSlot<crate::CpuFrame>,
     },
+    /// A labeled on/off control. `checked` is the current value; `on_change` fires on toggle
+    /// (Space/click). Indicator size is `CHECK_SIZE`; chrome draws the box and checkmark.
+    Checkbox {
+        checked: bool,
+        label: String,
+        font_size: f32,
+        text_color: Color,
+        box_color: Color,
+        check_color: Color,
+        on_change: Option<BoolCallback>,
+    },
+    /// One option in a radio group. `group_id` ties peers together — exclusivity is enforced
+    /// later in `fastgui-app` (selecting one clears others with the same id). `on_select` fires
+    /// when this option becomes selected (click/Space); it is not re-fired if already selected.
+    Radio {
+        selected: bool,
+        label: String,
+        group_id: u64,
+        font_size: f32,
+        text_color: Color,
+        box_color: Color,
+        dot_color: Color,
+        on_select: Option<ClickCallback>,
+        /// Python's `Radio.selected`: kept in step when a peer's selection clears this one too,
+        /// so a rebuild (theme switch, `set_content`) doesn't bring back a stale selection.
+        mirror: Option<Readback<bool>>,
+    },
+    /// A compact on/off switch with no built-in label (pair with a `Label` in demos). Track
+    /// colors swap with `checked`; thumb is always `thumb_color`.
+    Toggle {
+        checked: bool,
+        track_off: Color,
+        track_on: Color,
+        thumb_color: Color,
+        on_change: Option<BoolCallback>,
+    },
+    /// Numeric stepper with −/+ buttons. `decimals == 0` shows an integer; otherwise that many
+    /// fractional digits. `mirror` publishes every change for a synchronous Python getter, like
+    /// `TextInput`.
+    SpinBox {
+        value: f32,
+        min: f32,
+        max: f32,
+        step: f32,
+        decimals: u32,
+        font_size: f32,
+        text_color: Color,
+        background: Color,
+        button_color: Color,
+        on_change: Option<ChangeCallback>,
+        mirror: Option<Readback<f32>>,
+    },
+    /// Drag-to-scrub numeric field: horizontal drag changes `value` by `speed` per logical
+    /// pixel. Same display/`mirror` conventions as `SpinBox`.
+    NumericScrub {
+        value: f32,
+        min: f32,
+        max: f32,
+        speed: f32,
+        decimals: u32,
+        font_size: f32,
+        text_color: Color,
+        background: Color,
+        on_change: Option<ChangeCallback>,
+        mirror: Option<Readback<f32>>,
+    },
+    /// Non-interactive determinate progress track. `value` is clamped to `[min, max]` when drawn.
+    ProgressBar {
+        value: f32,
+        min: f32,
+        max: f32,
+        track_color: Color,
+        fill_color: Color,
+    },
+    /// Static/CPU image via the same latest-wins mailbox as `Viewport`. `image_id` is a stable
+    /// identity for the renderer's texture cache across tree rebuilds; a later GPU path can
+    /// reuse viewport draws for the same slot.
+    Image {
+        image_id: u64,
+        frames: FrameSlot<crate::CpuFrame>,
+    },
+    /// Closed field showing the selected item (or `placeholder`) with a chevron; click / Space /
+    /// ArrowDown opens a non-modal `Popup` anchored below with a `ListView` of `items`.
+    /// `popup_id` is the open dropdown (runtime only — `describe` leaves it `None`).
+    ComboBox {
+        items: Vec<String>,
+        selected: Option<usize>,
+        placeholder: String,
+        font_size: f32,
+        text_color: Color,
+        placeholder_color: Color,
+        background: Color,
+        border: Color,
+        /// Highlight color for the open dropdown's selected row (`palette().selection`).
+        selection_color: Color,
+        on_change: Option<IndexCallback>,
+        mirror: Option<Readback<Option<usize>>>,
+        /// Open dropdown popup id, if any (runtime; describe leaves None).
+        popup_id: Option<WidgetId>,
+    },
 }
 
 impl WidgetKind {
@@ -328,7 +460,14 @@ impl WidgetKind {
             WidgetKind::Button { .. }
                 | WidgetKind::Slider { .. }
                 | WidgetKind::TextInput { .. }
+                | WidgetKind::TextArea { .. }
                 | WidgetKind::ListView { .. }
+                | WidgetKind::Checkbox { .. }
+                | WidgetKind::Radio { .. }
+                | WidgetKind::Toggle { .. }
+                | WidgetKind::SpinBox { .. }
+                | WidgetKind::NumericScrub { .. }
+                | WidgetKind::ComboBox { .. }
         )
     }
 }
@@ -386,6 +525,82 @@ pub fn close_hit_rect(bar: Rect) -> Rect {
     let drawn = close_button_rect(bar);
     let width = (drawn.width + CLOSE_HIT_SLOP).min(bar.width.max(0.0) * CLOSE_MAX_WIDTH_FRACTION).max(drawn.width);
     Rect { x: bar.x + bar.width - width, y: bar.y, width, height: bar.height }
+}
+
+/// Checkbox / radio indicator square (or the circle's bounding box), vertically centred in `row`.
+pub fn check_indicator_rect(row: Rect) -> Rect {
+    let size = CHECK_SIZE.min(row.height).min(row.width.max(0.0));
+    Rect {
+        x: row.x,
+        y: row.y + (row.height - size) * 0.5,
+        width: size,
+        height: size,
+    }
+}
+
+/// Right-hand column reserved for a `SpinBox`'s −/+ buttons.
+pub fn spin_buttons_rect(row: Rect) -> Rect {
+    let width = SPIN_BUTTON_WIDTH.min(row.width.max(0.0) * 0.5).min(row.height.max(SPIN_BUTTON_WIDTH));
+    Rect { x: row.x + row.width - width, y: row.y, width, height: row.height }
+}
+
+/// Top half of `spin_buttons_rect` (increment).
+pub fn spin_up_rect(row: Rect) -> Rect {
+    let buttons = spin_buttons_rect(row);
+    Rect { height: buttons.height * 0.5, ..buttons }
+}
+
+/// Bottom half of `spin_buttons_rect` (decrement).
+pub fn spin_down_rect(row: Rect) -> Rect {
+    let buttons = spin_buttons_rect(row);
+    let half = buttons.height * 0.5;
+    Rect { y: buttons.y + half, height: buttons.height - half, ..buttons }
+}
+
+/// Value area of a `SpinBox` (everything left of the button column).
+pub fn spin_value_rect(row: Rect) -> Rect {
+    let buttons = spin_buttons_rect(row);
+    Rect { width: (row.width - buttons.width).max(0.0), ..row }
+}
+
+/// Format a spin/scrub value for display (`decimals == 0` → integer).
+pub fn format_decimal(value: f32, decimals: u32) -> String {
+    if decimals == 0 {
+        format!("{}", value.round() as i64)
+    } else {
+        format!("{value:.prec$}", prec = decimals as usize)
+    }
+}
+
+/// Clamp `value` into `[a, b]` (either order). A NaN bound leaves `value` unchanged so callers
+/// never hit `f32::clamp`'s panic on a NaN or reversed range.
+pub fn clamp_range(value: f32, a: f32, b: f32) -> f32 {
+    let (lo, hi) = (a.min(b), a.max(b));
+    if lo.is_nan() || hi.is_nan() {
+        value
+    } else {
+        value.clamp(lo, hi)
+    }
+}
+
+/// Round `value` to `decimals` fractional digits (`0` → nearest integer).
+pub fn round_to_decimals(value: f32, decimals: u32) -> f32 {
+    if decimals == 0 {
+        value.round()
+    } else {
+        let scale = 10f32.powi(decimals as i32);
+        (value * scale).round() / scale
+    }
+}
+
+/// Smallest positive change `round_to_decimals` can represent at `decimals`
+/// (`0` → `1.0`, `1` → `0.1`, …).
+pub fn decimal_quantum(decimals: u32) -> f32 {
+    if decimals == 0 {
+        1.0
+    } else {
+        10f32.powi(-(decimals as i32))
+    }
 }
 
 /// The retained-mode widget tree: taffy owns layout (parent/child structure + style), this
@@ -623,6 +838,17 @@ impl WidgetTree {
                     self.scroll_content.insert(id, content);
                     *scroll = scroll.clamp(0.0, max_scroll(layout.size, content).1);
                 }
+                WidgetKind::TextArea { edit, font_size, scroll_y, .. } => {
+                    // Same height math as caret-follow scroll: line stack + vertical padding.
+                    let line_height = *font_size * LINE_HEIGHT_RATIO;
+                    let lines = edit.text().split('\n').count().max(1) as f32;
+                    let content = Size {
+                        width: layout.size.width,
+                        height: lines * line_height + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
+                    };
+                    self.scroll_content.insert(id, content);
+                    *scroll_y = scroll_y.clamp(0.0, max_scroll(layout.size, content).1);
+                }
                 _ => {}
             }
         }
@@ -747,6 +973,23 @@ impl WidgetTree {
         }
     }
 
+    /// Move `ListView` `id`'s highlighted row to `index` (clamped) and scroll it into view,
+    /// without `on_select` or the mirror: a combo dropdown's arrow keys, where selecting commits.
+    pub fn list_highlight(&mut self, id: WidgetId, index: usize) {
+        let view = self.absolute_rects.get(&id).map_or(0.0, |r| r.height);
+        let Some(WidgetKind::ListView { items, row_height, scroll, selected, .. }) = self.kinds.get_mut(&id) else {
+            return;
+        };
+        if items.is_empty() {
+            return;
+        }
+        let i = index.min(items.len() - 1);
+        *selected = Some(i);
+        let (top, bottom) = (i as f32 * *row_height, (i + 1) as f32 * *row_height);
+        *scroll = if view > 0.0 { scroll.min(top).max(bottom - view) } else { top };
+        self.mark_dirty();
+    }
+
     /// How many whole rows fit in `ListView` `id` (at least 1) — PageUp/PageDown's step.
     pub fn list_page_rows(&self, id: WidgetId) -> usize {
         let (Some(WidgetKind::ListView { row_height, .. }), Some(rect)) = (self.kind(id), self.absolute_rect(id)) else {
@@ -755,11 +998,13 @@ impl WidgetTree {
         ((rect.height / row_height).floor() as usize).max(1)
     }
 
-    /// A scrollable widget's current offset (`ScrollArea`, or a `ListView`'s vertical scroll).
+    /// A scrollable widget's current offset (`ScrollArea`, a `ListView`'s vertical scroll, or a
+    /// `TextArea`'s `scroll_y`).
     pub fn scroll_offset(&self, id: WidgetId) -> Option<(f32, f32)> {
         match self.kind(id)? {
             WidgetKind::ScrollArea { offset, .. } => Some(*offset),
             WidgetKind::ListView { scroll, .. } => Some((0.0, *scroll)),
+            WidgetKind::TextArea { scroll_y, .. } => Some((0.0, *scroll_y)),
             _ => None,
         }
     }
@@ -774,6 +1019,7 @@ impl WidgetTree {
         match self.kinds.get_mut(&id) {
             Some(WidgetKind::ScrollArea { offset, .. }) => *offset = target,
             Some(WidgetKind::ListView { scroll, .. }) => *scroll = target.1,
+            Some(WidgetKind::TextArea { scroll_y, .. }) => *scroll_y = target.1,
             _ => return false,
         }
         self.mark_dirty();
@@ -781,8 +1027,9 @@ impl WidgetTree {
     }
 
     /// Scroll by `(dx, dy)` (layout units; positive reveals content further right/down) the
-    /// innermost `ScrollArea` under `(x, y)` that can still move that way; one at its limit
-    /// passes the scroll out to the one around it. Returns whether anything scrolled.
+    /// innermost scrollable under `(x, y)` (`ScrollArea`, `ListView`, `TextArea`) that can still
+    /// move that way; one at its limit passes the scroll out to the one around it. Returns
+    /// whether anything scrolled.
     pub fn scroll_at(&mut self, x: f32, y: f32, dx: f32, dy: f32) -> bool {
         let areas: Vec<WidgetId> =
             self.walk().filter(|&id| self.scroll_offset(id).is_some() && self.visible_at(id, x, y)).collect();
@@ -1233,7 +1480,7 @@ impl Default for WidgetTree {
 /// this only has to be good enough that layout doesn't look broken before that happens. Good
 /// enough for M4; swap for measuring through `fastgui-chrome`'s font system if/when this
 /// approximation visibly matters (e.g. non-Latin scripts, tight-fitting layouts).
-const LINE_HEIGHT_RATIO: f32 = 1.3;
+pub const LINE_HEIGHT_RATIO: f32 = 1.3;
 
 fn measure_text(text: &str, font_size: f32) -> Size<f32> {
     const AVG_ADVANCE_RATIO: f32 = 0.55;
@@ -1276,6 +1523,33 @@ fn measure_leaf<'m>(
             width: 160.0,
             height: font_size * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
         },
+        Some(WidgetKind::TextArea { font_size, .. }) => Size {
+            // Default ~4 lines tall; soft wrap is not modeled — height is for hard newlines.
+            width: 160.0,
+            height: font_size * LINE_HEIGHT_RATIO * 4.0 + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
+        },
+        Some(WidgetKind::Checkbox { label, font_size, .. } | WidgetKind::Radio { label, font_size, .. }) => {
+            // Real shaping like `Label`: the 0.55×size estimate cut wide labels short.
+            let text_size = text_size(label, *font_size);
+            Size {
+                width: CHECK_SIZE + CHECK_LABEL_GAP + text_size.width,
+                height: CHECK_SIZE.max(text_size.height),
+            }
+        }
+        Some(WidgetKind::Toggle { .. }) => Size { width: TOGGLE_WIDTH, height: TOGGLE_HEIGHT },
+        Some(WidgetKind::SpinBox { font_size, .. }) => Size {
+            width: 100.0,
+            height: font_size * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
+        },
+        Some(WidgetKind::NumericScrub { font_size, .. }) => Size {
+            width: 80.0,
+            height: font_size * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
+        },
+        Some(WidgetKind::ProgressBar { .. }) => Size { width: 120.0, height: PROGRESS_HEIGHT },
+        Some(WidgetKind::ComboBox { font_size, .. }) => Size {
+            width: 160.0,
+            height: font_size * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING,
+        },
         Some(
             WidgetKind::Container { .. }
             | WidgetKind::Slider { .. }
@@ -1284,7 +1558,8 @@ fn measure_leaf<'m>(
             | WidgetKind::PanelTitleBar { .. }
             | WidgetKind::ScrollArea { .. }
             | WidgetKind::Popup { .. }
-            | WidgetKind::Viewport { .. },
+            | WidgetKind::Viewport { .. }
+            | WidgetKind::Image { .. },
         )
         | None => Size::ZERO,
         Some(WidgetKind::ListView { row_height, items, .. }) => {
@@ -2131,6 +2406,42 @@ mod tests {
     }
 
     #[test]
+    fn measured_layout_sizes_checkbox_and_radio_labels_by_real_text_width() {
+        struct Wide;
+        impl TextMeasure for Wide {
+            fn caret_x(&mut self, text: &str, _: f32, index: usize) -> f32 {
+                text[..index].chars().count() as f32 * 20.0
+            }
+            fn index_at(&mut self, _: &str, _: f32, _: f32) -> usize {
+                0
+            }
+        }
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let row = tree.new_node(
+            Style { flex_direction: FlexDirection::Row, align_items: Some(AlignItems::FLEX_START), ..Default::default() },
+            WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+        );
+        tree.add_child(root, row);
+        let check = tree.new_node(
+            Style::default(),
+            WidgetKind::Checkbox {
+                checked: false,
+                label: "Modal".into(),
+                font_size: 14.0,
+                text_color: Color::TRANSPARENT,
+                box_color: Color::TRANSPARENT,
+                check_color: Color::TRANSPARENT,
+                on_change: None,
+            },
+        );
+        tree.add_child(row, check);
+        tree.compute_layout_measured(600.0, 200.0, &mut Wide);
+        let width = tree.absolute_rect(check).unwrap().width;
+        assert_eq!(width, CHECK_SIZE + CHECK_LABEL_GAP + 100.0, "label measured 5 × 20, not the 5 × 7.7 estimate");
+    }
+
+    #[test]
     fn measured_layout_sizes_labels_by_real_text_width() {
         /// "Shaping" where every character is 20 wide — far wider than the 0.55 × 14 = 7.7
         /// the estimate assumes — so the result shows which one layout used.
@@ -2190,5 +2501,147 @@ mod tests {
         let WidgetKind::Viewport { frames, .. } = tree.kind(id).unwrap() else { panic!("kind") };
         let frame = frames.take_latest().expect("frame");
         assert_eq!(frame.data, vec![1, 2, 3, 4]);
+    }
+
+    /// Intrinsic measure without the root column stretching the cross axis.
+    fn measure_style() -> Style {
+        Style { align_self: Some(AlignSelf::START), ..Default::default() }
+    }
+
+    #[test]
+    fn checkbox_measure_includes_box_and_label() {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let id = tree.new_node(
+            measure_style(),
+            WidgetKind::Checkbox {
+                checked: false,
+                label: "On".into(),
+                font_size: 14.0,
+                text_color: Color::TRANSPARENT,
+                box_color: Color::TRANSPARENT,
+                check_color: Color::TRANSPARENT,
+                on_change: None,
+            },
+        );
+        tree.add_child(root, id);
+        tree.compute_layout(400.0, 200.0);
+        let rect = tree.absolute_rect(id).expect("laid out");
+        let text = measure_text("On", 14.0);
+        // taffy may round final layout sizes; measure only has to land nearby.
+        assert!((rect.width - (CHECK_SIZE + CHECK_LABEL_GAP + text.width)).abs() < 1.0);
+        assert!((rect.height - CHECK_SIZE.max(text.height)).abs() < 1.0);
+        assert!(tree.kind(id).unwrap().is_focusable());
+    }
+
+    #[test]
+    fn toggle_and_spinbox_intrinsic_sizes() {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let toggle = tree.new_node(
+            measure_style(),
+            WidgetKind::Toggle {
+                checked: false,
+                track_off: Color::TRANSPARENT,
+                track_on: Color::TRANSPARENT,
+                thumb_color: Color::TRANSPARENT,
+                on_change: None,
+            },
+        );
+        let spin = tree.new_node(
+            measure_style(),
+            WidgetKind::SpinBox {
+                value: 0.0,
+                min: 0.0,
+                max: 10.0,
+                step: 1.0,
+                decimals: 0,
+                font_size: 14.0,
+                text_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                button_color: Color::TRANSPARENT,
+                on_change: None,
+                mirror: None,
+            },
+        );
+        tree.add_child(root, toggle);
+        tree.add_child(root, spin);
+        tree.compute_layout(400.0, 200.0);
+        let t = tree.absolute_rect(toggle).expect("toggle");
+        assert!((t.width - TOGGLE_WIDTH).abs() < 1.0);
+        assert!((t.height - TOGGLE_HEIGHT).abs() < 1.0);
+        let s = tree.absolute_rect(spin).expect("spin");
+        assert!((s.width - 100.0).abs() < 1.0);
+        let expected_h = 14.0 * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING;
+        assert!((s.height - expected_h).abs() < 1.0);
+    }
+
+    #[test]
+    fn combo_box_measure_and_focusable() {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let id = tree.new_node(
+            measure_style(),
+            WidgetKind::ComboBox {
+                items: vec!["a".into(), "b".into()],
+                selected: None,
+                placeholder: "Pick…".into(),
+                font_size: 14.0,
+                text_color: Color::TRANSPARENT,
+                placeholder_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                border: Color::TRANSPARENT,
+                selection_color: Color::TRANSPARENT,
+                on_change: None,
+                mirror: None,
+                popup_id: None,
+            },
+        );
+        tree.add_child(root, id);
+        tree.compute_layout(400.0, 200.0);
+        let rect = tree.absolute_rect(id).expect("laid out");
+        assert!((rect.width - 160.0).abs() < 1.0);
+        let expected_h = 14.0 * LINE_HEIGHT_RATIO + 2.0 * TEXT_INPUT_VERTICAL_PADDING;
+        assert!((rect.height - expected_h).abs() < 1.0);
+        assert!(tree.kind(id).unwrap().is_focusable());
+    }
+
+    #[test]
+    fn text_area_wheels_and_shows_a_scrollbar_when_it_overflows() {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let lines = (0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let id = tree.new_node(
+            Style {
+                size: Size { width: Dimension::length(200.0), height: Dimension::length(80.0) },
+                ..Default::default()
+            },
+            WidgetKind::TextArea {
+                edit: TextEdit::new_multiline(&lines),
+                placeholder: String::new(),
+                font_size: 14.0,
+                text_color: Color::TRANSPARENT,
+                placeholder_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                selection_color: Color::TRANSPARENT,
+                scroll_x: 0.0,
+                scroll_y: 0.0,
+                preedit: None,
+                on_change: None,
+                on_submit: None,
+                mirror: None,
+            },
+        );
+        tree.add_child(root, id);
+        tree.compute_layout(400.0, 300.0);
+        let max = tree.scroll_extent(id).expect("text area scrolls").1;
+        assert!(max > 0.0, "twenty lines in an 80-tall field must overflow");
+        assert_eq!(tree.scroll_offset(id), Some((0.0, 0.0)));
+        assert!(tree.scrollbar_thumbs(id).0.is_some(), "overflow draws a vertical thumb");
+        assert!(tree.scroll_at(10.0, 10.0, 0.0, 40.0));
+        let Some((_, y)) = tree.scroll_offset(id) else { panic!() };
+        assert!((y - 40.0).abs() < 0.5, "wheel moved scroll_y to {y}");
+        assert!(tree.set_scroll_offset(id, 0.0, 1e6));
+        assert_eq!(tree.scroll_offset(id), Some((0.0, max)));
     }
 }

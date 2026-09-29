@@ -15,6 +15,7 @@ use crate::cloak::set_cloaked;
 use crate::command::{Command, RenderThreadHandles};
 use crate::constants::*;
 use crate::coords::{remap_rect, scale_rect};
+use crate::forms::{self, PressResult};
 use crate::ghost::build_tear_ghost_tree;
 use crate::keyboard::handle_key;
 use crate::text_input::{self, KeyPress, SystemClipboard};
@@ -115,6 +116,8 @@ struct FloatingWindow<B: SurfaceBackend> {
     dragging_slider: Option<WidgetId>,
     dragging_splitter: Option<WidgetId>,
     dragging_text: Option<WidgetId>,
+    /// A `NumericScrub` / `SpinBox` value area being dragged: `(id, press x, value at press)`.
+    dragging_scrub: Option<(WidgetId, f32, f32)>,
     dragging_scrollbar: Option<ScrollbarDrag>,
     pressed_button: Option<WidgetId>,
     last_click: Option<(Instant, (f32, f32))>,
@@ -159,8 +162,11 @@ struct App<B: SurfaceBackend> {
     dragging_splitter: Option<WidgetId>,
     /// A `TextInput` whose selection follows the cursor until mouse-up.
     dragging_text: Option<WidgetId>,
+    /// `(widget, press x, value at press)` while scrubbing a `NumericScrub` / `SpinBox` value.
+    dragging_scrub: Option<(WidgetId, f32, f32)>,
     dragging_scrollbar: Option<ScrollbarDrag>,
-    /// A `Button` pressed and not yet released; it clicks if released over itself.
+    /// A `Button` / `Checkbox` / `Radio` / `Toggle` pressed and not yet released; it activates
+    /// if released over itself.
     pressed_button: Option<WidgetId>,
     /// Time and place of the last press on a `TextInput`, for double-click detection.
     last_click: Option<(Instant, (f32, f32))>,
@@ -409,6 +415,7 @@ impl<B: SurfaceBackend> App<B> {
             dragging_slider: None,
             dragging_splitter: None,
             dragging_text: None,
+            dragging_scrub: None,
             dragging_scrollbar: None,
             pressed_button: None,
             last_click: None,
@@ -453,12 +460,14 @@ impl<B: SurfaceBackend> App<B> {
         let mut live_ids = Vec::new();
         let mut uploads = Vec::new();
         for id in self.widget_tree.walk() {
-            let Some(WidgetKind::Viewport { viewport_id, frames }) = self.widget_tree.kind(id) else {
-                continue;
+            let (layer_id, frames) = match self.widget_tree.kind(id) {
+                Some(WidgetKind::Viewport { viewport_id, frames }) => (*viewport_id, frames),
+                Some(WidgetKind::Image { image_id, frames }) => (*image_id, frames),
+                _ => continue,
             };
-            live_ids.push(*viewport_id);
+            live_ids.push(layer_id);
             if let Some(frame) = frames.take_latest() {
-                uploads.push((*viewport_id, frame));
+                uploads.push((layer_id, frame));
             }
         }
         if let Some(renderer) = &mut self.renderer {
@@ -499,12 +508,14 @@ impl<B: SurfaceBackend> App<B> {
         let mut live_ids = Vec::new();
         let mut uploads = Vec::new();
         for id in floater.widget_tree.walk() {
-            let Some(WidgetKind::Viewport { viewport_id, frames }) = floater.widget_tree.kind(id) else {
-                continue;
+            let (layer_id, frames) = match floater.widget_tree.kind(id) {
+                Some(WidgetKind::Viewport { viewport_id, frames }) => (*viewport_id, frames),
+                Some(WidgetKind::Image { image_id, frames }) => (*image_id, frames),
+                _ => continue,
             };
-            live_ids.push(*viewport_id);
+            live_ids.push(layer_id);
             if let Some(frame) = frames.take_latest() {
-                uploads.push((*viewport_id, frame));
+                uploads.push((layer_id, frame));
             }
         }
         for (viewport_id, frame) in uploads {
@@ -524,14 +535,16 @@ impl<B: SurfaceBackend> App<B> {
         // overlaps (its chrome placeholder shows instead) so the highlight is visible.
         let preview = self.hover_region.map(|(_, rect, zone)| zone.preview_rect(rect));
         for id in self.widget_tree.walk() {
-            let Some(WidgetKind::Viewport { viewport_id, .. }) = self.widget_tree.kind(id) else {
-                continue;
+            let layer_id = match self.widget_tree.kind(id) {
+                Some(WidgetKind::Viewport { viewport_id, .. }) => *viewport_id,
+                Some(WidgetKind::Image { image_id, .. }) => *image_id,
+                _ => continue,
             };
             let Some(rect) = self.widget_tree.absolute_rect(id) else { continue };
             if preview.is_some_and(|p| p.intersects(&rect)) {
                 continue;
             }
-            if let Some(draw) = viewport_draw(&self.widget_tree, id, *viewport_id, rect, self.scale_factor) {
+            if let Some(draw) = viewport_draw(&self.widget_tree, id, layer_id, rect, self.scale_factor) {
                 draws.push(draw);
             }
         }
@@ -544,11 +557,13 @@ impl<B: SurfaceBackend> App<B> {
             return draws;
         }
         for id in floater.widget_tree.walk() {
-            let Some(WidgetKind::Viewport { viewport_id, .. }) = floater.widget_tree.kind(id) else {
-                continue;
+            let layer_id = match floater.widget_tree.kind(id) {
+                Some(WidgetKind::Viewport { viewport_id, .. }) => *viewport_id,
+                Some(WidgetKind::Image { image_id, .. }) => *image_id,
+                _ => continue,
             };
             let Some(rect) = floater.widget_tree.absolute_rect(id) else { continue };
-            if let Some(draw) = viewport_draw(&floater.widget_tree, id, *viewport_id, rect, floater.scale_factor) {
+            if let Some(draw) = viewport_draw(&floater.widget_tree, id, layer_id, rect, floater.scale_factor) {
                 draws.push(draw);
             }
         }
@@ -557,7 +572,9 @@ impl<B: SurfaceBackend> App<B> {
 
     fn handle_mouse_press(&mut self) {
         // An outside click closes the open popup (or hits a modal one's backdrop) and stops here.
-        if self.widget_tree.popup_press(self.cursor.0, self.cursor.1) == PopupPress::Consumed {
+        if forms::with_tree(&mut self.widget_tree, |tree| {
+            tree.popup_press(self.cursor.0, self.cursor.1) == PopupPress::Consumed
+        }) {
             return;
         }
         if let Some(drag) = grab_scrollbar(&self.widget_tree, self.cursor) {
@@ -577,9 +594,12 @@ impl<B: SurfaceBackend> App<B> {
         let Some(id) = hit else { return };
         let Some(kind) = self.widget_tree.kind(id) else { return };
         match kind {
-            // Clicks on release over the same button (see `release_button`), so pressing and
+            // Activate on release over the same widget (see `release_button`), so pressing and
             // dragging off cancels, as in every native toolkit.
-            WidgetKind::Button { .. } => self.pressed_button = Some(id),
+            WidgetKind::Button { .. }
+            | WidgetKind::Checkbox { .. }
+            | WidgetKind::Radio { .. }
+            | WidgetKind::Toggle { .. } => self.pressed_button = Some(id),
             WidgetKind::Slider { .. } => {
                 self.dragging_slider = Some(id);
                 self.update_dragged_slider();
@@ -589,13 +609,35 @@ impl<B: SurfaceBackend> App<B> {
             }
             WidgetKind::ListView { .. } => {
                 let double = is_double_click(&mut self.last_click, self.cursor);
-                list_press(&mut self.widget_tree, id, self.cursor.1, double);
+                forms::with_tree(&mut self.widget_tree, |tree| {
+                    list_press(tree, id, self.cursor.1, double);
+                });
             }
-            WidgetKind::TextInput { .. } => {
+            WidgetKind::TextInput { .. } | WidgetKind::TextArea { .. } => {
                 let double = is_double_click(&mut self.last_click, self.cursor);
                 let extend = self.modifiers.shift_key();
-                text_input::handle_press(&mut self.widget_tree, id, self.cursor.0, extend, double, &mut self.chrome);
+                text_input::handle_press(
+                    &mut self.widget_tree,
+                    id,
+                    self.cursor.0,
+                    self.cursor.1,
+                    extend,
+                    double,
+                    &mut self.chrome,
+                );
                 self.dragging_text = Some(id);
+            }
+            WidgetKind::ComboBox { .. } => {
+                forms::with_tree(&mut self.widget_tree, |tree| forms::open_combo(tree, id));
+            }
+            WidgetKind::SpinBox { .. } | WidgetKind::NumericScrub { .. } => {
+                match forms::handle_press(&mut self.widget_tree, id, self.cursor.0, self.cursor.1) {
+                    PressResult::StartScrub => {
+                        let start = forms::numeric_value(&self.widget_tree, id).unwrap_or(0.0);
+                        self.dragging_scrub = Some((id, self.cursor.0, start));
+                    }
+                    PressResult::Handled(_) | PressResult::Ignored => {}
+                }
             }
             WidgetKind::TabBar { panel_ids, content_ids, titles, on_close, .. } => {
                 if let Some(index) = self.tab_bar_clicked_index(id) {
@@ -657,6 +699,8 @@ impl<B: SurfaceBackend> App<B> {
             | WidgetKind::Label { .. }
             | WidgetKind::ScrollArea { .. }
             | WidgetKind::Popup { .. }
+            | WidgetKind::ProgressBar { .. }
+            | WidgetKind::Image { .. }
             | WidgetKind::Viewport { .. } => {}
         }
     }
@@ -683,7 +727,9 @@ impl<B: SurfaceBackend> App<B> {
             return;
         }
         if let Some(floater) = self.floating.get_mut(&window_id) {
-            if floater.widget_tree.popup_press(cursor.0, cursor.1) == PopupPress::Consumed {
+            if forms::with_tree(&mut floater.widget_tree, |tree| {
+                tree.popup_press(cursor.0, cursor.1) == PopupPress::Consumed
+            }) {
                 return;
             }
         }
@@ -707,7 +753,10 @@ impl<B: SurfaceBackend> App<B> {
         let Some(id) = hit else { return };
         let Some(kind) = floater.widget_tree.kind(id) else { return };
         match kind {
-            WidgetKind::Button { .. } => {
+            WidgetKind::Button { .. }
+            | WidgetKind::Checkbox { .. }
+            | WidgetKind::Radio { .. }
+            | WidgetKind::Toggle { .. } => {
                 if let Some(floater) = self.floating.get_mut(&window_id) {
                     floater.pressed_button = Some(id);
                 }
@@ -726,15 +775,41 @@ impl<B: SurfaceBackend> App<B> {
             WidgetKind::ListView { .. } => {
                 if let Some(floater) = self.floating.get_mut(&window_id) {
                     let double = is_double_click(&mut floater.last_click, cursor);
-                    list_press(&mut floater.widget_tree, id, cursor.1, double);
+                    forms::with_tree(&mut floater.widget_tree, |tree| {
+                        list_press(tree, id, cursor.1, double);
+                    });
                 }
             }
-            WidgetKind::TextInput { .. } => {
+            WidgetKind::TextInput { .. } | WidgetKind::TextArea { .. } => {
                 let extend = self.modifiers.shift_key();
                 if let Some(floater) = self.floating.get_mut(&window_id) {
                     let double = is_double_click(&mut floater.last_click, cursor);
-                    text_input::handle_press(&mut floater.widget_tree, id, cursor.0, extend, double, &mut floater.chrome);
+                    text_input::handle_press(
+                        &mut floater.widget_tree,
+                        id,
+                        cursor.0,
+                        cursor.1,
+                        extend,
+                        double,
+                        &mut floater.chrome,
+                    );
                     floater.dragging_text = Some(id);
+                }
+            }
+            WidgetKind::ComboBox { .. } => {
+                if let Some(floater) = self.floating.get_mut(&window_id) {
+                    forms::with_tree(&mut floater.widget_tree, |tree| forms::open_combo(tree, id));
+                }
+            }
+            WidgetKind::SpinBox { .. } | WidgetKind::NumericScrub { .. } => {
+                if let Some(floater) = self.floating.get_mut(&window_id) {
+                    match forms::handle_press(&mut floater.widget_tree, id, cursor.0, cursor.1) {
+                        PressResult::StartScrub => {
+                            let start = forms::numeric_value(&floater.widget_tree, id).unwrap_or(0.0);
+                            floater.dragging_scrub = Some((id, cursor.0, start));
+                        }
+                        PressResult::Handled(_) | PressResult::Ignored => {}
+                    }
                 }
             }
             WidgetKind::TabBar { panel_ids, titles, on_close, .. } => {
@@ -790,6 +865,8 @@ impl<B: SurfaceBackend> App<B> {
             | WidgetKind::Label { .. }
             | WidgetKind::ScrollArea { .. }
             | WidgetKind::Popup { .. }
+            | WidgetKind::ProgressBar { .. }
+            | WidgetKind::Image { .. }
             | WidgetKind::Viewport { .. } => {}
         }
     }
@@ -1709,6 +1786,7 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                     || self.dragging_splitter.is_some()
                     || self.dragging_panel_title.is_some()
                     || self.dragging_text.is_some()
+                    || self.dragging_scrub.is_some()
                     || self.dragging_scrollbar.is_some();
                 if self.dragging_slider.is_some() {
                     self.update_dragged_slider();
@@ -1717,7 +1795,17 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                     drag_scrollbar(&mut self.widget_tree, drag, self.cursor);
                 }
                 if let Some(id) = self.dragging_text {
-                    text_input::handle_drag(&mut self.widget_tree, id, self.cursor.0, &mut self.chrome);
+                    text_input::handle_drag(
+                        &mut self.widget_tree,
+                        id,
+                        self.cursor.0,
+                        self.cursor.1,
+                        &mut self.chrome,
+                    );
+                }
+                if let Some((id, start_x, start_value)) = self.dragging_scrub {
+                    let dx = self.cursor.0 - start_x;
+                    forms::scrub_from(&mut self.widget_tree, id, start_value, dx);
                 }
                 if self.dragging_splitter.is_some() {
                     self.update_dragged_splitter();
@@ -1737,25 +1825,44 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                 button: MouseButton::Left,
                 ..
             } => match state {
-                ElementState::Pressed => self.handle_mouse_press(),
+                ElementState::Pressed => {
+                    self.handle_mouse_press();
+                    // Focus changes and form-control toggles mark the tree dirty; redraw so
+                    // checkboxes / radios / spin buttons update without waiting on a wake.
+                    if self.widget_tree.is_dirty() {
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
+                }
                 ElementState::Released => {
                     let was_dragging = self.dragging_slider.is_some()
                         || self.dragging_splitter.is_some()
                         || self.dragging_panel_title.is_some()
                         || self.dragging_text.is_some()
+                        || self.dragging_scrub.is_some()
                         || self.dragging_scrollbar.is_some();
                     self.dragging_slider = None;
                     self.dragging_splitter = None;
                     self.dragging_text = None;
+                    self.dragging_scrub = None;
                     self.dragging_scrollbar = None;
-                    release_button(&self.widget_tree, self.pressed_button.take(), self.cursor);
+                    let pressed = self.pressed_button.take();
+                    let cursor = self.cursor;
+                    forms::with_tree(&mut self.widget_tree, |tree| {
+                        release_button(tree, pressed, cursor);
+                    });
                     // Floater OS-window drag is owned by the floater's mouse-up path.
                     if self.dragging_from_floating.is_none() {
                         self.handle_panel_drop();
                     }
                     self.update_cursor_icon();
-                    if was_dragging {
-                        self.render_now(event_loop);
+                    if was_dragging || self.widget_tree.is_dirty() {
+                        if was_dragging {
+                            self.render_now(event_loop);
+                        } else if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
                     }
                 }
             },
@@ -1863,11 +1970,22 @@ impl<B: SurfaceBackend> App<B> {
                     f.dragging_slider.is_some()
                         || f.dragging_splitter.is_some()
                         || f.dragging_text.is_some()
+                        || f.dragging_scrub.is_some()
                         || f.dragging_scrollbar.is_some()
                 });
                 if let Some(floater) = self.floating.get_mut(&window_id) {
                     if let Some(id) = floater.dragging_text {
-                        text_input::handle_drag(&mut floater.widget_tree, id, floater.cursor.0, &mut floater.chrome);
+                        text_input::handle_drag(
+                            &mut floater.widget_tree,
+                            id,
+                            floater.cursor.0,
+                            floater.cursor.1,
+                            &mut floater.chrome,
+                        );
+                    }
+                    if let Some((id, start_x, start_value)) = floater.dragging_scrub {
+                        let dx = floater.cursor.0 - start_x;
+                        forms::scrub_from(&mut floater.widget_tree, id, start_value, dx);
                     }
                     if let Some(drag) = floater.dragging_scrollbar {
                         drag_scrollbar(&mut floater.widget_tree, drag, floater.cursor);
@@ -1900,12 +2018,20 @@ impl<B: SurfaceBackend> App<B> {
                 button: MouseButton::Left,
                 ..
             } => match state {
-                ElementState::Pressed => self.handle_floating_mouse_press(window_id),
+                ElementState::Pressed => {
+                    self.handle_floating_mouse_press(window_id);
+                    if self.floating.get(&window_id).is_some_and(|f| f.widget_tree.is_dirty()) {
+                        if let Some(floater) = self.floating.get(&window_id) {
+                            floater.window.request_redraw();
+                        }
+                    }
+                }
                 ElementState::Released => {
                     let was_dragging = self.floating.get(&window_id).is_some_and(|f| {
                         f.dragging_slider.is_some()
                             || f.dragging_splitter.is_some()
                             || f.dragging_text.is_some()
+                            || f.dragging_scrub.is_some()
                             || f.dragging_scrollbar.is_some()
                     }) || self.dragging_floating_panel.is_some_and(|(id, _)| id == window_id)
                         || self.dragging_floating_resize.as_ref().is_some_and(|d| d.window_id == window_id)
@@ -1914,15 +2040,26 @@ impl<B: SurfaceBackend> App<B> {
                         floater.dragging_slider = None;
                         floater.dragging_splitter = None;
                         floater.dragging_text = None;
+                        floater.dragging_scrub = None;
                         floater.dragging_scrollbar = None;
-                        release_button(&floater.widget_tree, floater.pressed_button.take(), floater.cursor);
+                        let pressed = floater.pressed_button.take();
+                        let cursor = floater.cursor;
+                        forms::with_tree(&mut floater.widget_tree, |tree| {
+                            release_button(tree, pressed, cursor);
+                        });
                     }
                     self.dragging_floating_panel = None;
                     self.dragging_floating_resize = None;
                     self.handle_panel_drop();
                     self.update_floating_cursor_icon(window_id);
+                    let floater_dirty =
+                        self.floating.get(&window_id).is_some_and(|f| f.widget_tree.is_dirty());
                     if was_dragging {
                         self.render_now(event_loop);
+                    } else if floater_dirty {
+                        if let Some(floater) = self.floating.get(&window_id) {
+                            floater.window.request_redraw();
+                        }
                     }
                 }
             },
@@ -2000,21 +2137,26 @@ fn drag_scrollbar(tree: &mut WidgetTree, drag: ScrollbarDrag, cursor: (f32, f32)
 }
 
 fn is_text_input(tree: &WidgetTree, id: WidgetId) -> bool {
-    matches!(tree.kind(id), Some(WidgetKind::TextInput { .. }))
+    matches!(tree.kind(id), Some(WidgetKind::TextInput { .. } | WidgetKind::TextArea { .. }))
 }
 
 fn key_press(event: &KeyEvent, modifiers: ModifiersState) -> KeyPress<'_> {
     KeyPress { key: &event.logical_key, text: event.text.as_deref(), modifiers }
 }
 
-/// Mouse-up after pressing `pressed` (a `Button`): click it if the cursor is still over it.
-fn release_button(tree: &WidgetTree, pressed: Option<WidgetId>, cursor: (f32, f32)) {
+/// Mouse-up after pressing `pressed`: activate it if the cursor is still over it.
+/// Buttons fire `on_click`; checkboxes / radios / toggles run `forms::handle_press`.
+fn release_button(tree: &mut WidgetTree, pressed: Option<WidgetId>, cursor: (f32, f32)) {
     let Some(id) = pressed else { return };
     if tree.hit_test(cursor.0, cursor.1) != Some(id) {
         return;
     }
-    if let Some(WidgetKind::Button { on_click: Some(callback), .. }) = tree.kind(id) {
-        callback.clone()();
+    match tree.kind(id) {
+        Some(WidgetKind::Button { on_click: Some(callback), .. }) => callback.clone()(),
+        Some(WidgetKind::Checkbox { .. } | WidgetKind::Radio { .. } | WidgetKind::Toggle { .. }) => {
+            let _ = forms::handle_press(tree, id, cursor.0, cursor.1);
+        }
+        _ => {}
     }
 }
 
@@ -2090,6 +2232,7 @@ pub fn run<B: SurfaceBackend>(
         dragging_slider: None,
         dragging_splitter: None,
         dragging_text: None,
+        dragging_scrub: None,
         dragging_scrollbar: None,
         pressed_button: None,
         last_click: None,
@@ -2152,11 +2295,11 @@ mod tests {
         );
         tree.add_child(root, button);
         tree.compute_layout(200.0, 100.0);
-        release_button(&tree, Some(button), (40.0, 15.0));
+        release_button(&mut tree, Some(button), (40.0, 15.0));
         assert_eq!(clicks.load(Ordering::SeqCst), 1, "released over the button: click");
-        release_button(&tree, Some(button), (150.0, 80.0));
+        release_button(&mut tree, Some(button), (150.0, 80.0));
         assert_eq!(clicks.load(Ordering::SeqCst), 1, "dragged off before releasing: no click");
-        release_button(&tree, None, (40.0, 15.0));
+        release_button(&mut tree, None, (40.0, 15.0));
         assert_eq!(clicks.load(Ordering::SeqCst), 1, "nothing was pressed");
     }
 }

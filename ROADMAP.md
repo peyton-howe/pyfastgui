@@ -1243,8 +1243,9 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
    clip rects needed). Demo: `text_input_demo.py`. Unit-tested and render-checked to PNG; not yet
    driven interactively. **Layout now measures label/button text with real shaping**
    (`WidgetTree::compute_layout_measured` via chrome's `TextMeasure`, 2026-09-28 — labels had
-   been losing their last word to the 0.55×size estimate). **Still open:** text wrapping / multi-line `TextEdit`, caret blink, RTL/bidi caret placement (stops
-   are per glyph cluster, correct for LTR only).
+   been losing their last word to the 0.55×size estimate). Hard-newline multi-line `TextEdit` /
+   `TextArea` is done (see 7B). **Still open:** soft-wrap for multi-line fields, caret blink,
+   RTL/bidi caret placement (stops are per glyph cluster, correct for LTR only).
 3. **Scroll container + clipping** — needs per-quad clip rects in the GPU quad pipeline (Vulkan
    and Metal). The GPU chrome path already makes scroll cheap (~128 KiB/frame upload in
    `chrome_bench`'s table scene vs 24 MiB on the CPU path). **Done (2026-09-27):** `WidgetKind::ScrollArea` /
@@ -1327,14 +1328,24 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 
 ### 7B. Tier 1 — core form controls
 
-- Single-line and multi-line text input (`QLineEdit` / `QTextEdit`)
-- Checkbox, radio group, toggle switch
-- Spin box (int/float) and a drag-to-scrub numeric field
-- Combo box / dropdown (needs 7A.4)
-- Progress bar
-- Scroll area (needs 7A.3)
-- Grid layout — `taffy` already supports CSS Grid, so this is mostly bindings
-- Image widget
+- Single-line and multi-line text input (`QLineEdit` / `QTextEdit`) — **Done (2026-09-28):**
+  single-line (see 7A.2); multi-line `WidgetKind::TextArea` / `fg.TextArea` with hard
+  newlines, Up/Down by line, Home/End per line, caret-follow + mouse-wheel/`ListView`-style
+  overlay scrollbar when content overflows, Cmd/Ctrl+Enter submit. **Still open:** soft wrap.
+- Checkbox, radio group, toggle switch — **Done (2026-09-27):** `Checkbox` / `Radio` (shared
+  `group` id for exclusivity) / `Toggle`; click + Space/Enter; focusable.
+- Spin box (int/float) and a drag-to-scrub numeric field — **Done (2026-09-27):** `SpinBox`
+  (± buttons, arrows/Page/Home/End) and `NumericScrub` (horizontal drag); `value` mirror
+  getters; scrub also works on a SpinBox's value area.
+- Combo box / dropdown — **Done (2026-09-28):** `ComboBox` closed field + chevron; click /
+  Space / ArrowDown opens a non-modal `Popup` with a `ListView`; pick/activate sets selection,
+  fires `on_change`, closes via existing dismiss. Demo: `form_controls_demo.py`.
+- Progress bar — **Done (2026-09-27):** `ProgressBar` (display-only track + fill).
+- Scroll area — **Done** (see 7A.3).
+- Grid layout — **Done (2026-09-27):** `Grid(children, columns=N)` via taffy CSS Grid
+  (`evenly_sized_tracks`).
+- Image widget — **Done (2026-09-27):** `Image` + `set_image` (same GPU layer path as
+  `Viewport`). Demo: `form_controls_demo.py`.
 
 ### 7C. Tier 2 — application structure
 
@@ -1371,6 +1382,9 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
   skipping this is where fastgui would fall short of it.
 - **HiDPI** scale factor applied to chrome.
 - **Drag-and-drop** between widgets and from the OS, generalizing the docking drag code.
+- **Disabled and hover states** for every control — a shared follow-up after 7B. Touches
+  every `WidgetKind`, input handling (skip presses / focus), and theming (`Theme` tokens for
+  disabled/hover fills). Do not bolt onto individual 7B widgets one at a time.
 
 ### Suggested order
 

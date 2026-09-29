@@ -13,9 +13,18 @@ const SLIDER_PAGE: f32 = 0.1;
 
 /// Apply one key press to `tree`: Tab / Shift+Tab move focus, Escape clears it, and the
 /// focused widget handles the rest (Enter/Space click a `Button`; arrows, PageUp/PageDown and
-/// Home/End move a `Slider`; a `TextInput` edits — see `text_input::handle_key`). Returns
+/// Home/End move a `Slider`; a `TextInput` / `TextArea` edits — see `text_input::handle_key`). Returns
 /// whether anything happened, i.e. whether to redraw.
 pub fn handle_key(
+    tree: &mut WidgetTree,
+    press: &KeyPress<'_>,
+    measure: &mut dyn TextMeasure,
+    clipboard: &mut dyn Clipboard,
+) -> bool {
+    crate::forms::with_tree(tree, |tree| handle_key_inner(tree, press, measure, clipboard))
+}
+
+fn handle_key_inner(
     tree: &mut WidgetTree,
     press: &KeyPress<'_>,
     measure: &mut dyn TextMeasure,
@@ -65,11 +74,40 @@ pub fn handle_key(
             set_slider_value(tree, id, target.clamp(min.min(max), max.max(min)));
             true
         }
-        Some(WidgetKind::TextInput { .. }) => text_input::handle_key(tree, id, press, measure, clipboard),
+        Some(WidgetKind::TextInput { .. } | WidgetKind::TextArea { .. }) => {
+            text_input::handle_key(tree, id, press, measure, clipboard)
+        }
         Some(WidgetKind::ListView { items, selected, on_activate, .. }) => {
+            let combo = crate::forms::combo_for_list(tree, id);
             let (count, current) = (items.len(), *selected);
             let page = tree.list_page_rows(id);
             let last = count.saturating_sub(1);
+            // Combo dropdown: arrows move the highlight without firing on_select (which closes).
+            if combo.is_some() {
+                let activate = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space))
+                    || matches!(key, Key::Character(c) if c == " ");
+                if activate {
+                    if let (Some(callback), Some(row)) = (on_activate.clone(), current) {
+                        callback(row);
+                    }
+                    return current.is_some();
+                }
+                let target = match key {
+                    Key::Named(NamedKey::ArrowDown) => current.map_or(0, |i| (i + 1).min(last)),
+                    Key::Named(NamedKey::ArrowUp) => current.map_or(0, |i| i.saturating_sub(1)),
+                    Key::Named(NamedKey::PageDown) => current.map_or(0, |i| (i + page).min(last)),
+                    Key::Named(NamedKey::PageUp) => current.map_or(0, |i| i.saturating_sub(page)),
+                    Key::Named(NamedKey::Home) => 0,
+                    Key::Named(NamedKey::End) => last,
+                    _ => return false,
+                };
+                if count == 0 {
+                    return false;
+                }
+                // Scrolls too: past the 8 visible rows the highlight used to move out of sight.
+                tree.list_highlight(id, target);
+                return true;
+            }
             let target = match key {
                 Key::Named(NamedKey::Enter) => {
                     if let (Some(callback), Some(row)) = (on_activate.clone(), current) {
@@ -87,6 +125,80 @@ pub fn handle_key(
             };
             tree.list_select(id, Some(target));
             true
+        }
+        Some(WidgetKind::Checkbox { .. } | WidgetKind::Toggle { .. }) => {
+            let activate = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space))
+                || matches!(key, Key::Character(c) if c == " ");
+            if activate {
+                crate::forms::toggle_bool(tree, id);
+            }
+            activate
+        }
+        Some(WidgetKind::Radio { group_id, .. }) => {
+            let group_id = *group_id;
+            let activate = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space))
+                || matches!(key, Key::Character(c) if c == " ");
+            if activate {
+                crate::forms::select_radio(tree, id);
+                return true;
+            }
+            let step = match key {
+                Key::Named(NamedKey::ArrowUp | NamedKey::ArrowLeft) => -1isize,
+                Key::Named(NamedKey::ArrowDown | NamedKey::ArrowRight) => 1,
+                _ => return false,
+            };
+            let peers = crate::forms::radios_in_group(tree, group_id);
+            let Some(index) = peers.iter().position(|&peer| peer == id) else {
+                return false;
+            };
+            let next = index as isize + step;
+            if next < 0 || next as usize >= peers.len() {
+                return false;
+            }
+            let target = peers[next as usize];
+            crate::forms::select_radio(tree, target);
+            tree.set_focus(Some(target));
+            true
+        }
+        Some(WidgetKind::SpinBox { min, max, step, .. }) => {
+            let (min, max, step) = (*min, *max, *step);
+            match key {
+                Key::Named(NamedKey::ArrowUp | NamedKey::ArrowRight) => {
+                    crate::forms::set_numeric_delta(tree, id, step)
+                }
+                Key::Named(NamedKey::ArrowDown | NamedKey::ArrowLeft) => {
+                    crate::forms::set_numeric_delta(tree, id, -step)
+                }
+                Key::Named(NamedKey::PageUp) => crate::forms::set_numeric_delta(tree, id, step * 10.0),
+                Key::Named(NamedKey::PageDown) => crate::forms::set_numeric_delta(tree, id, -step * 10.0),
+                Key::Named(NamedKey::Home) => crate::forms::set_numeric(tree, id, min),
+                Key::Named(NamedKey::End) => crate::forms::set_numeric(tree, id, max),
+                _ => false,
+            }
+        }
+        Some(WidgetKind::NumericScrub { min, max, speed, .. }) => {
+            let (min, max, speed) = (*min, *max, *speed);
+            match key {
+                Key::Named(NamedKey::ArrowUp | NamedKey::ArrowRight) => {
+                    crate::forms::set_numeric_delta(tree, id, speed)
+                }
+                Key::Named(NamedKey::ArrowDown | NamedKey::ArrowLeft) => {
+                    crate::forms::set_numeric_delta(tree, id, -speed)
+                }
+                Key::Named(NamedKey::PageUp) => crate::forms::set_numeric_delta(tree, id, speed * 10.0),
+                Key::Named(NamedKey::PageDown) => crate::forms::set_numeric_delta(tree, id, -speed * 10.0),
+                Key::Named(NamedKey::Home) => crate::forms::set_numeric(tree, id, min),
+                Key::Named(NamedKey::End) => crate::forms::set_numeric(tree, id, max),
+                _ => false,
+            }
+        }
+        Some(WidgetKind::ComboBox { .. }) => {
+            let open = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space | NamedKey::ArrowDown))
+                || matches!(key, Key::Character(c) if c == " ");
+            if open {
+                crate::forms::open_combo(tree, id);
+            }
+            open
         }
         _ => false,
     }
