@@ -1,6 +1,6 @@
 //! Click / keyboard / drag handling for M7 form controls (checkbox, radio, toggle, spin, scrub, combo).
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use fastgui_core::taffy::prelude::*;
@@ -8,31 +8,35 @@ use fastgui_core::widget::{
     spin_down_rect, spin_up_rect, Color, PopupAnchor, PopupSide, WidgetId, WidgetKind, WidgetTree,
 };
 
+/// A change to the tree queued by a widget callback (see [`defer`]).
+type TreeJob = Box<dyn FnOnce(&mut WidgetTree)>;
+
 thread_local! {
-    /// Set while handling input so combo ListView callbacks can mutate the live tree.
-    static ACTIVE_TREE: Cell<Option<*mut WidgetTree>> = const { Cell::new(None) };
+    /// Tree changes queued by callbacks that fire while the tree is borrowed (a combo dropdown's
+    /// `ListView` pick, a popup's `on_dismiss`), applied by [`with_tree`] once it's free.
+    static DEFERRED: RefCell<Vec<TreeJob>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Run `f` with `tree` available to [`with_active_tree`] (for IndexCallback / on_dismiss).
+/// Run input handling `f` on `tree`, then apply every tree change a callback queued meanwhile
+/// (with [`defer`]). Callbacks fire from inside tree methods — `list_select`, `dismiss_popup` —
+/// while the tree is borrowed, so they can't touch it directly; they queue the change instead,
+/// and it lands before this returns, i.e. within the same input event.
 pub fn with_tree<R>(tree: &mut WidgetTree, f: impl FnOnce(&mut WidgetTree) -> R) -> R {
-    struct Guard(Option<*mut WidgetTree>);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            ACTIVE_TREE.with(|slot| slot.set(self.0));
+    let result = f(tree);
+    loop {
+        let jobs = DEFERRED.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
+        if jobs.is_empty() {
+            return result;
+        }
+        for job in jobs {
+            job(tree);
         }
     }
-    let prev = ACTIVE_TREE.with(|slot| slot.replace(Some(tree as *mut WidgetTree)));
-    let _guard = Guard(prev);
-    f(tree)
 }
 
-fn with_active_tree(f: impl FnOnce(&mut WidgetTree)) {
-    ACTIVE_TREE.with(|slot| {
-        if let Some(ptr) = slot.get() {
-            // SAFETY: pointer set by `with_tree` for the duration of input handling on this thread.
-            f(unsafe { &mut *ptr });
-        }
-    });
+/// Queue a tree change from inside a widget callback; the enclosing [`with_tree`] applies it.
+fn defer(job: impl FnOnce(&mut WidgetTree) + 'static) {
+    DEFERRED.with(|queue| queue.borrow_mut().push(Box::new(job)));
 }
 
 /// Toggle a `Checkbox` or `Toggle` and fire `on_change`.
@@ -219,10 +223,10 @@ pub fn open_combo(tree: &mut WidgetTree, combo_id: WidgetId) {
     let scroll = selected.map_or(0.0, |i| i.min(items.len().saturating_sub(visible)) as f32 * row_height);
 
     let pick = Arc::new(move |index: usize| {
-        with_active_tree(|tree| apply_combo_pick(tree, combo_id, index));
+        defer(move |tree| apply_combo_pick(tree, combo_id, index));
     });
     let on_dismiss = Arc::new(move || {
-        with_active_tree(|tree| {
+        defer(move |tree| {
             tree.mutate_kind(combo_id, |kind| {
                 if let WidgetKind::ComboBox { popup_id, .. } = kind {
                     *popup_id = None;
@@ -258,13 +262,9 @@ pub fn open_combo(tree: &mut WidgetTree, combo_id: WidgetId) {
         mirror: None,
     };
 
-    // `with_tree` so a synchronous pick during open (unlikely) still sees the tree; mainly
-    // so nested open_popup stays consistent with dismiss callbacks.
-    let popup = with_tree(tree, |tree| {
-        tree.open_popup(popup_kind, |tree, popup| {
-            let list = tree.new_node(list_style, list_kind);
-            tree.add_child(popup, list);
-        })
+    let popup = tree.open_popup(popup_kind, |tree, popup| {
+        let list = tree.new_node(list_style, list_kind);
+        tree.add_child(popup, list);
     });
     tree.mutate_kind(combo_id, |kind| {
         if let WidgetKind::ComboBox { popup_id, .. } = kind {
