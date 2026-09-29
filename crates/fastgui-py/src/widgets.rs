@@ -1,13 +1,13 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use fastgui_core::taffy::prelude::*;
 use fastgui_core::taffy::style::LengthPercentage;
 use fastgui_core::widget::{
-    clamp_range, round_to_decimals, BoolCallback, ChangeCallback, ClickCallback, Color, IndexCallback,
-    PanelCloseCallback, PanelDropCallback, PopupAnchor, PopupSide, SplitDirection, TabSelectCallback,
-    TextCallback, WidgetId, WidgetKind, WidgetTree,
+    clamp_range, round_to_decimals, Accel, BoolCallback, ChangeCallback, ClickCallback, Color, IndexCallback,
+    PanelCloseCallback, PanelDropCallback, PointCallback, PopupAnchor, PopupSide, SplitDirection,
+    TabSelectCallback, TextCallback, WidgetId, WidgetKind, WidgetTree,
 };
 use fastgui_core::text_edit::TextEdit;
 use fastgui_core::{CpuFrame, FrameSlot, PixelFormat, Readback, MAX_CPU_FRAME_EXTENT};
@@ -47,6 +47,35 @@ fn wrap_callback0(callback: Py<PyAny>) -> ClickCallback {
     Arc::new(move || {
         Python::attach(|py| {
             if let Err(err) = callback.call0(py) {
+                err.print(py);
+            }
+        });
+    })
+}
+
+/// `context_menu=` value: a `Popup`, an object with `as_popup()`, or a `(x, y)` callable.
+fn wrap_context_menu(callback: Py<PyAny>, sender_cell: SenderCell) -> PointCallback {
+    Arc::new(move |x: f32, y: f32| {
+        let Some(sender) = sender_cell
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        Python::attach(|py| {
+            let obj = callback.bind(py);
+            if let Ok(popup) = obj.cast::<Popup>() {
+                let _ = popup.borrow().open_in(&sender, PopupAnchor::Point(x, y));
+                return;
+            }
+            if let Ok(as_popup) = obj.call_method0("as_popup") {
+                if let Ok(popup) = as_popup.cast::<Popup>() {
+                    let _ = popup.borrow().open_in(&sender, PopupAnchor::Point(x, y));
+                    return;
+                }
+            }
+            if let Err(err) = obj.call1((x, y)) {
                 err.print(py);
             }
         });
@@ -231,6 +260,8 @@ struct StyleParams {
     wrap: bool,
     /// `Some(n)` → CSS Grid with `n` equal `1fr` columns (auto-flow rows). `None` → flexbox.
     grid_columns: Option<u16>,
+    /// `false` → `Display::None` (stacked/collapsible pages; same path as inactive tabs).
+    visible: bool,
 }
 
 impl StyleParams {
@@ -247,6 +278,7 @@ impl StyleParams {
             absolute: None,
             wrap: false,
             grid_columns: None,
+            visible: true,
         }
     }
 
@@ -298,6 +330,9 @@ impl StyleParams {
             style.grid_template_columns = evenly_sized_tracks(columns);
             style.grid_auto_rows = vec![TrackSizingFunction::AUTO];
         }
+        if !self.visible {
+            style.display = Display::None;
+        }
         style
     }
 }
@@ -347,6 +382,9 @@ pub(crate) fn described_viewport(viewport_id: u64, frames: fastgui_core::FrameSl
         children: Vec::new(),
         splitter_bar: None,
         tab_bar: None,
+        tooltip: None,
+        context_menu: None,
+        accelerators: Vec::new(),
     }
 }
 
@@ -358,6 +396,9 @@ pub(crate) struct DescribedWidget {
     children: Vec<DescribedWidget>,
     splitter_bar: Option<SplitterBarSpec>,
     tab_bar: Option<TabBarSpec>,
+    tooltip: Option<String>,
+    context_menu: Option<PointCallback>,
+    accelerators: Vec<(String, ClickCallback)>,
 }
 
 impl DescribedWidget {
@@ -518,13 +559,36 @@ pub(crate) fn attach(
     described: DescribedWidget,
     sender: &CommandDispatch,
 ) -> WidgetId {
-    let id = tree.new_node(described.style.to_style(), described.kind);
+    let DescribedWidget {
+        style,
+        kind,
+        id_cell,
+        sender_cell,
+        children,
+        splitter_bar,
+        tab_bar,
+        tooltip,
+        context_menu,
+        accelerators,
+    } = described;
+    let id = tree.new_node(style.to_style(), kind);
     tree.add_child(parent, id);
-    *described.id_cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(id);
-    *described.sender_cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(sender.clone());
+    *id_cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(id);
+    *sender_cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(sender.clone());
+    if let Some(text) = tooltip {
+        tree.set_tooltip(id, Some(text));
+    }
+    if let Some(callback) = context_menu {
+        tree.set_context_menu(id, Some(callback));
+    }
+    for (shortcut, callback) in accelerators {
+        if let Some(accel) = Accel::parse(&shortcut) {
+            tree.register_accelerator(accel, callback);
+        }
+    }
 
-    if let Some(bar_spec) = described.splitter_bar {
-        let mut children = described.children.into_iter();
+    if let Some(bar_spec) = splitter_bar {
+        let mut children = children.into_iter();
         let (Some(first_described), Some(second_described)) = (children.next(), children.next()) else {
             // `Splitter::describe` always produces exactly two children; this can't happen
             // outside a bug in this crate, and there's no sane partial-splitter to build.
@@ -539,7 +603,7 @@ pub(crate) fn attach(
             width: (bar_spec.direction == SplitDirection::Row).then_some(bar_spec.thickness),
             height: (bar_spec.direction == SplitDirection::Column).then_some(bar_spec.thickness),
             fill: false,
-            align_items: None, absolute: None, wrap: false, grid_columns: None,
+            align_items: None, absolute: None, wrap: false, grid_columns: None, visible: true,
         };
         let bar_kind = WidgetKind::Splitter {
             direction: bar_spec.direction,
@@ -562,7 +626,7 @@ pub(crate) fn attach(
                 *second = second_id;
             }
         });
-    } else if let Some(bar_spec) = described.tab_bar {
+    } else if let Some(bar_spec) = tab_bar {
         // Bar goes first (visually above its content — see `WidgetKind::TabBar`'s doc comment),
         // so it's created and `add_child`ed before any content wrapper, unlike `Splitter`'s bar
         // (which sits *between* its two children and so needs the first one's id already).
@@ -574,7 +638,7 @@ pub(crate) fn attach(
             width: None,
             height: Some(bar_spec.height),
             fill: false,
-            align_items: None, absolute: None, wrap: false, grid_columns: None,
+            align_items: None, absolute: None, wrap: false, grid_columns: None, visible: true,
         };
         let active = bar_spec.active;
         let bar_kind = WidgetKind::TabBar {
@@ -595,8 +659,7 @@ pub(crate) fn attach(
         // Only the active tab's content is visible at attach time — everything but the click
         // handler's own `set_display` toggling (`fastgui-app::app::handle_tab_click`)
         // lives here, so both paths agree on what "active" means.
-        let content_ids: Vec<WidgetId> = described
-            .children
+        let content_ids: Vec<WidgetId> = children
             .into_iter()
             .enumerate()
             .map(|(index, child)| {
@@ -611,7 +674,7 @@ pub(crate) fn attach(
             }
         });
     } else {
-        for child in described.children {
+        for child in children {
             let child_id = attach(tree, id, child, sender);
             if let Some(WidgetKind::PanelTitleBar { .. }) = tree.kind(child_id) {
                 tree.mutate_kind(child_id, |kind| {
@@ -676,14 +739,30 @@ pub(crate) struct Label {
     text: String,
     font_size: Option<FontSize>,
     color: Option<(f32, f32, f32, f32)>,
+    tooltip: Option<String>,
+    context_menu: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl Label {
     #[new]
-    #[pyo3(signature = (text, font_size=None, color=None))]
-    fn new(text: String, font_size: Option<FontSize>, color: Option<(f32, f32, f32, f32)>) -> Self {
-        Self { id: Arc::new(Mutex::new(None)), sender: Arc::new(Mutex::new(None)), text, font_size, color }
+    #[pyo3(signature = (text, font_size=None, color=None, tooltip=None, context_menu=None))]
+    fn new(
+        text: String,
+        font_size: Option<FontSize>,
+        color: Option<(f32, f32, f32, f32)>,
+        tooltip: Option<String>,
+        context_menu: Option<Py<PyAny>>,
+    ) -> Self {
+        Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            text,
+            font_size,
+            color,
+            tooltip,
+            context_menu,
+        }
     }
 
     /// Change the displayed text. Safe to call from any thread, only once this label has been
@@ -699,6 +778,10 @@ impl Label {
 
 impl Label {
     fn describe(&self) -> DescribedWidget {
+        let context_menu = self.context_menu.as_ref().map(|cb| {
+            let cb = Python::attach(|py| cb.clone_ref(py));
+            wrap_context_menu(cb, self.sender.clone())
+        });
         DescribedWidget {
             style: StyleParams::leaf(0.0, None, None),
             kind: WidgetKind::Label { text: self.text.clone(), font_size: self.font_size.unwrap_or(FontSize::Body).resolve(), color: rgba(self.color.unwrap_or(crate::theme::palette().text)) },
@@ -707,6 +790,9 @@ impl Label {
             children: Vec::new(),
             splitter_bar: None,
             tab_bar: None,
+            tooltip: self.tooltip.clone(),
+            context_menu,
+            accelerators: Vec::new(),
         }
     }
 }
@@ -720,19 +806,35 @@ pub(crate) struct Button {
     font_size: Option<FontSize>,
     text_color: Option<(f32, f32, f32, f32)>,
     background: Option<(f32, f32, f32, f32)>,
+    /// Menu-bar title style: compact, no fill until hover / `set_background`.
+    flat: bool,
     on_click: Option<Py<PyAny>>,
+    tooltip: Option<String>,
+    context_menu: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl Button {
     #[new]
-    #[pyo3(signature = (text, on_click=None, font_size=None, text_color=None, background=None))]
+    #[pyo3(signature = (
+        text,
+        on_click=None,
+        font_size=None,
+        text_color=None,
+        background=None,
+        flat=false,
+        tooltip=None,
+        context_menu=None,
+    ))]
     fn new(
         text: String,
         on_click: Option<Py<PyAny>>,
         font_size: Option<FontSize>,
         text_color: Option<(f32, f32, f32, f32)>,
         background: Option<(f32, f32, f32, f32)>,
+        flat: bool,
+        tooltip: Option<String>,
+        context_menu: Option<Py<PyAny>>,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
@@ -741,7 +843,10 @@ impl Button {
             font_size,
             text_color,
             background,
+            flat,
             on_click,
+            tooltip,
+            context_menu,
         }
     }
 
@@ -752,18 +857,44 @@ impl Button {
             }
         })
     }
+
+    /// Update the fill (e.g. menu-title open highlight). `None` clears to transparent.
+    #[pyo3(signature = (color=None))]
+    fn set_background(&self, color: Option<(f32, f32, f32, f32)>) -> PyResult<()> {
+        let fill = rgba(color.unwrap_or((0.0, 0.0, 0.0, 0.0)));
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::Button { background, .. } = kind {
+                *background = fill;
+            }
+        })
+    }
 }
 
 impl Button {
     fn describe(&self) -> DescribedWidget {
         let on_click = self.on_click.as_ref().map(|cb| Python::attach(|py| cb.clone_ref(py)));
+        let context_menu = self.context_menu.as_ref().map(|cb| {
+            let cb = Python::attach(|py| cb.clone_ref(py));
+            wrap_context_menu(cb, self.sender.clone())
+        });
+        let default_bg = if self.flat {
+            (0.0, 0.0, 0.0, 0.0)
+        } else {
+            crate::theme::palette().button
+        };
+        let default_fg = if self.flat {
+            crate::theme::palette().text
+        } else {
+            crate::theme::palette().button_text
+        };
         DescribedWidget {
             style: StyleParams::leaf(0.0, None, None),
             kind: WidgetKind::Button {
                 text: self.text.clone(),
                 font_size: self.font_size.unwrap_or(FontSize::Body).resolve(),
-                text_color: rgba(self.text_color.unwrap_or(crate::theme::palette().button_text)),
-                background: rgba(self.background.unwrap_or(crate::theme::palette().button)),
+                text_color: rgba(self.text_color.unwrap_or(default_fg)),
+                background: rgba(self.background.unwrap_or(default_bg)),
+                flat: self.flat,
                 on_click: on_click.map(wrap_callback0),
             },
             id_cell: self.id.clone(),
@@ -771,6 +902,9 @@ impl Button {
             children: Vec::new(),
             splitter_bar: None,
             tab_bar: None,
+            tooltip: self.tooltip.clone(),
+            context_menu,
+            accelerators: Vec::new(),
         }
     }
 }
@@ -786,6 +920,7 @@ pub(crate) struct Slider {
     track_color: Option<(f32, f32, f32, f32)>,
     thumb_color: Option<(f32, f32, f32, f32)>,
     on_change: Option<Py<PyAny>>,
+    tooltip: Option<String>,
 }
 
 #[pymethods]
@@ -798,6 +933,7 @@ impl Slider {
         on_change=None,
         track_color=None,
         thumb_color=None,
+        tooltip=None,
     ))]
     fn new(
         value: f32,
@@ -806,6 +942,7 @@ impl Slider {
         on_change: Option<Py<PyAny>>,
         track_color: Option<(f32, f32, f32, f32)>,
         thumb_color: Option<(f32, f32, f32, f32)>,
+        tooltip: Option<String>,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
@@ -816,6 +953,7 @@ impl Slider {
             track_color,
             thumb_color,
             on_change,
+            tooltip,
         }
     }
 
@@ -848,6 +986,9 @@ impl Slider {
             children: Vec::new(),
             splitter_bar: None,
             tab_bar: None,
+            tooltip: self.tooltip.clone(),
+            context_menu: None,
+            accelerators: Vec::new(),
         }
     }
 }
@@ -973,6 +1114,9 @@ impl TextInput {
             children: Vec::new(),
             splitter_bar: None,
             tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         }
     }
 }
@@ -1100,6 +1244,9 @@ impl TextArea {
             children: Vec::new(),
             splitter_bar: None,
             tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         }
     }
 }
@@ -1258,6 +1405,9 @@ impl ListView {
             children: Vec::new(),
             splitter_bar: None,
             tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         }
     }
 }
@@ -1334,6 +1484,19 @@ impl Popup {
         self.open_in(&sender, PopupAnchor::Widget(anchor_id, side))
     }
 
+    /// Open with top-left at `(x, y)` in the same window as `near` (an attached widget).
+    fn show_at(&self, near: &Bound<'_, PyAny>, x: f32, y: f32) -> PyResult<()> {
+        let described = describe(near)?;
+        let not_attached = || PyRuntimeError::new_err("the near widget isn't shown in a window yet");
+        let sender = described
+            .sender_cell
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or_else(not_attached)?;
+        self.open_in(&sender, PopupAnchor::Point(x, y))
+    }
+
     /// Close it (without calling `on_dismiss`). No-op when it isn't open.
     fn close(&self) -> PyResult<()> {
         let Some(sender) = self.sender.lock().unwrap_or_else(|p| p.into_inner()).clone() else { return Ok(()) };
@@ -1369,6 +1532,9 @@ impl Popup {
             children: vec![content],
             splitter_bar: None,
             tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         };
         let kind = WidgetKind::Popup {
             anchor,
@@ -1488,6 +1654,9 @@ impl ScrollArea {
             children: vec![content],
             splitter_bar: None,
             tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         })
     }
 }
@@ -1505,6 +1674,7 @@ pub(crate) struct Checkbox {
     box_color: Option<(f32, f32, f32, f32)>,
     check_color: Option<(f32, f32, f32, f32)>,
     on_change: Option<Py<PyAny>>,
+    tooltip: Option<String>,
 }
 
 #[pymethods]
@@ -1518,6 +1688,7 @@ impl Checkbox {
         text_color=None,
         box_color=None,
         check_color=None,
+        tooltip=None,
     ))]
     fn new(
         label: String,
@@ -1527,6 +1698,7 @@ impl Checkbox {
         text_color: Option<(f32, f32, f32, f32)>,
         box_color: Option<(f32, f32, f32, f32)>,
         check_color: Option<(f32, f32, f32, f32)>,
+        tooltip: Option<String>,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
@@ -1538,6 +1710,7 @@ impl Checkbox {
             box_color,
             check_color,
             on_change,
+            tooltip,
         }
     }
 
@@ -1589,6 +1762,9 @@ impl Checkbox {
             children: Vec::new(),
             splitter_bar: None,
             tab_bar: None,
+            tooltip: self.tooltip.clone(),
+            context_menu: None,
+            accelerators: Vec::new(),
         }
     }
 }
@@ -1745,6 +1921,9 @@ impl Radio {
             children: Vec::new(),
             splitter_bar: None,
             tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         }
     }
 }
@@ -1759,6 +1938,7 @@ pub(crate) struct Toggle {
     track_on: Option<(f32, f32, f32, f32)>,
     thumb_color: Option<(f32, f32, f32, f32)>,
     on_change: Option<Py<PyAny>>,
+    tooltip: Option<String>,
 }
 
 #[pymethods]
@@ -1770,6 +1950,7 @@ impl Toggle {
         track_off=None,
         track_on=None,
         thumb_color=None,
+        tooltip=None,
     ))]
     fn new(
         checked: bool,
@@ -1777,6 +1958,7 @@ impl Toggle {
         track_off: Option<(f32, f32, f32, f32)>,
         track_on: Option<(f32, f32, f32, f32)>,
         thumb_color: Option<(f32, f32, f32, f32)>,
+        tooltip: Option<String>,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
@@ -1786,6 +1968,7 @@ impl Toggle {
             track_on,
             thumb_color,
             on_change,
+            tooltip,
         }
     }
 
@@ -1835,6 +2018,9 @@ impl Toggle {
             children: Vec::new(),
             splitter_bar: None,
             tab_bar: None,
+            tooltip: self.tooltip.clone(),
+            context_menu: None,
+            accelerators: Vec::new(),
         }
     }
 }
@@ -1952,6 +2138,9 @@ impl SpinBox {
             children: Vec::new(),
             splitter_bar: None,
             tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         }
     }
 }
@@ -2064,6 +2253,9 @@ impl NumericScrub {
             children: Vec::new(),
             splitter_bar: None,
             tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         }
     }
 }
@@ -2152,6 +2344,9 @@ impl ProgressBar {
             children: Vec::new(),
             splitter_bar: None,
             tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         }
     }
 }
@@ -2325,6 +2520,9 @@ impl ComboBox {
             children: Vec::new(),
             splitter_bar: None,
             tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         }
     }
 }
@@ -2413,6 +2611,9 @@ impl Image {
             children: Vec::new(),
             splitter_bar: None,
             tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         }
     }
 }
@@ -2495,6 +2696,7 @@ impl Grid {
                 absolute: None,
                 wrap: false,
                 grid_columns: Some(self.columns),
+                visible: true,
             },
             kind: WidgetKind::Container {
                 background: if self.background.3 > 0.0 { rgba(self.background) } else { transparent() },
@@ -2505,6 +2707,9 @@ impl Grid {
             children,
             splitter_bar: None,
             tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         })
     }
 }
@@ -2523,7 +2728,12 @@ pub(crate) struct BoxWidget {
     height: Option<f32>,
     background: (f32, f32, f32, f32),
     wrap: bool,
+    /// Mirrored into taffy `Display` at attach / via `set_display`.
+    visible: AtomicBool,
     children: Py<PyList>,
+    context_menu: Option<Py<PyAny>>,
+    /// `(shortcut, on_click)` pairs registered as accelerators when this box attaches.
+    accelerators: Vec<(String, Py<PyAny>)>,
 }
 
 #[pymethods]
@@ -2539,6 +2749,9 @@ impl BoxWidget {
         height=None,
         background=(0.0, 0.0, 0.0, 0.0),
         wrap=false,
+        visible=true,
+        context_menu=None,
+        accelerators=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -2551,6 +2764,9 @@ impl BoxWidget {
         height: Option<f32>,
         background: (f32, f32, f32, f32),
         wrap: bool,
+        visible: bool,
+        context_menu: Option<Py<PyAny>>,
+        accelerators: Option<Bound<'_, PyList>>,
     ) -> PyResult<Self> {
         let direction = match direction {
             "row" => FlexDirection::Row,
@@ -2561,6 +2777,13 @@ impl BoxWidget {
                 )))
             }
         };
+        let mut accel = Vec::new();
+        if let Some(list) = accelerators {
+            for item in list.iter() {
+                let (shortcut, callback): (String, Py<PyAny>) = item.extract()?;
+                accel.push((shortcut, callback));
+            }
+        }
         Ok(Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
@@ -2572,7 +2795,24 @@ impl BoxWidget {
             height,
             background,
             wrap,
+            visible: AtomicBool::new(visible),
             children,
+            context_menu,
+            accelerators: accel,
+        })
+    }
+
+    /// Show or hide this box (`Display::None` when hidden). Works before and after attach.
+    fn set_display(&self, visible: bool) -> PyResult<()> {
+        self.visible.store(visible, Ordering::Relaxed);
+        let Some(id) = *self.id.lock().unwrap_or_else(|p| p.into_inner()) else {
+            return Ok(());
+        };
+        let Some(sender) = self.sender.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
+            return Ok(());
+        };
+        send_tree_mutation(&sender, move |tree| {
+            tree.set_display(id, visible);
         })
     }
 }
@@ -2591,11 +2831,24 @@ impl BoxWidget {
             absolute: None,
             wrap: self.wrap,
             grid_columns: None,
+            visible: self.visible.load(Ordering::Relaxed),
         };
 
         let children = Python::attach(|py| -> PyResult<Vec<DescribedWidget>> {
             self.children.bind(py).iter().map(|child| describe(&child)).collect()
         })?;
+        let context_menu = self.context_menu.as_ref().map(|cb| {
+            let cb = Python::attach(|py| cb.clone_ref(py));
+            wrap_context_menu(cb, self.sender.clone())
+        });
+        let accelerators = self
+            .accelerators
+            .iter()
+            .map(|(shortcut, cb)| {
+                let cb = Python::attach(|py| cb.clone_ref(py));
+                (shortcut.clone(), wrap_callback0(cb))
+            })
+            .collect();
 
         Ok(DescribedWidget {
             style,
@@ -2608,6 +2861,9 @@ impl BoxWidget {
             children,
             splitter_bar: None,
             tab_bar: None,
+            tooltip: None,
+            context_menu,
+            accelerators,
         })
     }
 }
@@ -2691,7 +2947,7 @@ impl Splitter {
                 width: None,
                 height: None,
                 fill: false,
-                align_items: None, absolute: None, wrap: false, grid_columns: None,
+                align_items: None, absolute: None, wrap: false, grid_columns: None, visible: true,
             },
             kind: WidgetKind::Container { background: transparent(), region_id: None },
             id_cell: self.id.clone(),
@@ -2704,6 +2960,9 @@ impl Splitter {
                 thickness: self.thickness,
             }),
             tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         })
     }
 }
@@ -2905,6 +3164,7 @@ impl Panel {
                 absolute: None,
                 wrap: false,
                 grid_columns: None,
+                visible: true,
             },
             kind: WidgetKind::PanelTitleBar {
                 panel_id: self.region_id,
@@ -2924,6 +3184,9 @@ impl Panel {
             children: Vec::new(),
             splitter_bar: None,
             tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         };
 
         Ok(DescribedWidget {
@@ -2935,7 +3198,7 @@ impl Panel {
                 width: None,
                 height: None,
                 fill: false,
-                align_items: None, absolute: None, wrap: false, grid_columns: None,
+                align_items: None, absolute: None, wrap: false, grid_columns: None, visible: true,
             },
             kind: WidgetKind::Container { background: rgba(self.background.unwrap_or(crate::theme::palette().surface)), region_id: Some(self.region_id) },
             id_cell: self.id.clone(),
@@ -2943,6 +3206,9 @@ impl Panel {
             children: vec![title_bar, content_described],
             splitter_bar: None,
             tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         })
     }
 }
@@ -3079,7 +3345,7 @@ impl Tabs {
                 width: None,
                 height: None,
                 fill: false,
-                align_items: None, absolute: None, wrap: false, grid_columns: None,
+                align_items: None, absolute: None, wrap: false, grid_columns: None, visible: true,
             },
             kind: WidgetKind::Container { background: transparent(), region_id: Some(self.region_id) },
             id_cell: self.id.clone(),
@@ -3099,6 +3365,9 @@ impl Tabs {
                 on_drop,
                 on_close,
             }),
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         })
     }
 }

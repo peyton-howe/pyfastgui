@@ -150,6 +150,7 @@ pub(crate) fn install(theme: Theme) {
         scrim: color(theme.scrim),
         drop_indicator: color(theme.drop_indicator),
         scrollbar: color(theme.scrollbar),
+        hover: color(theme.surface_active),
         font_family: theme.font_family.as_deref().map(Arc::from),
     });
     *CURRENT.write().unwrap_or_else(|p| p.into_inner()) = theme;
