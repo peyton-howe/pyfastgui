@@ -25,6 +25,8 @@ from ._fastgui import (
     Viewport,
     Window,
     get_theme,
+    open_file_dialog,
+    save_file_dialog,
     set_theme,
 )
 
@@ -35,6 +37,471 @@ _REGIONS = ("center", "left", "right", "top", "bottom")
 # DockArea", not "split just whatever panel happens to be under the cursor". Never a real
 # `Panel`/`Tabs` id (`next_region_id()`, Rust-side, starts at 1).
 _ROOT_REGION_ID = 0
+
+
+class MenuItem:
+    """One actionable row in a `Menu` (`label`, optional `shortcut`, `on_click`)."""
+
+    def __init__(self, label, shortcut=None, on_click=None, enabled=True):
+        self.label = label
+        self.shortcut = shortcut
+        self.on_click = on_click
+        self.enabled = bool(enabled)
+
+
+class MenuSeparator:
+    """A thin muted bar between `MenuItem`s."""
+
+
+class Menu:
+    """A popup column of `MenuItem` / `MenuSeparator` rows. Open with `show(anchor)` or
+    `show_at(near, x, y)`; also usable as `context_menu=` (via `as_popup()`)."""
+
+    def __init__(self, items):
+        self.items = list(items)
+        self._popup = None
+
+    def _build_row(self, item):
+        theme = get_theme()
+        if isinstance(item, MenuSeparator):
+            return Box(
+                direction="column",
+                height=9.0,
+                padding=4.0,
+                children=[
+                    Box(
+                        direction="row",
+                        height=1.0,
+                        flex_grow=1.0,
+                        background=theme.border,
+                        children=[],
+                    )
+                ],
+            )
+        if not isinstance(item, MenuItem):
+            raise TypeError(f"Menu items must be MenuItem or MenuSeparator, got {type(item)!r}")
+
+        def activate(it=item):
+            if not it.enabled:
+                return
+            self.close()
+            if it.on_click is not None:
+                it.on_click()
+
+        label_color = theme.text if item.enabled else theme.text_muted
+        text = item.label if not item.shortcut else f"{item.label}    {item.shortcut}"
+        # Flat rows: transparent until hover (`surface_active`), like a native menu.
+        return Button(
+            text,
+            on_click=activate if item.enabled else None,
+            font_size="small",
+            text_color=label_color,
+            background=None,
+            flat=True,
+        )
+
+    def as_popup(self, on_dismiss=None):
+        """Fresh `Popup` for `context_menu=` / `Window.show_popup` (rebuilds each call)."""
+        rows = [self._build_row(item) for item in self.items]
+        self._popup = Popup(
+            Box(direction="column", gap=0.0, children=rows),
+            padding=4.0,
+            on_dismiss=on_dismiss,
+        )
+        return self._popup
+
+    def show(self, anchor, side="below", on_dismiss=None):
+        self.as_popup(on_dismiss=on_dismiss).show(anchor, side=side)
+
+    def show_at(self, near, x, y, on_dismiss=None):
+        """Open at window point `(x, y)` using `near`'s window (an attached widget)."""
+        self.as_popup(on_dismiss=on_dismiss).show_at(near, x, y)
+
+    def close(self):
+        if self._popup is not None:
+            self._popup.close()
+
+    @property
+    def is_open(self):
+        return bool(self._popup is not None and self._popup.is_open)
+
+
+class MenuBar:
+    """Traditional menu strip: flat titles, hover/open highlight, thin bottom edge.
+
+    Each entry is `(title, Menu)`. Title clicks toggle that menu; accelerators from enabled
+    `MenuItem.shortcut`s are registered on the bar when attached.
+    """
+
+    def __init__(self, menus):
+        self.menus = list(menus)
+        self._titles = []  # (Button, Menu) after describe
+
+    def _clear_title_highlights(self):
+        for btn, _ in self._titles:
+            btn.set_background(None)
+
+    def _toggle(self, title_button, menu):
+        theme = get_theme()
+        for btn, other in self._titles:
+            if other is not menu and other.is_open:
+                other.close()
+                btn.set_background(None)
+        if menu.is_open:
+            menu.close()
+            title_button.set_background(None)
+        else:
+            # Clear open highlight if the menu is dismissed by outside click / Escape.
+            menu.show(title_button, on_dismiss=lambda b=title_button: b.set_background(None))
+            title_button.set_background(theme.surface_active)
+
+    @property
+    def _fastgui_widget(self):
+        theme = get_theme()
+        buttons = []
+        accelerators = []
+        self._titles = []
+        for title, menu in self.menus:
+            if not isinstance(menu, Menu):
+                raise TypeError(f"MenuBar menus must be Menu instances, got {type(menu)!r}")
+            holder = {"btn": None}
+
+            def make_click(h=holder, m=menu):
+                return lambda: self._toggle(h["btn"], m)
+
+            btn = Button(
+                title,
+                on_click=make_click(),
+                font_size="small",
+                text_color=theme.text,
+                background=None,
+                flat=True,
+            )
+            holder["btn"] = btn
+            buttons.append(btn)
+            self._titles.append((btn, menu))
+            for item in menu.items:
+                if isinstance(item, MenuItem) and item.enabled and item.shortcut and item.on_click:
+                    accelerators.append((item.shortcut, item.on_click))
+        # Row of titles + 1px bottom border — reads as a menubar, not a button toolbar.
+        titles = Box(
+            direction="row",
+            gap=0.0,
+            children=buttons,
+            background=theme.surface,
+            accelerators=accelerators,
+        )
+        edge = Box(direction="row", height=1.0, background=theme.border, children=[])
+        return Box(
+            direction="column",
+            gap=0.0,
+            children=[titles, edge],
+            background=theme.surface,
+        )
+
+
+class Toolbar:
+    """Horizontal strip for Buttons/Labels/spacers under a `MenuBar`."""
+
+    def __init__(self, children):
+        self.children = list(children)
+
+    @property
+    def _fastgui_widget(self):
+        theme = get_theme()
+        return Box(
+            direction="row",
+            gap="small",
+            padding="small",
+            children=self.children,
+            background=theme.surface_alt,
+        )
+
+
+class StatusBar:
+    """Bottom strip with muted small text. Call `set_text` to update."""
+
+    def __init__(self, text=""):
+        self._text = text
+        self._label = None
+
+    def set_text(self, text):
+        self._text = text
+        if self._label is not None:
+            try:
+                self._label.set_text(text)
+            except RuntimeError:
+                pass
+
+    @property
+    def _fastgui_widget(self):
+        theme = get_theme()
+        self._label = Label(self._text, font_size="small", color=theme.text_muted)
+        return Box(
+            direction="row",
+            padding="small",
+            children=[self._label],
+            background=theme.surface,
+            flex_grow=0.0,
+        )
+
+
+class Dialog:
+    """Thin modal/modeless wrapper around `Popup`. Open with `show(window)` or
+    `window.show_popup(dialog)`."""
+
+    def __init__(self, title, content, buttons=None, modal=True, on_dismiss=None):
+        self.title = title
+        self.content = content
+        self.buttons = list(buttons or [])
+        self.modal = bool(modal)
+        self.on_dismiss = on_dismiss
+        self._popup = None
+
+    def as_popup(self):
+        theme = get_theme()
+        rows = [Label(self.title, font_size="large"), self.content]
+        if self.buttons:
+            button_row = []
+            for label, callback in self.buttons:
+
+                def make_click(cb=callback):
+                    def _click():
+                        self.close()
+                        if cb is not None:
+                            cb()
+
+                    return _click
+
+                button_row.append(Button(label, on_click=make_click()))
+            rows.append(Box(direction="row", gap="small", children=button_row))
+        body = Box(direction="column", gap="medium", padding="medium", children=rows)
+        self._popup = Popup(
+            body,
+            modal=self.modal,
+            on_dismiss=self.on_dismiss,
+            background=theme.surface_alt,
+            border=theme.border,
+        )
+        return self._popup
+
+    def show(self, window):
+        window.show_popup(self.as_popup())
+
+    def close(self):
+        if self._popup is not None:
+            self._popup.close()
+
+    @property
+    def is_open(self):
+        return bool(self._popup is not None and self._popup.is_open)
+
+
+def pick_color(window, initial=None, on_pick=None):
+    """Open an in-app modal RGB color picker on `window`.
+
+    rfd has no color dialog, so this is a small `Dialog` with 0–255 spinners.
+    Calls `on_pick(rgba)` on OK or `on_pick(None)` on Cancel/dismiss. Returns the
+    `Dialog` (non-blocking — native file dialogs are the blocking pickers).
+    """
+    theme = get_theme()
+    r0, g0, b0, a0 = initial if initial is not None else (*theme.accent[:3], 1.0)
+    state = {
+        "r": max(0.0, min(1.0, float(r0))),
+        "g": max(0.0, min(1.0, float(g0))),
+        "b": max(0.0, min(1.0, float(b0))),
+        "a": max(0.0, min(1.0, float(a0))),
+    }
+
+    def _rgb_text():
+        return (
+            f"RGB ({int(round(state['r'] * 255))}, "
+            f"{int(round(state['g'] * 255))}, {int(round(state['b'] * 255))})"
+        )
+
+    readout = Label(_rgb_text(), font_size="small", color=theme.text_muted)
+
+    def sync_from_spins(_value=None):
+        state["r"] = r_spin.value / 255.0
+        state["g"] = g_spin.value / 255.0
+        state["b"] = b_spin.value / 255.0
+        readout.set_text(_rgb_text())
+
+    r_spin = SpinBox(
+        value=round(state["r"] * 255), min=0, max=255, step=1, decimals=0, width=72.0, on_change=sync_from_spins
+    )
+    g_spin = SpinBox(
+        value=round(state["g"] * 255), min=0, max=255, step=1, decimals=0, width=72.0, on_change=sync_from_spins
+    )
+    b_spin = SpinBox(
+        value=round(state["b"] * 255), min=0, max=255, step=1, decimals=0, width=72.0, on_change=sync_from_spins
+    )
+
+    content = Box(
+        direction="column",
+        gap="small",
+        children=[
+            Box(
+                direction="row",
+                gap="small",
+                children=[
+                    Label("R", font_size="small"),
+                    r_spin,
+                    Label("G", font_size="small"),
+                    g_spin,
+                    Label("B", font_size="small"),
+                    b_spin,
+                ],
+            ),
+            Box(
+                direction="row",
+                height=28.0,
+                flex_grow=1.0,
+                background=(state["r"], state["g"], state["b"], state["a"]),
+                children=[],
+            ),
+            readout,
+        ],
+    )
+
+    def on_ok():
+        sync_from_spins()
+        if on_pick is not None:
+            on_pick((state["r"], state["g"], state["b"], state["a"]))
+
+    def on_cancel():
+        if on_pick is not None:
+            on_pick(None)
+
+    dialog = Dialog(
+        "Pick color",
+        content,
+        buttons=[("OK", on_ok), ("Cancel", on_cancel)],
+        modal=True,
+        on_dismiss=on_cancel,
+    )
+    dialog.show(window)
+    return dialog
+
+
+class GroupBox:
+    """Titled frame around `content` (Label + bordered/padded Box)."""
+
+    def __init__(self, title, content, padding="medium"):
+        self.title = title
+        self.content = content
+        self.padding = padding
+
+    @property
+    def _fastgui_widget(self):
+        theme = get_theme()
+        # 1px border via nested Boxes (outer border color, inner surface inset by 1).
+        inner = Box(
+            direction="column",
+            gap="small",
+            padding=self.padding,
+            background=theme.surface,
+            children=[
+                Label(self.title, font_size="small", color=theme.text_muted),
+                self.content,
+            ],
+        )
+        return Box(
+            direction="column",
+            padding=1.0,
+            background=theme.border,
+            children=[inner],
+        )
+
+
+class CollapsibleSection:
+    """Header row toggles body visibility via `Box.set_display`."""
+
+    def __init__(self, title, content, expanded=True):
+        self.title = title
+        self.content = content
+        self._expanded = bool(expanded)
+        self._body = None
+        self._header = None
+
+    def set_expanded(self, expanded):
+        self._expanded = bool(expanded)
+        if self._body is not None:
+            self._body.set_display(self._expanded)
+        if self._header is not None:
+            try:
+                self._header.set_text(self._header_label())
+            except RuntimeError:
+                pass
+
+    def _header_label(self):
+        mark = "▼" if self._expanded else "▶"
+        return f"{mark}  {self.title}"
+
+    def _toggle(self):
+        self.set_expanded(not self._expanded)
+
+    @property
+    def expanded(self):
+        return self._expanded
+
+    @property
+    def _fastgui_widget(self):
+        theme = get_theme()
+        self._header = Button(
+            self._header_label(),
+            on_click=self._toggle,
+            background=theme.surface_alt,
+            text_color=theme.text,
+        )
+        self._body = Box(
+            direction="column",
+            padding="small",
+            children=[self.content],
+            visible=self._expanded,
+            flex_grow=1.0,
+        )
+        return Box(
+            direction="column",
+            gap=2.0,
+            children=[self._header, self._body],
+            background=theme.surface,
+        )
+
+
+class StackedWidget:
+    """Only one child visible at a time; `set_index(i)` toggles `Display::None` on the rest."""
+
+    def __init__(self, children, index=0):
+        self.children = list(children)
+        if not self.children:
+            raise ValueError("StackedWidget needs at least one child")
+        self._index = max(0, min(int(index), len(self.children) - 1))
+        self._pages = []
+
+    @property
+    def index(self):
+        return self._index
+
+    def set_index(self, index):
+        if not self.children:
+            return
+        self._index = max(0, min(int(index), len(self.children) - 1))
+        for i, page in enumerate(self._pages):
+            page.set_display(i == self._index)
+
+    @property
+    def _fastgui_widget(self):
+        self._pages = [
+            Box(
+                direction="column",
+                children=[child],
+                flex_grow=1.0,
+                visible=(i == self._index),
+            )
+            for i, child in enumerate(self.children)
+        ]
+        return Box(direction="column", children=self._pages, flex_grow=1.0)
 
 
 class DockArea:
@@ -358,13 +825,20 @@ __all__ = [
     "Box",
     "Button",
     "Checkbox",
+    "CollapsibleSection",
     "ComboBox",
     "CudaSurface",
+    "Dialog",
     "DockArea",
     "Grid",
+    "GroupBox",
     "Image",
     "Label",
     "ListView",
+    "Menu",
+    "MenuBar",
+    "MenuItem",
+    "MenuSeparator",
     "NumericScrub",
     "Panel",
     "Popup",
@@ -374,13 +848,19 @@ __all__ = [
     "Slider",
     "SpinBox",
     "Splitter",
+    "StackedWidget",
+    "StatusBar",
     "Tabs",
     "TextArea",
     "TextInput",
     "Theme",
     "Toggle",
+    "Toolbar",
     "Viewport",
     "Window",
     "get_theme",
+    "open_file_dialog",
+    "pick_color",
+    "save_file_dialog",
     "set_theme",
 ]
