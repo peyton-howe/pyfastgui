@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use fastgui_core::taffy::prelude::*;
 use fastgui_core::widget::{
-    spin_down_rect, spin_up_rect, Color, PopupAnchor, PopupSide, WidgetId, WidgetKind, WidgetTree,
+    clamp_range, round_to_decimals, spin_down_rect, spin_up_rect, PopupAnchor, PopupSide, WidgetId,
+    WidgetKind, WidgetTree,
 };
 
 /// A change to the tree queued by a widget callback (see [`defer`]).
@@ -60,11 +61,34 @@ pub fn toggle_bool(tree: &mut WidgetTree, id: WidgetId) -> bool {
 
 /// Select a `Radio`, clear peers that share its `group_id`, and fire `on_select` if it changed.
 pub fn select_radio(tree: &mut WidgetTree, id: WidgetId) -> bool {
-    let Some(WidgetKind::Radio { selected, group_id, .. }) = tree.kind(id) else {
+    if !set_radio_selected(tree, id, true) {
+        return false;
+    }
+    if let Some(WidgetKind::Radio { on_select: Some(callback), .. }) = tree.kind(id) {
+        callback();
+    }
+    true
+}
+
+/// Set a radio's selection without firing `on_select` (Python setters never fire callbacks).
+/// Selecting clears peers in the same group; deselecting only clears this radio.
+pub fn set_radio_selected(tree: &mut WidgetTree, id: WidgetId, selected: bool) -> bool {
+    let Some(WidgetKind::Radio { selected: was, group_id, .. }) = tree.kind(id) else {
         return false;
     };
-    if *selected {
+    if *was == selected {
         return false;
+    }
+    if !selected {
+        tree.mutate_kind(id, |kind| {
+            if let WidgetKind::Radio { selected, mirror, .. } = kind {
+                *selected = false;
+                if let Some(mirror) = mirror {
+                    mirror.set(false);
+                }
+            }
+        });
+        return true;
     }
     let group_id = *group_id;
     let peers: Vec<_> = tree
@@ -83,34 +107,38 @@ pub fn select_radio(tree: &mut WidgetTree, id: WidgetId) -> bool {
             }
         });
     }
-    if let Some(WidgetKind::Radio { on_select: Some(callback), .. }) = tree.kind(id) {
-        callback();
-    }
     true
 }
 
-/// Set a `SpinBox` or `NumericScrub` value (clamped), update its mirror, fire `on_change`.
+/// Radios in `group_id` in tree-walk order (for arrow-key navigation).
+pub fn radios_in_group(tree: &WidgetTree, group_id: u64) -> Vec<WidgetId> {
+    tree.walk()
+        .filter(|&id| matches!(tree.kind(id), Some(WidgetKind::Radio { group_id: g, .. }) if *g == group_id))
+        .collect()
+}
+
+/// Set a `SpinBox` or `NumericScrub` value (clamped + rounded), update its mirror, fire `on_change`.
 pub fn set_numeric(tree: &mut WidgetTree, id: WidgetId, new_value: f32) -> bool {
     let mut changed = false;
     let mut published = None;
     tree.mutate_kind(id, |kind| match kind {
-        WidgetKind::SpinBox { value, min, max, mirror, .. } => {
-            let clamped = new_value.clamp((*min).min(*max), (*max).max(*min));
-            changed = *value != clamped;
-            *value = clamped;
+        WidgetKind::SpinBox { value, min, max, decimals, mirror, .. } => {
+            let next = round_to_decimals(clamp_range(new_value, *min, *max), *decimals);
+            changed = *value != next;
+            *value = next;
             if let Some(mirror) = mirror {
-                mirror.set(clamped);
+                mirror.set(next);
             }
-            published = Some(clamped);
+            published = Some(next);
         }
-        WidgetKind::NumericScrub { value, min, max, mirror, .. } => {
-            let clamped = new_value.clamp((*min).min(*max), (*max).max(*min));
-            changed = *value != clamped;
-            *value = clamped;
+        WidgetKind::NumericScrub { value, min, max, decimals, mirror, .. } => {
+            let next = round_to_decimals(clamp_range(new_value, *min, *max), *decimals);
+            changed = *value != next;
+            *value = next;
             if let Some(mirror) = mirror {
-                mirror.set(clamped);
+                mirror.set(next);
             }
-            published = Some(clamped);
+            published = Some(next);
         }
         _ => {}
     });
@@ -162,9 +190,6 @@ pub fn handle_press(tree: &mut WidgetTree, id: WidgetId, x: f32, y: f32) -> Pres
     }
 }
 
-/// Dark-theme selection tint used for combo dropdown rows (matches Python `palette().selection`).
-const COMBO_SELECTION: Color = Color([0.25, 0.45, 0.80, 0.6]);
-
 /// Toggle the dropdown for `ComboBox` `combo_id`: close if open, otherwise open a non-modal
 /// popup anchored below with a `ListView` of the combo's items.
 pub fn open_combo(tree: &mut WidgetTree, combo_id: WidgetId) {
@@ -195,6 +220,7 @@ pub fn open_combo(tree: &mut WidgetTree, combo_id: WidgetId) {
         text_color,
         background,
         border,
+        selection_color,
     ) = match tree.kind(combo_id) {
         Some(WidgetKind::ComboBox {
             items,
@@ -203,6 +229,7 @@ pub fn open_combo(tree: &mut WidgetTree, combo_id: WidgetId) {
             text_color,
             background,
             border,
+            selection_color,
             ..
         }) => (
             items.clone(),
@@ -211,6 +238,7 @@ pub fn open_combo(tree: &mut WidgetTree, combo_id: WidgetId) {
             *text_color,
             *background,
             *border,
+            *selection_color,
         ),
         _ => return,
     };
@@ -256,7 +284,7 @@ pub fn open_combo(tree: &mut WidgetTree, combo_id: WidgetId) {
         selected,
         text_color,
         background,
-        selection_color: COMBO_SELECTION,
+        selection_color,
         on_select: Some(pick.clone()),
         on_activate: Some(pick),
         mirror: None,
@@ -326,21 +354,31 @@ fn set_numeric_delta(tree: &mut WidgetTree, id: WidgetId, delta: f32) -> bool {
     set_numeric(tree, id, current + delta)
 }
 
-/// Apply a horizontal scrub drag: `dx` logical pixels since press (or last update).
-pub fn scrub_by(tree: &mut WidgetTree, id: WidgetId, dx: f32) -> bool {
-    let (value, speed) = match tree.kind(id) {
-        Some(WidgetKind::NumericScrub { value, speed, .. }) => (*value, *speed),
-        Some(WidgetKind::SpinBox { value, step, .. }) => (*value, *step * 0.1),
+/// Apply a horizontal scrub from the press origin: `start_value + dx * speed`.
+/// Scrubbing from the origin (instead of per-event deltas) keeps slow drags moving after
+/// `round_to_decimals` would otherwise swallow tiny steps.
+pub fn scrub_from(tree: &mut WidgetTree, id: WidgetId, start_value: f32, dx: f32) -> bool {
+    let speed = match tree.kind(id) {
+        Some(WidgetKind::NumericScrub { speed, .. }) => *speed,
+        Some(WidgetKind::SpinBox { step, .. }) => *step * 0.1,
         _ => return false,
     };
-    set_numeric(tree, id, value + dx * speed)
+    set_numeric(tree, id, start_value + dx * speed)
+}
+
+/// Current numeric value of a `SpinBox` / `NumericScrub`, for recording a scrub press origin.
+pub fn numeric_value(tree: &WidgetTree, id: WidgetId) -> Option<f32> {
+    match tree.kind(id) {
+        Some(WidgetKind::SpinBox { value, .. } | WidgetKind::NumericScrub { value, .. }) => Some(*value),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PressResult {
     Ignored,
     Handled(bool),
-    /// Caller should track drag and call `scrub_by`.
+    /// Caller should track drag and call `scrub_from`.
     StartScrub,
 }
 
@@ -483,6 +521,7 @@ mod tests {
             placeholder_color: Color::TRANSPARENT,
             background: Color([0.16, 0.17, 0.2, 1.0]),
             border: Color([0.32, 0.35, 0.42, 1.0]),
+            selection_color: Color([0.25, 0.45, 0.80, 0.6]),
             on_change,
             mirror: None,
             popup_id: None,

@@ -131,27 +131,49 @@ pub fn scroll_caret_into_view(tree: &mut WidgetTree, id: WidgetId, measure: &mut
                 });
             }
         }
-        Some(WidgetKind::TextArea { edit, font_size, scroll_y, preedit, .. }) => {
+        Some(WidgetKind::TextArea { edit, font_size, scroll_x, scroll_y, preedit, .. }) => {
             let (display, caret, _) = edit.composed(preedit.as_ref());
-            let line_height = *font_size * LINE_HEIGHT_RATIO;
-            let visible = (rect.height - 2.0 * TEXT_INPUT_VERTICAL_PADDING).max(0.0);
+            let size = *font_size;
+            let line_height = size * LINE_HEIGHT_RATIO;
+            let visible_h = (rect.height - 2.0 * TEXT_INPUT_VERTICAL_PADDING).max(0.0);
+            let visible_w = (rect.width - 2.0 * TEXT_INPUT_PADDING - CARET_SLACK).max(0.0);
             let line_index = display[..caret].bytes().filter(|&b| b == b'\n').count() as f32;
             let caret_top = line_index * line_height;
             let caret_bottom = caret_top + line_height;
-            let mut target = *scroll_y;
-            if caret_bottom - target > visible {
-                target = caret_bottom - visible;
+            let mut target_y = *scroll_y;
+            if caret_bottom - target_y > visible_h {
+                target_y = caret_bottom - visible_h;
             }
-            if caret_top < target {
-                target = caret_top;
+            if caret_top < target_y {
+                target_y = caret_top;
             }
             let total_lines = display.split('\n').count().max(1) as f32;
             let content_h = total_lines * line_height;
-            target = target.clamp(0.0, (content_h - visible).max(0.0));
-            if target != *scroll_y {
+            target_y = target_y.clamp(0.0, (content_h - visible_h).max(0.0));
+
+            let line_start = display[..caret].rfind('\n').map_or(0, |i| i + 1);
+            let line_end = display[line_start..].find('\n').map_or(display.len(), |i| line_start + i);
+            let line = &display[line_start..line_end];
+            let local = caret.saturating_sub(line_start).min(line.len());
+            let caret_x = measure.caret_x(line, size, local);
+            let mut max_line_w = 0.0f32;
+            for row in display.split('\n') {
+                max_line_w = max_line_w.max(measure.caret_x(row, size, row.len()));
+            }
+            let mut target_x = *scroll_x;
+            if caret_x - target_x > visible_w {
+                target_x = caret_x - visible_w;
+            }
+            if caret_x < target_x {
+                target_x = caret_x;
+            }
+            target_x = target_x.clamp(0.0, (max_line_w - visible_w).max(0.0));
+
+            if target_x != *scroll_x || target_y != *scroll_y {
                 tree.mutate_kind(id, |kind| {
-                    if let WidgetKind::TextArea { scroll_y, .. } = kind {
-                        *scroll_y = target;
+                    if let WidgetKind::TextArea { scroll_x, scroll_y, .. } = kind {
+                        *scroll_x = target_x;
+                        *scroll_y = target_y;
                     }
                 });
             }
@@ -317,7 +339,7 @@ fn index_at_cursor(
             let x = cursor_x - rect.x - TEXT_INPUT_PADDING + scroll;
             Some(measure.index_at(edit.text(), *font_size, x))
         }
-        Some(WidgetKind::TextArea { edit, font_size, scroll_y, .. }) => {
+        Some(WidgetKind::TextArea { edit, font_size, scroll_x, scroll_y, .. }) => {
             let text = edit.text();
             let line_height = *font_size * LINE_HEIGHT_RATIO;
             let y = cursor_y - rect.y - TEXT_INPUT_VERTICAL_PADDING + *scroll_y;
@@ -333,7 +355,7 @@ fn index_at_cursor(
                 let end = start + line.len();
                 let last = lines.peek().is_none();
                 if i == line_index || last {
-                    let x = cursor_x - rect.x - TEXT_INPUT_PADDING;
+                    let x = cursor_x - rect.x - TEXT_INPUT_PADDING + scroll_x;
                     let local = measure.index_at(line, *font_size, x);
                     return Some(start + local);
                 }
@@ -381,7 +403,7 @@ pub fn ime_cursor_area(tree: &WidgetTree, measure: &mut dyn TextMeasure) -> Opti
             let x = rect.x + TEXT_INPUT_PADDING + measure.caret_x(&display, *font_size, caret) - scroll;
             Some(Rect { x, y: rect.y, width: 1.0, height: rect.height })
         }
-        Some(WidgetKind::TextArea { edit, font_size, scroll_y, preedit, .. }) => {
+        Some(WidgetKind::TextArea { edit, font_size, scroll_x, scroll_y, preedit, .. }) => {
             let (display, caret, _) = edit.composed(preedit.as_ref());
             let caret = caret.min(display.len());
             let line_height = *font_size * LINE_HEIGHT_RATIO;
@@ -390,7 +412,7 @@ pub fn ime_cursor_area(tree: &WidgetTree, measure: &mut dyn TextMeasure) -> Opti
             let line = &display[line_start..line_end];
             let local_caret = caret.saturating_sub(line_start).min(line.len());
             let line_index = display[..line_start].bytes().filter(|&b| b == b'\n').count() as f32;
-            let x = rect.x + TEXT_INPUT_PADDING + measure.caret_x(line, *font_size, local_caret);
+            let x = rect.x + TEXT_INPUT_PADDING + measure.caret_x(line, *font_size, local_caret) - scroll_x;
             let y = rect.y + TEXT_INPUT_VERTICAL_PADDING + line_index * line_height - *scroll_y;
             let _ = edit;
             Some(Rect { x, y, width: 1.0, height: line_height })
@@ -505,6 +527,45 @@ mod tests {
                 placeholder_color: Color::TRANSPARENT,
                 background: Color::TRANSPARENT,
                 selection_color: Color::TRANSPARENT,
+                scroll_x: 0.0,
+                scroll_y: 0.0,
+                preedit: None,
+                on_change: Some(Arc::new(move |t| c.lock().unwrap().push(t))),
+                on_submit: Some(Arc::new(move |t| s.lock().unwrap().push(t))),
+                mirror: Some(mirror.clone()),
+            },
+        );
+        tree.add_child(root, id);
+        tree.compute_layout(400.0, 300.0);
+        tree.set_focus(Some(id));
+        Field { tree, id, changes, submits, mirror, clipboard: FakeClipboard::default() }
+    }
+
+    /// A narrow multiline field (~10 mono characters visible) for horizontal scroll tests.
+    fn narrow_area(text: &str) -> Field {
+        let changes = Arc::new(Mutex::new(Vec::new()));
+        let submits = Arc::new(Mutex::new(Vec::new()));
+        let mirror = Readback::new(text.to_owned());
+        let (c, s) = (changes.clone(), submits.clone());
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let id = tree.new_node(
+            Style {
+                size: Size {
+                    width: Dimension::length(100.0 + 2.0 * TEXT_INPUT_PADDING + CARET_SLACK),
+                    height: Dimension::length(16.0 * LINE_HEIGHT_RATIO * 2.0 + 2.0 * TEXT_INPUT_VERTICAL_PADDING),
+                },
+                ..Default::default()
+            },
+            WidgetKind::TextArea {
+                edit: TextEdit::new_multiline(text),
+                placeholder: String::new(),
+                font_size: 16.0,
+                text_color: Color::TRANSPARENT,
+                placeholder_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                selection_color: Color::TRANSPARENT,
+                scroll_x: 0.0,
                 scroll_y: 0.0,
                 preedit: None,
                 on_change: Some(Arc::new(move |t| c.lock().unwrap().push(t))),
@@ -535,6 +596,13 @@ mod tests {
             match self.tree.kind(self.id) {
                 Some(WidgetKind::TextInput { edit, scroll, .. }) => (edit.text().to_owned(), edit.caret(), *scroll),
                 Some(WidgetKind::TextArea { edit, scroll_y, .. }) => (edit.text().to_owned(), edit.caret(), *scroll_y),
+                _ => panic!(),
+            }
+        }
+
+        fn scroll_x(&self) -> f32 {
+            match self.tree.kind(self.id) {
+                Some(WidgetKind::TextArea { scroll_x, .. }) => *scroll_x,
                 _ => panic!(),
             }
         }
@@ -639,5 +707,15 @@ mod tests {
         assert_eq!(f.state().1, 6);
         f.key(Key::Named(NamedKey::Home), None, CMD);
         assert_eq!(f.state().1, 0);
+    }
+
+    #[test]
+    fn textarea_caret_scrolls_horizontally_into_view_and_home_resets() {
+        let mut f = narrow_area("");
+        f.typed("0123456789abcde");
+        // 15 chars = 150 units in a 100-unit view: the caret sits at the right edge.
+        assert_eq!(f.scroll_x(), 50.0);
+        f.key(Key::Named(NamedKey::Home), None, ModifiersState::empty());
+        assert_eq!(f.scroll_x(), 0.0);
     }
 }

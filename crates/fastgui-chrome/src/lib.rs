@@ -355,6 +355,7 @@ impl ChromeRenderer {
                     placeholder_color,
                     background,
                     selection_color,
+                    scroll_x,
                     scroll_y,
                     preedit,
                     ..
@@ -370,6 +371,7 @@ impl ChromeRenderer {
                         placeholder_color: *placeholder_color,
                         selection_color: *selection_color,
                         caret_color: theme.accent,
+                        scroll_x: *scroll_x,
                         scroll_y: *scroll_y,
                     };
                     self.push_text_area(&mut ops, logical_rect, scale, &field);
@@ -560,6 +562,7 @@ impl ChromeRenderer {
         if inner.width <= 0.0 || inner.height <= 0.0 {
             return;
         }
+        let scroll_x = (field.scroll_x * scale).round();
         let scroll_y = (field.scroll_y * scale).round();
         let (display, caret, composing) = field.edit.composed(field.preedit.filter(|_| field.focused));
         let selection = if composing.is_some() { 0..0 } else { field.edit.selection() };
@@ -589,12 +592,13 @@ impl ChromeRenderer {
                             let x0 = if selection.start <= line_start {
                                 inner.x
                             } else {
-                                inner.x + stop_x(&stops, sel_start - line_start)
+                                inner.x + stop_x(&stops, sel_start - line_start) - scroll_x
                             };
                             let x1 = if selection.end > line_end {
-                                (inner.x + stop_x(&stops, line.len()) + font_size * 0.4).min(inner.x + inner.width)
+                                (inner.x + stop_x(&stops, line.len()) - scroll_x + font_size * 0.4)
+                                    .min(inner.x + inner.width)
                             } else {
-                                inner.x + stop_x(&stops, sel_end - line_start)
+                                inner.x + stop_x(&stops, sel_end - line_start) - scroll_x
                             };
                             let (x0, x1) = (x0.max(inner.x), x1.min(inner.x + inner.width));
                             if x1 > x0 {
@@ -607,15 +611,15 @@ impl ChromeRenderer {
                         }
                     }
                     if !line.is_empty() {
-                        self.push_line_text(&mut content, line_rect, line, font_size, 0.0, field.text_color);
+                        self.push_line_text(&mut content, line_rect, line, font_size, scroll_x, field.text_color);
                     }
                     if let Some(range) = &composing {
                         let c0 = range.start.max(line_start);
                         let c1 = range.end.min(line_end);
                         if c0 < c1 {
                             let stops = self.line_stops(line, font_size);
-                            let x0 = (inner.x + stop_x(&stops, c0 - line_start)).max(inner.x);
-                            let x1 = (inner.x + stop_x(&stops, c1 - line_start)).min(inner.x + inner.width);
+                            let x0 = (inner.x + stop_x(&stops, c0 - line_start) - scroll_x).max(inner.x);
+                            let x1 = (inner.x + stop_x(&stops, c1 - line_start) - scroll_x).min(inner.x + inner.width);
                             let thickness = scale.max(1.0);
                             push_fill(
                                 &mut content,
@@ -634,7 +638,9 @@ impl ChromeRenderer {
                         let stops = self.line_stops(line, font_size);
                         let width = (CARET_WIDTH * scale).max(1.0);
                         let local = caret.saturating_sub(line_start).min(line.len());
-                        let x = (inner.x + stop_x(&stops, local)).round().clamp(inner.x, inner.x + inner.width - width);
+                        let x = (inner.x + stop_x(&stops, local) - scroll_x)
+                            .round()
+                            .clamp(inner.x, inner.x + inner.width - width);
                         push_fill(&mut content, WidgetRect { x, y, width, height: line_height }, field.caret_color);
                     }
                 }
@@ -989,6 +995,7 @@ struct TextAreaField<'a> {
     placeholder_color: Color,
     selection_color: Color,
     caret_color: Color,
+    scroll_x: f32,
     scroll_y: f32,
 }
 

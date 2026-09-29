@@ -134,13 +134,31 @@ fn handle_key_inner(
             }
             activate
         }
-        Some(WidgetKind::Radio { .. }) => {
+        Some(WidgetKind::Radio { group_id, .. }) => {
+            let group_id = *group_id;
             let activate = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space))
                 || matches!(key, Key::Character(c) if c == " ");
             if activate {
                 crate::forms::select_radio(tree, id);
+                return true;
             }
-            activate
+            let step = match key {
+                Key::Named(NamedKey::ArrowUp | NamedKey::ArrowLeft) => -1isize,
+                Key::Named(NamedKey::ArrowDown | NamedKey::ArrowRight) => 1,
+                _ => return false,
+            };
+            let peers = crate::forms::radios_in_group(tree, group_id);
+            let Some(index) = peers.iter().position(|&peer| peer == id) else {
+                return false;
+            };
+            let next = index as isize + step;
+            if next < 0 || next as usize >= peers.len() {
+                return false;
+            }
+            let target = peers[next as usize];
+            crate::forms::select_radio(tree, target);
+            tree.set_focus(Some(target));
+            true
         }
         Some(WidgetKind::SpinBox { value, min, max, step, .. }) => {
             let (value, min, max, step) = (*value, *min, *max, *step);

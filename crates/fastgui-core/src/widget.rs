@@ -285,7 +285,8 @@ pub enum WidgetKind {
         mirror: Option<Readback<String>>,
     },
     /// A multi-line editable text field (`QTextEdit`) with hard newlines only (no soft wrap yet).
-    /// Same editing/IME/`mirror` model as `TextInput`; `scroll_y` keeps the caret line in view.
+    /// Same editing/IME/`mirror` model as `TextInput`; `scroll_y` keeps the caret line in view
+    /// and `scroll_x` keeps the caret column in view on long unwrapped lines.
     TextArea {
         edit: TextEdit,
         placeholder: String,
@@ -294,6 +295,7 @@ pub enum WidgetKind {
         placeholder_color: Color,
         background: Color,
         selection_color: Color,
+        scroll_x: f32,
         scroll_y: f32,
         preedit: Option<(String, Option<(usize, usize)>)>,
         on_change: Option<TextCallback>,
@@ -441,6 +443,8 @@ pub enum WidgetKind {
         placeholder_color: Color,
         background: Color,
         border: Color,
+        /// Highlight color for the open dropdown's selected row (`palette().selection`).
+        selection_color: Color,
         on_change: Option<IndexCallback>,
         mirror: Option<Readback<Option<usize>>>,
         /// Open dropdown popup id, if any (runtime; describe leaves None).
@@ -565,6 +569,27 @@ pub fn format_decimal(value: f32, decimals: u32) -> String {
         format!("{}", value.round() as i64)
     } else {
         format!("{value:.prec$}", prec = decimals as usize)
+    }
+}
+
+/// Clamp `value` into `[a, b]` (either order). A NaN bound leaves `value` unchanged so callers
+/// never hit `f32::clamp`'s panic on a NaN or reversed range.
+pub fn clamp_range(value: f32, a: f32, b: f32) -> f32 {
+    let (lo, hi) = (a.min(b), a.max(b));
+    if lo.is_nan() || hi.is_nan() {
+        value
+    } else {
+        value.clamp(lo, hi)
+    }
+}
+
+/// Round `value` to `decimals` fractional digits (`0` → nearest integer).
+pub fn round_to_decimals(value: f32, decimals: u32) -> f32 {
+    if decimals == 0 {
+        value.round()
+    } else {
+        let scale = 10f32.powi(decimals as i32);
+        (value * scale).round() / scale
     }
 }
 
@@ -2556,6 +2581,7 @@ mod tests {
                 placeholder_color: Color::TRANSPARENT,
                 background: Color::TRANSPARENT,
                 border: Color::TRANSPARENT,
+                selection_color: Color::TRANSPARENT,
                 on_change: None,
                 mirror: None,
                 popup_id: None,
@@ -2588,6 +2614,7 @@ mod tests {
                 placeholder_color: Color::TRANSPARENT,
                 background: Color::TRANSPARENT,
                 selection_color: Color::TRANSPARENT,
+                scroll_x: 0.0,
                 scroll_y: 0.0,
                 preedit: None,
                 on_change: None,

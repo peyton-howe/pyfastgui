@@ -1,11 +1,13 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use fastgui_core::taffy::prelude::*;
 use fastgui_core::taffy::style::LengthPercentage;
 use fastgui_core::widget::{
-    BoolCallback, ChangeCallback, ClickCallback, Color, IndexCallback, PanelCloseCallback, PanelDropCallback,
-    PopupAnchor, PopupSide, SplitDirection, TabSelectCallback, TextCallback, WidgetId, WidgetKind, WidgetTree,
+    clamp_range, round_to_decimals, BoolCallback, ChangeCallback, ClickCallback, Color, IndexCallback,
+    PanelCloseCallback, PanelDropCallback, PopupAnchor, PopupSide, SplitDirection, TabSelectCallback,
+    TextCallback, WidgetId, WidgetKind, WidgetTree,
 };
 use fastgui_core::text_edit::TextEdit;
 use fastgui_core::{CpuFrame, FrameSlot, PixelFormat, Readback};
@@ -82,18 +84,65 @@ fn next_image_id() -> u64 {
 /// `value` clamped to the range between `a` and `b` in either order. `f32::clamp` panics when
 /// `min > max` or a bound is NaN — on the render thread that took the whole app down for a
 /// `ProgressBar(min=1, max=0).set_value(...)`.
-fn clamp_range(value: f32, a: f32, b: f32) -> f32 {
-    let (lo, hi) = (a.min(b), a.max(b));
-    if lo.is_nan() || hi.is_nan() {
-        value
-    } else {
-        value.clamp(lo, hi)
-    }
-}
+/// Auto-assigned radio group ids set this high bit so they never collide with user-supplied ones.
+const RADIO_AUTO_GROUP_BIT: u64 = 1 << 63;
 
 static NEXT_RADIO_GROUP: AtomicU64 = AtomicU64::new(1);
 fn next_radio_group() -> u64 {
-    NEXT_RADIO_GROUP.fetch_add(1, Ordering::Relaxed)
+    NEXT_RADIO_GROUP.fetch_add(1, Ordering::Relaxed) | RADIO_AUTO_GROUP_BIT
+}
+
+fn parse_radio_group(group: Option<u64>) -> PyResult<u64> {
+    match group {
+        None => Ok(next_radio_group()),
+        Some(g) if g >= RADIO_AUTO_GROUP_BIT => Err(PyValueError::new_err(
+            "Radio.group must be < 2**63 (automatic ids use that range)",
+        )),
+        Some(g) => Ok(g),
+    }
+}
+
+/// Mirrors for radios that share a group — used by `set_selected` before the widgets attach.
+static RADIO_GROUP_MIRRORS: LazyLock<Mutex<HashMap<u64, Vec<Readback<bool>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn register_radio_mirror(group: u64, mirror: &Readback<bool>) {
+    RADIO_GROUP_MIRRORS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(group)
+        .or_default()
+        .push(mirror.clone());
+}
+
+fn sync_radio_mirrors(group: u64, chosen: &Readback<bool>, selected: bool) {
+    let mirrors = RADIO_GROUP_MIRRORS.lock().unwrap_or_else(|p| p.into_inner());
+    if selected {
+        if let Some(peers) = mirrors.get(&group) {
+            for mirror in peers {
+                mirror.set(false);
+            }
+        }
+    }
+    drop(mirrors);
+    chosen.set(selected);
+}
+
+fn require_finite(name: &str, value: f32) -> PyResult<f32> {
+    if value.is_nan() {
+        Err(PyValueError::new_err(format!("{name} must be a finite number (got NaN)")))
+    } else {
+        Ok(value)
+    }
+}
+
+fn require_positive_step(name: &str, value: f32) -> PyResult<f32> {
+    let value = require_finite(name, value)?;
+    if value <= 0.0 {
+        Err(PyValueError::new_err(format!("{name} must be > 0")))
+    } else {
+        Ok(value)
+    }
 }
 
 fn wrap_callback_text(callback: Py<PyAny>) -> TextCallback {
@@ -1011,8 +1060,9 @@ impl TextArea {
             return Ok(());
         }
         mutate(&self.id, &self.sender, move |kind| {
-            if let WidgetKind::TextArea { edit, scroll_y, preedit, .. } = kind {
+            if let WidgetKind::TextArea { edit, scroll_x, scroll_y, preedit, .. } = kind {
                 edit.set_text(&text);
+                *scroll_x = 0.0;
                 *scroll_y = 0.0;
                 *preedit = None;
             }
@@ -1038,6 +1088,7 @@ impl TextArea {
                 placeholder_color: rgba(self.placeholder_color.unwrap_or(crate::theme::palette().text_muted)),
                 background: rgba(self.background.unwrap_or(crate::theme::palette().surface_alt)),
                 selection_color: rgba(self.selection_color.unwrap_or(crate::theme::palette().selection)),
+                scroll_x: 0.0,
                 scroll_y: 0.0,
                 preedit: None,
                 on_change: on_change.map(wrap_callback_text),
@@ -1441,7 +1492,8 @@ impl ScrollArea {
     }
 }
 
-/// A labeled on/off checkbox.
+/// A labeled on/off checkbox (`QCheckBox`). Click or Space/Enter toggles; `checked` / `set_checked`
+/// mirror the value (setters never fire `on_change`).
 #[pyclass]
 pub(crate) struct Checkbox {
     id: IdCell,
@@ -1578,19 +1630,25 @@ impl Radio {
         text_color: Option<(f32, f32, f32, f32)>,
         box_color: Option<(f32, f32, f32, f32)>,
         dot_color: Option<(f32, f32, f32, f32)>,
-    ) -> Self {
-        Self {
+    ) -> PyResult<Self> {
+        let group_id = parse_radio_group(group)?;
+        let mirror = Readback::new(selected);
+        register_radio_mirror(group_id, &mirror);
+        if selected {
+            sync_radio_mirrors(group_id, &mirror, true);
+        }
+        Ok(Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
-            selected: Readback::new(selected),
+            selected: mirror,
             label,
-            group_id: group.unwrap_or_else(next_radio_group),
+            group_id,
             font_size,
             text_color,
             box_color,
             dot_color,
             on_select,
-        }
+        })
     }
 
     /// Stable group id — pass the same value to peer `Radio`s so only one can be selected.
@@ -1602,6 +1660,54 @@ impl Radio {
     #[getter]
     fn selected(&self) -> bool {
         self.selected.get()
+    }
+
+    /// Select or clear this radio without firing `on_select`. Selecting clears peers in the
+    /// same group (their `selected` getters update too).
+    fn set_selected(&self, selected: bool) -> PyResult<()> {
+        sync_radio_mirrors(self.group_id, &self.selected, selected);
+        let id = *self.id.lock().unwrap_or_else(|p| p.into_inner());
+        let sender = self.sender.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let (Some(id), Some(sender)) = (id, sender) else {
+            return Ok(());
+        };
+        send_tree_mutation(&sender, move |tree| {
+            // Same exclusivity as a click, without firing `on_select` (setters never do).
+            let Some(WidgetKind::Radio { selected: was, group_id, .. }) = tree.kind(id) else {
+                return;
+            };
+            if *was == selected {
+                return;
+            }
+            if !selected {
+                tree.mutate_kind(id, |kind| {
+                    if let WidgetKind::Radio { selected, mirror, .. } = kind {
+                        *selected = false;
+                        if let Some(mirror) = mirror {
+                            mirror.set(false);
+                        }
+                    }
+                });
+                return;
+            }
+            let group_id = *group_id;
+            let peers: Vec<_> = tree
+                .walk()
+                .filter(|&peer| {
+                    matches!(tree.kind(peer), Some(WidgetKind::Radio { group_id: g, .. }) if *g == group_id)
+                })
+                .collect();
+            for peer in peers {
+                tree.mutate_kind(peer, |kind| {
+                    if let WidgetKind::Radio { selected, mirror, .. } = kind {
+                        *selected = peer == id;
+                        if let Some(mirror) = mirror {
+                            mirror.set(*selected);
+                        }
+                    }
+                });
+            }
+        })
     }
 }
 
@@ -1780,9 +1886,13 @@ impl SpinBox {
         text_color: Option<(f32, f32, f32, f32)>,
         background: Option<(f32, f32, f32, f32)>,
         button_color: Option<(f32, f32, f32, f32)>,
-    ) -> Self {
-        let value = value.clamp(min.min(max), max.max(min));
-        Self {
+    ) -> PyResult<Self> {
+        let value = require_finite("value", value)?;
+        let min = require_finite("min", min)?;
+        let max = require_finite("max", max)?;
+        let step = require_positive_step("step", step)?;
+        let value = round_to_decimals(clamp_range(value, min, max), decimals);
+        Ok(Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
             value: Readback::new(value),
@@ -1796,7 +1906,7 @@ impl SpinBox {
             background,
             button_color,
             on_change,
-        }
+        })
     }
 
     #[getter]
@@ -1805,7 +1915,8 @@ impl SpinBox {
     }
 
     fn set_value(&self, value: f32) -> PyResult<()> {
-        let value = value.clamp(self.min.min(self.max), self.max.max(self.min));
+        let value = require_finite("value", value)?;
+        let value = round_to_decimals(clamp_range(value, self.min, self.max), self.decimals);
         self.value.set(value);
         if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
             return Ok(());
@@ -1889,9 +2000,13 @@ impl NumericScrub {
         width: Option<f32>,
         text_color: Option<(f32, f32, f32, f32)>,
         background: Option<(f32, f32, f32, f32)>,
-    ) -> Self {
-        let value = value.clamp(min.min(max), max.max(min));
-        Self {
+    ) -> PyResult<Self> {
+        let value = require_finite("value", value)?;
+        let min = require_finite("min", min)?;
+        let max = require_finite("max", max)?;
+        let speed = require_positive_step("speed", speed)?;
+        let value = round_to_decimals(clamp_range(value, min, max), decimals);
+        Ok(Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
             value: Readback::new(value),
@@ -1904,7 +2019,7 @@ impl NumericScrub {
             text_color,
             background,
             on_change,
-        }
+        })
     }
 
     #[getter]
@@ -1913,7 +2028,8 @@ impl NumericScrub {
     }
 
     fn set_value(&self, value: f32) -> PyResult<()> {
-        let value = value.clamp(self.min.min(self.max), self.max.max(self.min));
+        let value = require_finite("value", value)?;
+        let value = round_to_decimals(clamp_range(value, self.min, self.max), self.decimals);
         self.value.set(value);
         if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
             return Ok(());
@@ -2199,6 +2315,7 @@ impl ComboBox {
                 placeholder_color: rgba(self.placeholder_color.unwrap_or(crate::theme::palette().text_muted)),
                 background: rgba(self.background.unwrap_or(crate::theme::palette().surface_alt)),
                 border: rgba(self.border.unwrap_or(crate::theme::palette().border)),
+                selection_color: rgba(crate::theme::palette().selection),
                 on_change,
                 mirror: Some(self.selected.clone()),
                 popup_id: None,
