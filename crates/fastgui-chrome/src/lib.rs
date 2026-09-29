@@ -242,8 +242,17 @@ impl ChromeRenderer {
                     let size = *font_size * scale;
                     self.push_text(&mut ops, WidgetRect { width: rect.width + size, ..rect }, text, size, *color);
                 }
-                WidgetKind::Button { text, font_size, text_color, background, .. } => {
-                    push_fill(&mut ops, rect, *background);
+                WidgetKind::Button { text, font_size, text_color, background, flat, .. } => {
+                    let fill = if tree.hovered() == Some(id) {
+                        theme.hover
+                    } else if *flat && background.0[3] <= 0.001 {
+                        Color::TRANSPARENT
+                    } else {
+                        *background
+                    };
+                    if fill.0[3] > 0.001 {
+                        push_fill(&mut ops, rect, fill);
+                    }
                     self.push_text(&mut ops, rect, text, *font_size * scale, *text_color);
                 }
                 WidgetKind::Slider { value, min, max, track_color, thumb_color, .. } => {
