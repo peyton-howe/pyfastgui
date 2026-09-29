@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fastgui_chrome::ChromeRenderer;
-use fastgui_core::widget::{DropZone, PopupPress, Rect, WidgetId, WidgetKind, WidgetTree, SPLITTER_HIT_SLOP};
+use fastgui_core::widget::{
+    Color, DropZone, PopupAnchor, PopupPress, PopupSide, Rect, WidgetId, WidgetKind, WidgetTree,
+    SPLITTER_HIT_SLOP,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -21,6 +24,13 @@ use crate::keyboard::handle_key;
 use crate::text_input::{self, KeyPress, SystemClipboard};
 use crate::resize_edge::{classify_float_resize_edge, resize_edge_cursor, ResizeEdge};
 use crate::surface::{MainResizePolicy, SurfaceBackend, ViewportDraw};
+
+/// Hover delay before a tooltip popup opens.
+const TOOLTIP_DELAY: Duration = Duration::from_millis(500);
+const TOOLTIP_BG: Color = Color([0.12, 0.13, 0.15, 0.96]);
+const TOOLTIP_FG: Color = Color([0.92, 0.93, 0.95, 1.0]);
+const TOOLTIP_BORDER: Color = Color([0.35, 0.37, 0.40, 1.0]);
+const TOOLTIP_PAD: f32 = 6.0;
 
 /// Active edge-resize of a floating window, tracked in physical screen space so size/position
 /// updates stay stable as the window moves under the cursor.
@@ -214,6 +224,11 @@ struct App<B: SurfaceBackend> {
         f32,
         Box<dyn FnOnce(&mut WidgetTree) + Send>,
     )>,
+    /// Widget under the cursor for tooltip timing (main window).
+    hover_id: Option<WidgetId>,
+    hover_since: Instant,
+    /// Open tooltip popup node, if any.
+    tooltip_popup: Option<WidgetId>,
     error: Option<RunError<B::Error>>,
 }
 
@@ -250,6 +265,10 @@ impl<B: SurfaceBackend> App<B> {
                 Command::MutateWidgetTree(mutation) => {
                     mutation(&mut self.widget_tree);
                     self.has_widget_content = true;
+                    // Rebuilds drop popup nodes; clear tooltip hover handles.
+                    self.tooltip_popup = None;
+                    self.hover_id = None;
+                    self.widget_tree.set_hovered(None);
                 }
                 Command::MutateFloatingTree { region_id, mutation } => {
                     if let Some(&window_id) = self.floating_by_region.get(&region_id) {
@@ -570,7 +589,124 @@ impl<B: SurfaceBackend> App<B> {
         draws
     }
 
+    fn dismiss_tooltip(&mut self) {
+        if let Some(id) = self.tooltip_popup.take() {
+            if matches!(self.widget_tree.kind(id), Some(WidgetKind::Popup { .. })) {
+                self.widget_tree.close_popup(id);
+            }
+        }
+    }
+
+    /// True when a non-tooltip popup (menu, combo, dialog) is open and should block tooltips.
+    fn tooltip_blocked(&self) -> bool {
+        match self.widget_tree.topmost_popup() {
+            None => false,
+            Some(id) => Some(id) != self.tooltip_popup,
+        }
+    }
+
+    fn update_hover_for_tooltip(&mut self) {
+        let mut hit = self.widget_tree.hit_test(self.cursor.0, self.cursor.1);
+        // Cursor over the tooltip itself keeps the original hover target.
+        if let (Some(id), Some(tip)) = (hit, self.tooltip_popup) {
+            if id == tip || self.widget_tree.popup_of(id) == Some(tip) {
+                hit = self.hover_id;
+            }
+        }
+        if hit != self.hover_id {
+            self.dismiss_tooltip();
+            self.hover_id = hit;
+            self.hover_since = Instant::now();
+        }
+    }
+
+    /// Drive button/menu hover fills; redraw when the hovered widget changes.
+    fn update_hovered_widget(&mut self) {
+        let hit = self.widget_tree.hit_test(self.cursor.0, self.cursor.1);
+        if self.widget_tree.set_hovered(hit) {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn maybe_open_tooltip(&mut self) {
+        if self.tooltip_popup.is_some() || self.tooltip_blocked() {
+            return;
+        }
+        let Some(id) = self.hover_id else { return };
+        if self.hover_since.elapsed() < TOOLTIP_DELAY {
+            return;
+        }
+        let Some(text) = self.widget_tree.tooltip(id).map(str::to_owned) else { return };
+        if self.widget_tree.kind(id).is_none() {
+            return;
+        }
+        let kind = WidgetKind::Popup {
+            anchor: PopupAnchor::Widget(id, PopupSide::Below),
+            modal: false,
+            background: TOOLTIP_BG,
+            border: TOOLTIP_BORDER,
+            on_dismiss: None,
+            restore_focus: None,
+            open: None,
+        };
+        let popup = self.widget_tree.open_popup_no_focus(kind, |tree, popup| {
+            use fastgui_core::taffy::prelude::{FlexDirection, LengthPercentage, Style};
+            let pad = Style {
+                padding: fastgui_core::taffy::prelude::Rect {
+                    left: LengthPercentage::length(TOOLTIP_PAD),
+                    right: LengthPercentage::length(TOOLTIP_PAD),
+                    top: LengthPercentage::length(TOOLTIP_PAD),
+                    bottom: LengthPercentage::length(TOOLTIP_PAD),
+                },
+                flex_direction: FlexDirection::Column,
+                ..Default::default()
+            };
+            let wrap = tree.new_node(
+                pad,
+                WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+            );
+            tree.add_child(popup, wrap);
+            let label = tree.new_node(
+                Default::default(),
+                WidgetKind::Label { text, font_size: 12.0, color: TOOLTIP_FG },
+            );
+            tree.add_child(wrap, label);
+        });
+        self.tooltip_popup = Some(popup);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn handle_context_menu_press(&mut self) {
+        self.dismiss_tooltip();
+        // Outside click still dismisses a non-modal menu/combo before opening a context menu.
+        if forms::with_tree(&mut self.widget_tree, |tree| {
+            tree.popup_press(self.cursor.0, self.cursor.1) == PopupPress::Consumed
+        }) {
+            return;
+        }
+        let Some(id) = self.widget_tree.hit_test(self.cursor.0, self.cursor.1) else { return };
+        // Walk up so a Label inside a Box with a context menu still finds it.
+        let mut node = Some(id);
+        while let Some(current) = node {
+            if let Some(callback) = self.widget_tree.context_menu(current).cloned() {
+                callback(self.cursor.0, self.cursor.1);
+                if self.widget_tree.is_dirty() {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                return;
+            }
+            node = self.widget_tree.parent(current);
+        }
+    }
+
     fn handle_mouse_press(&mut self) {
+        self.dismiss_tooltip();
         // An outside click closes the open popup (or hits a modal one's backdrop) and stops here.
         if forms::with_tree(&mut self.widget_tree, |tree| {
             tree.popup_press(self.cursor.0, self.cursor.1) == PopupPress::Consumed
@@ -1671,6 +1807,19 @@ impl<B: SurfaceBackend> App<B> {
                 window.request_redraw();
             }
         }
+        // Wake when a hovered tooltip's delay elapses.
+        if self.tooltip_popup.is_none()
+            && !self.tooltip_blocked()
+            && self.hover_id.is_some_and(|id| self.widget_tree.tooltip(id).is_some())
+        {
+            let elapsed = self.hover_since.elapsed();
+            if elapsed < TOOLTIP_DELAY {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + (TOOLTIP_DELAY - elapsed),
+                ));
+                return;
+            }
+        }
         event_loop.set_control_flow(ControlFlow::Wait);
     }
 }
@@ -1814,6 +1963,10 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                     self.update_panel_drag_hover();
                     self.update_tear_ghost(event_loop);
                 }
+                if !dragging {
+                    self.update_hover_for_tooltip();
+                    self.update_hovered_widget();
+                }
                 self.update_cursor_icon();
                 if dragging && self.last_drag_render.elapsed() >= DRAG_RENDER_INTERVAL {
                     self.render_now(event_loop);
@@ -1842,40 +1995,53 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                         || self.dragging_text.is_some()
                         || self.dragging_scrub.is_some()
                         || self.dragging_scrollbar.is_some();
+                    let pressed = self.pressed_button.take();
                     self.dragging_slider = None;
                     self.dragging_splitter = None;
                     self.dragging_text = None;
                     self.dragging_scrub = None;
                     self.dragging_scrollbar = None;
-                    let pressed = self.pressed_button.take();
                     let cursor = self.cursor;
                     forms::with_tree(&mut self.widget_tree, |tree| {
                         release_button(tree, pressed, cursor);
                     });
+                    // Menu item `on_click` queues `Popup.close` on the command channel — drain
+                    // it now so the menu disappears on this click instead of waiting for an
+                    // outside click to force a redraw.
+                    self.drain_commands(event_loop);
                     // Floater OS-window drag is owned by the floater's mouse-up path.
                     if self.dragging_from_floating.is_none() {
                         self.handle_panel_drop();
                     }
                     self.update_cursor_icon();
-                    if was_dragging || self.widget_tree.is_dirty() {
-                        if was_dragging {
-                            self.render_now(event_loop);
-                        } else if let Some(window) = &self.window {
-                            window.request_redraw();
-                        }
+                    if was_dragging || pressed.is_some() || self.widget_tree.is_dirty() {
+                        self.render_now(event_loop);
                     }
                 }
             },
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                self.handle_context_menu_press();
+            }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let press = key_press(&event, self.modifiers);
+                // Escape dismisses a tooltip via dismiss_popup; clear our handle if so.
+                let tip = self.tooltip_popup;
                 if handle_key(&mut self.widget_tree, &press, &mut self.chrome, &mut self.clipboard) {
+                    if tip.is_some_and(|id| self.widget_tree.kind(id).is_none()) {
+                        self.tooltip_popup = None;
+                    }
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                self.dismiss_tooltip();
                 let (dx, dy) = wheel_delta(delta, self.scale_factor);
                 if self.widget_tree.scroll_at(self.cursor.0, self.cursor.1, dx, dy) {
                     self.render_now(event_loop);
@@ -1907,6 +2073,7 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.maybe_open_tooltip();
         self.schedule_control_flow(event_loop);
     }
 }
@@ -2036,30 +2203,26 @@ impl<B: SurfaceBackend> App<B> {
                     }) || self.dragging_floating_panel.is_some_and(|(id, _)| id == window_id)
                         || self.dragging_floating_resize.as_ref().is_some_and(|d| d.window_id == window_id)
                         || self.dragging_from_floating.is_some();
+                    let pressed = self.floating.get_mut(&window_id).and_then(|f| f.pressed_button.take());
                     if let Some(floater) = self.floating.get_mut(&window_id) {
                         floater.dragging_slider = None;
                         floater.dragging_splitter = None;
                         floater.dragging_text = None;
                         floater.dragging_scrub = None;
                         floater.dragging_scrollbar = None;
-                        let pressed = floater.pressed_button.take();
                         let cursor = floater.cursor;
                         forms::with_tree(&mut floater.widget_tree, |tree| {
                             release_button(tree, pressed, cursor);
                         });
                     }
+                    self.drain_commands(event_loop);
                     self.dragging_floating_panel = None;
                     self.dragging_floating_resize = None;
                     self.handle_panel_drop();
                     self.update_floating_cursor_icon(window_id);
-                    let floater_dirty =
-                        self.floating.get(&window_id).is_some_and(|f| f.widget_tree.is_dirty());
-                    if was_dragging {
+                    let dirty = self.floating.get(&window_id).is_some_and(|f| f.widget_tree.is_dirty());
+                    if was_dragging || pressed.is_some() || dirty {
                         self.render_now(event_loop);
-                    } else if floater_dirty {
-                        if let Some(floater) = self.floating.get(&window_id) {
-                            floater.window.request_redraw();
-                        }
                     }
                 }
             },
@@ -2256,6 +2419,9 @@ pub fn run<B: SurfaceBackend>(
         floating: HashMap::new(),
         floating_by_region: HashMap::new(),
         pending_floaters: Vec::new(),
+        hover_id: None,
+        hover_since: Instant::now(),
+        tooltip_popup: None,
         error: None,
     };
     event_loop.run_app(&mut app)?;
@@ -2288,6 +2454,7 @@ mod tests {
                 font_size: 14.0,
                 text_color: Color::TRANSPARENT,
                 background: Color::TRANSPARENT,
+                flat: false,
                 on_click: Some(Arc::new(move || {
                     counter.fetch_add(1, Ordering::SeqCst);
                 })),

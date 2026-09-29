@@ -40,13 +40,18 @@ fn handle_key_inner(
             }
             return true;
         }
-        // Escape closes the topmost popup first (menus, dialogs), then clears focus.
+        // Escape closes the topmost popup first (menus, dialogs, tooltips), then clears focus.
         Key::Named(NamedKey::Escape) if tree.dismiss_popup() => return true,
         Key::Named(NamedKey::Escape) if tree.focused().is_some() => {
             tree.set_focus(None);
             return true;
         }
         _ => {}
+    }
+    // Menu / MenuBar shortcuts — before the focused widget eats the key (text fields still
+    // keep A/C/V/X/Z; see `accel::try_fire`).
+    if crate::accel::try_fire(tree, press) {
+        return true;
     }
     let Some(id) = tree.focused() else { return false };
     match tree.kind(id) {
@@ -295,6 +300,7 @@ mod tests {
             font_size: 12.0,
             text_color: Color::TRANSPARENT,
             background: Color::TRANSPARENT,
+            flat: false,
             on_click: Some(Arc::new(move || {
                 counter.fetch_add(1, Ordering::SeqCst);
             })),
