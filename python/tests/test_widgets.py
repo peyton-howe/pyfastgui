@@ -275,12 +275,15 @@ class MenuChainTests(unittest.TestCase):
     def setUp(self):
         self._saved = (fg.Button, fg.Popup)
         self.buttons = {}
+        self.hovers = {}
         self.popups = []
         test = self
 
         class FakeButton:
-            def __init__(self, text, on_click=None, **kwargs):
-                test.buttons[text.split("    ")[0].strip()] = on_click
+            def __init__(self, text, on_click=None, on_hover=None, **kwargs):
+                label = text.split("    ")[0].strip()
+                test.buttons[label] = on_click
+                test.hovers[label] = on_hover
 
             def set_background(self, color=None):
                 pass
@@ -328,3 +331,28 @@ class BoxTests(unittest.TestCase):
         box = fg.Box(children=[])
         box.set_background((1.0, 0.0, 0.0, 1.0))
         box.set_background(None)
+
+
+class SubmenuHoverTests(MenuChainTests):
+    """Submenus open on hover (the app runs `on_hover` after a short rest), no click needed."""
+
+    def test_hovering_a_submenu_row_opens_it_and_another_row_closes_it(self):
+        sub = fg.Menu([fg.MenuItem("Doc")])
+        root = fg.Menu([fg.MenuItem("Recent", submenu=sub), fg.MenuItem("Save")])
+        root.show(object())
+        self.hovers["Recent"]()
+        self.assertTrue(sub.is_open, "resting on the row opens its submenu")
+        self.assertFalse(self.popups[-1].kwargs["closes_on_anchor_click"], "clicking the row keeps it open")
+        self.buttons["Recent"]()
+        self.hovers["Recent"]()
+        self.assertTrue(sub.is_open, "clicking / hovering it again doesn't toggle it shut")
+        self.hovers["Save"]()
+        self.assertFalse(sub.is_open, "resting on another row closes it")
+        self.assertTrue(root.is_open)
+
+    def test_disabled_submenu_rows_do_not_open_on_hover(self):
+        sub = fg.Menu([fg.MenuItem("Doc")])
+        root = fg.Menu([fg.MenuItem("Recent", submenu=sub, enabled=False)])
+        root.show(object())
+        self.hovers["Recent"]()
+        self.assertFalse(sub.is_open)

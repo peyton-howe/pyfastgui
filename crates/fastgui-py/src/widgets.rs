@@ -385,6 +385,7 @@ pub(crate) fn described_viewport(viewport_id: u64, frames: fastgui_core::FrameSl
         tooltip: None,
         context_menu: None,
         accelerators: Vec::new(),
+        hover_action: None,
     }
 }
 
@@ -399,6 +400,8 @@ pub(crate) struct DescribedWidget {
     tooltip: Option<String>,
     context_menu: Option<PointCallback>,
     accelerators: Vec<(String, ClickCallback)>,
+    /// Run after the cursor rests on the widget (`WidgetTree::set_hover_action`).
+    hover_action: Option<ClickCallback>,
 }
 
 impl DescribedWidget {
@@ -570,6 +573,7 @@ pub(crate) fn attach(
         tooltip,
         context_menu,
         accelerators,
+        hover_action,
     } = described;
     let id = tree.new_node(style.to_style(), kind);
     tree.add_child(parent, id);
@@ -580,6 +584,9 @@ pub(crate) fn attach(
     }
     if let Some(callback) = context_menu {
         tree.set_context_menu(id, Some(callback));
+    }
+    if let Some(callback) = hover_action {
+        tree.set_hover_action(id, Some(callback));
     }
     for (shortcut, callback) in accelerators {
         if let Some(accel) = Accel::parse(&shortcut) {
@@ -793,6 +800,7 @@ impl Label {
             tooltip: self.tooltip.clone(),
             context_menu,
             accelerators: Vec::new(),
+            hover_action: None,
         }
     }
 }
@@ -811,6 +819,7 @@ pub(crate) struct Button {
     on_click: Option<Py<PyAny>>,
     tooltip: Option<String>,
     context_menu: Option<Py<PyAny>>,
+    on_hover: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -825,7 +834,9 @@ impl Button {
         flat=false,
         tooltip=None,
         context_menu=None,
+        on_hover=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         text: String,
         on_click: Option<Py<PyAny>>,
@@ -835,6 +846,7 @@ impl Button {
         flat: bool,
         tooltip: Option<String>,
         context_menu: Option<Py<PyAny>>,
+        on_hover: Option<Py<PyAny>>,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
@@ -847,6 +859,7 @@ impl Button {
             on_click,
             tooltip,
             context_menu,
+            on_hover,
         }
     }
 
@@ -905,6 +918,7 @@ impl Button {
             tooltip: self.tooltip.clone(),
             context_menu,
             accelerators: Vec::new(),
+            hover_action: self.on_hover.as_ref().map(|cb| wrap_callback0(Python::attach(|py| cb.clone_ref(py)))),
         }
     }
 }
@@ -989,6 +1003,7 @@ impl Slider {
             tooltip: self.tooltip.clone(),
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         }
     }
 }
@@ -1117,6 +1132,7 @@ impl TextInput {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         }
     }
 }
@@ -1247,6 +1263,7 @@ impl TextArea {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         }
     }
 }
@@ -1408,6 +1425,7 @@ impl ListView {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         }
     }
 }
@@ -1426,6 +1444,8 @@ pub(crate) struct Popup {
     on_dismiss: Option<Py<PyAny>>,
     /// A click outside that dismisses it also reaches what's under it (menu bar menus).
     click_through: bool,
+    /// A click on its anchor widget closes it (`false`: the click reaches the anchor — submenus).
+    closes_on_anchor_click: bool,
     /// The open popup node, and the window it's in.
     id: IdCell,
     sender: SenderCell,
@@ -1443,6 +1463,7 @@ impl Popup {
         background=None,
         border=None,
         click_through=false,
+        closes_on_anchor_click=true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1453,6 +1474,7 @@ impl Popup {
         background: Option<(f32, f32, f32, f32)>,
         border: Option<(f32, f32, f32, f32)>,
         click_through: bool,
+        closes_on_anchor_click: bool,
     ) -> Self {
         Self {
             content,
@@ -1462,6 +1484,7 @@ impl Popup {
             border,
             on_dismiss,
             click_through,
+            closes_on_anchor_click,
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
             open: Readback::new(false),
@@ -1541,6 +1564,7 @@ impl Popup {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         };
         let kind = WidgetKind::Popup {
             anchor,
@@ -1550,6 +1574,7 @@ impl Popup {
             on_dismiss: on_dismiss.map(wrap_callback0),
             restore_focus: None,
             click_through: self.click_through,
+            closes_on_anchor_click: self.closes_on_anchor_click,
             open: Some(self.open.clone()),
         };
         // Reopening in another window closes it in the old one first.
@@ -1669,6 +1694,7 @@ impl ScrollArea {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         })
     }
 }
@@ -1777,6 +1803,7 @@ impl Checkbox {
             tooltip: self.tooltip.clone(),
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         }
     }
 }
@@ -1936,6 +1963,7 @@ impl Radio {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         }
     }
 }
@@ -2033,6 +2061,7 @@ impl Toggle {
             tooltip: self.tooltip.clone(),
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         }
     }
 }
@@ -2153,6 +2182,7 @@ impl SpinBox {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         }
     }
 }
@@ -2268,6 +2298,7 @@ impl NumericScrub {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         }
     }
 }
@@ -2359,6 +2390,7 @@ impl ProgressBar {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         }
     }
 }
@@ -2535,6 +2567,7 @@ impl ComboBox {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         }
     }
 }
@@ -2626,6 +2659,7 @@ impl Image {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         }
     }
 }
@@ -2722,6 +2756,7 @@ impl Grid {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         })
     }
 }
@@ -2897,6 +2932,7 @@ impl BoxWidget {
             tooltip: None,
             context_menu,
             accelerators,
+            hover_action: None,
         })
     }
 }
@@ -2996,6 +3032,7 @@ impl Splitter {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         })
     }
 }
@@ -3220,6 +3257,7 @@ impl Panel {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         };
 
         Ok(DescribedWidget {
@@ -3242,6 +3280,7 @@ impl Panel {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         })
     }
 }
@@ -3401,6 +3440,7 @@ impl Tabs {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         })
     }
 }

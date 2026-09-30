@@ -412,6 +412,7 @@ mod tests {
                 on_dismiss: None,
                 restore_focus: None,
                 click_through: false,
+                closes_on_anchor_click: true,
                 open: None,
             },
             |tree, popup| {
@@ -517,6 +518,7 @@ mod tests {
             on_dismiss: None,
             restore_focus: None,
             click_through: false,
+            closes_on_anchor_click: true,
             open: None,
         };
         let inner = std::cell::Cell::new(None);
@@ -596,6 +598,7 @@ mod tests {
             on_dismiss: None,
             restore_focus: None,
             click_through: false,
+            closes_on_anchor_click: true,
             open: None,
         };
         let row_a = std::cell::Cell::new(None);

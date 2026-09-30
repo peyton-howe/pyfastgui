@@ -271,6 +271,7 @@ pub fn open_combo(tree: &mut WidgetTree, combo_id: WidgetId) {
         on_dismiss: Some(on_dismiss),
         restore_focus: Some(combo_id),
         click_through: false,
+        closes_on_anchor_click: true,
         open: None,
     };
     let list_style = Style {

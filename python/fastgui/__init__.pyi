@@ -54,6 +54,7 @@ class Button:
         flat: bool = False,
         tooltip: str | None = None,
         context_menu: Any = None,
+        on_hover: Callable[[], None] | None = None,
     ) -> None: ...
     def set_text(self, text: str) -> None: ...
     def set_background(self, color: RGBA | None = None) -> None:
@@ -219,6 +220,7 @@ class Popup:
         background: RGBA | None = None,
         border: RGBA | None = None,
         click_through: bool = False,
+        closes_on_anchor_click: bool = True,
     ) -> None: ...
     def show(self, anchor: Widget, side: str = "below") -> None:
         """Open next to `anchor` (already shown in a window): "below", "above", "right" or "left",
@@ -301,13 +303,19 @@ class MenuSeparator:
 class Menu:
     """Popup menu of `MenuItem` / `MenuSeparator` rows."""
     def __init__(self, items: Sequence[MenuItem | MenuSeparator]) -> None: ...
-    def as_popup(self, on_dismiss: Callable[[], None] | None = None, click_through: bool = False) -> Popup: ...
+    def as_popup(
+        self,
+        on_dismiss: Callable[[], None] | None = None,
+        click_through: bool = False,
+        closes_on_anchor_click: bool = True,
+    ) -> Popup: ...
     def show(
         self,
         anchor: Widget,
         side: str = "below",
         on_dismiss: Callable[[], None] | None = None,
         click_through: bool = False,
+        closes_on_anchor_click: bool = True,
     ) -> None: ...
     def show_at(self, near: Widget, x: float, y: float) -> None: ...
     def close(self) -> None: ...

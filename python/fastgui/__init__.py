@@ -112,13 +112,19 @@ class Menu:
             self._open_submenu.close()
             self._open_submenu = None
 
-    def _toggle_submenu(self, submenu, anchor_button):
+    def _open_submenu_for(self, submenu, anchor_button):
+        """Open `submenu` beside its row (hovering or clicking the row). Already open: stays."""
         if self._open_submenu is submenu and submenu.is_open:
-            self._close_submenu()
             return
         self._close_submenu()
         self._open_submenu = submenu
-        submenu.show(anchor_button, side="right", on_dismiss=lambda: setattr(self, "_open_submenu", None))
+        submenu.show(
+            anchor_button,
+            side="right",
+            on_dismiss=lambda: setattr(self, "_open_submenu", None),
+            # Clicking the row of an open submenu keeps it open (the click reaches the row).
+            closes_on_anchor_click=False,
+        )
         submenu._parent = self
 
     def _root(self):
@@ -153,7 +159,7 @@ class Menu:
             if not it.enabled:
                 return
             if it.submenu is not None:
-                self._toggle_submenu(it.submenu, h["btn"])
+                self._open_submenu_for(it.submenu, h["btn"])
                 return
             # A pick anywhere in a submenu chain closes the whole chain, from the top menu (whose
             # on_dismiss also clears e.g. the MenuBar title highlight).
@@ -162,6 +168,14 @@ class Menu:
                 it.on_click()
 
         label_color = theme.text if item.enabled else theme.text_muted
+        # Resting on a submenu row opens its submenu; on any other row, closes the open one —
+        # native menus, no click needed. (The app waits a moment first, so sweeping across rows
+        # toward an open submenu doesn't close it.)
+        if item.submenu is not None and item.enabled:
+            def on_hover(it=item, h=holder):
+                self._open_submenu_for(it.submenu, h["btn"])
+        else:
+            on_hover = self._close_submenu
         # Flat rows: transparent until hover (`surface_active`), like a native menu.
         btn = Button(
             self._item_label(item),
@@ -170,6 +184,7 @@ class Menu:
             text_color=label_color,
             background=None,
             flat=True,
+            on_hover=on_hover,
         )
         holder["btn"] = btn
         return btn
@@ -179,7 +194,7 @@ class Menu:
         self._on_dismiss = None
         return callback
 
-    def as_popup(self, on_dismiss=None, click_through=False):
+    def as_popup(self, on_dismiss=None, click_through=False, closes_on_anchor_click=True):
         """Fresh `Popup` for `context_menu=` / `Window.show_popup` (rebuilds each call).
         `click_through`: a click outside that closes it also reaches the widget there (a
         `MenuBar` uses it so clicking another title switches menus in one click)."""
@@ -200,11 +215,14 @@ class Menu:
             padding=4.0,
             on_dismiss=wrapped_dismiss if on_dismiss is not None else None,
             click_through=click_through,
+            closes_on_anchor_click=closes_on_anchor_click,
         )
         return self._popup
 
-    def show(self, anchor, side="below", on_dismiss=None, click_through=False):
-        self.as_popup(on_dismiss=on_dismiss, click_through=click_through).show(anchor, side=side)
+    def show(self, anchor, side="below", on_dismiss=None, click_through=False, closes_on_anchor_click=True):
+        self.as_popup(
+            on_dismiss=on_dismiss, click_through=click_through, closes_on_anchor_click=closes_on_anchor_click
+        ).show(anchor, side=side)
 
     def show_at(self, near, x, y, on_dismiss=None):
         """Open at window point `(x, y)` using `near`'s window (an attached widget)."""

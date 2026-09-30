@@ -31,6 +31,11 @@ use crate::surface::{MainResizePolicy, SurfaceBackend, ViewportDraw};
 const TOOLTIP_DELAY: Duration = Duration::from_millis(500);
 const TOOLTIP_PAD: f32 = 6.0;
 
+/// How long the cursor rests on a widget before its hover action runs (a menu's submenu row
+/// opening its submenu). Long enough that sweeping diagonally across other rows toward an open
+/// submenu doesn't trigger theirs; short enough to feel immediate.
+const HOVER_ACTION_DELAY: Duration = Duration::from_millis(180);
+
 /// Active edge-resize of a floating window, tracked in physical screen space so size/position
 /// updates stay stable as the window moves under the cursor.
 struct FloatingResizeDrag {
@@ -231,6 +236,8 @@ struct App<B: SurfaceBackend> {
     /// The widget whose tooltip the user dismissed (click, scroll, key): it stays closed until
     /// the cursor moves to another widget, instead of reopening after the hover delay.
     tooltip_dismissed_for: Option<WidgetId>,
+    /// The hovered widget whose hover action already ran this visit (it runs once per visit).
+    hover_action_done: Option<WidgetId>,
     error: Option<RunError<B::Error>>,
 }
 
@@ -617,6 +624,7 @@ impl<B: SurfaceBackend> App<B> {
         self.dismiss_tooltip();
         self.hover_id = None;
         self.tooltip_dismissed_for = None;
+        self.hover_action_done = None;
         if self.widget_tree.set_hovered(None) {
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -653,6 +661,7 @@ impl<B: SurfaceBackend> App<B> {
             self.hover_id = hit;
             self.hover_since = Instant::now();
             self.tooltip_dismissed_for = None;
+            self.hover_action_done = None;
         }
     }
 
@@ -664,6 +673,27 @@ impl<B: SurfaceBackend> App<B> {
                 window.request_redraw();
             }
         }
+    }
+
+    /// Run the hovered widget's hover action once the cursor has rested on it long enough.
+    fn maybe_run_hover_action(&mut self) {
+        let Some(id) = self.hover_id else { return };
+        if self.hover_action_done == Some(id) || self.hover_since.elapsed() < HOVER_ACTION_DELAY {
+            return;
+        }
+        let Some(callback) = self.widget_tree.hover_action(id).cloned() else { return };
+        self.hover_action_done = Some(id);
+        forms::with_tree(&mut self.widget_tree, |_| callback());
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// When a pending hover action is due, if one is.
+    fn hover_action_deadline(&self) -> Option<Instant> {
+        let id = self.hover_id?;
+        (self.hover_action_done != Some(id) && self.widget_tree.hover_action(id).is_some())
+            .then(|| self.hover_since + HOVER_ACTION_DELAY)
     }
 
     fn maybe_open_tooltip(&mut self) {
@@ -692,6 +722,7 @@ impl<B: SurfaceBackend> App<B> {
             on_dismiss: None,
             restore_focus: None,
             click_through: false,
+            closes_on_anchor_click: true,
             open: None,
         };
         let fg = theme.text;
@@ -1851,21 +1882,17 @@ impl<B: SurfaceBackend> App<B> {
                 window.request_redraw();
             }
         }
-        // Wake when a hovered tooltip's delay elapses.
-        if self.tooltip_popup.is_none()
+        // Wake when a hovered tooltip's delay or a hover action's delay elapses.
+        let tooltip_due = (self.tooltip_popup.is_none()
             && !self.tooltip_blocked()
             && self.tooltip_dismissed_for != self.hover_id
-            && self.hover_id.is_some_and(|id| self.widget_tree.tooltip(id).is_some())
-        {
-            let elapsed = self.hover_since.elapsed();
-            if elapsed < TOOLTIP_DELAY {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(
-                    Instant::now() + (TOOLTIP_DELAY - elapsed),
-                ));
-                return;
-            }
+            && self.hover_id.is_some_and(|id| self.widget_tree.tooltip(id).is_some()))
+        .then(|| self.hover_since + TOOLTIP_DELAY);
+        let next = [tooltip_due, self.hover_action_deadline()].into_iter().flatten().min();
+        match next {
+            Some(at) if at > Instant::now() => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            _ => event_loop.set_control_flow(ControlFlow::Wait),
         }
-        event_loop.set_control_flow(ControlFlow::Wait);
     }
 }
 
@@ -2119,6 +2146,7 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.maybe_run_hover_action();
         self.maybe_open_tooltip();
         self.schedule_control_flow(event_loop);
     }
@@ -2470,6 +2498,7 @@ pub fn run<B: SurfaceBackend>(
         hover_since: Instant::now(),
         tooltip_popup: None,
         tooltip_dismissed_for: None,
+        hover_action_done: None,
         error: None,
     };
     event_loop.run_app(&mut app)?;

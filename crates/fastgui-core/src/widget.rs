@@ -426,6 +426,10 @@ pub enum WidgetKind {
         /// menus: clicking another title switches menus in one click). Otherwise the click is
         /// spent dismissing it.
         click_through: bool,
+        /// A click on the widget this popup is anchored to closes it (a combo box or menu
+        /// title toggles its popup). `false` keeps it open and lets the click reach the anchor
+        /// instead (a submenu's row, which only ever opens it).
+        closes_on_anchor_click: bool,
         open: Option<Readback<bool>>,
     },
     /// A GPU/CPU image rect composited on top of chrome. `frames` is the same latest-wins
@@ -716,6 +720,9 @@ pub struct WidgetTree {
     tooltips: HashMap<WidgetId, String>,
     /// Right-click handlers (`WidgetTree::set_context_menu`), cleared on `reset`.
     context_menus: HashMap<WidgetId, PointCallback>,
+    /// Hover actions (`set_hover_action`): run once the cursor has rested on the widget for a
+    /// moment — a menu's submenu row opening its submenu. Cleared on `reset`.
+    hover_actions: HashMap<WidgetId, ClickCallback>,
     /// Menu / MenuBar shortcuts registered at attach, cleared on `reset`.
     accelerators: Vec<(Accel, ClickCallback)>,
     /// Widget under the cursor (for hover fills). Cleared on `reset`.
@@ -749,6 +756,7 @@ impl WidgetTree {
             focused: None,
             tooltips: HashMap::new(),
             context_menus: HashMap::new(),
+            hover_actions: HashMap::new(),
             accelerators: Vec::new(),
             hovered: None,
         }
@@ -791,6 +799,7 @@ impl WidgetTree {
         self.scroll_content.clear();
         self.tooltips.clear();
         self.context_menus.clear();
+        self.hover_actions.clear();
         self.accelerators.clear();
         self.hovered = None;
         self.root = self.taffy.new_leaf(root_style()).expect("creating the root node cannot fail");
@@ -1290,6 +1299,7 @@ impl WidgetTree {
             self.clip_rects.remove(&node);
             self.tooltips.remove(&node);
             self.context_menus.remove(&node);
+            self.hover_actions.remove(&node);
         }
         let _ = self.taffy.remove_child(self.root, id);
         remove_subtree(&mut self.taffy, id);
@@ -1311,6 +1321,22 @@ impl WidgetTree {
 
     pub fn tooltip(&self, id: WidgetId) -> Option<&str> {
         self.tooltips.get(&id).map(String::as_str)
+    }
+
+    /// Set or clear `id`'s hover action (see `hover_actions`).
+    pub fn set_hover_action(&mut self, id: WidgetId, callback: Option<ClickCallback>) {
+        match callback {
+            Some(callback) => {
+                self.hover_actions.insert(id, callback);
+            }
+            None => {
+                self.hover_actions.remove(&id);
+            }
+        }
+    }
+
+    pub fn hover_action(&self, id: WidgetId) -> Option<&ClickCallback> {
+        self.hover_actions.get(&id)
     }
 
     /// Widget under the cursor, if any — chrome uses this for hover fills on buttons/menus.
@@ -1428,11 +1454,18 @@ impl WidgetTree {
             if self.absolute_rect(id).is_some_and(|r| r.contains(x, y)) {
                 return PopupPress::Pass;
             }
-            let Some(&WidgetKind::Popup { modal, anchor, click_through: through, .. }) = self.kind(id) else { break };
+            let Some(&WidgetKind::Popup { modal, anchor, click_through: through, closes_on_anchor_click, .. }) =
+                self.kind(id)
+            else {
+                break;
+            };
             if modal {
                 return PopupPress::Consumed;
             }
             let on_anchor = anchor.widget().and_then(|a| self.absolute_rect(a)).is_some_and(|r| r.contains(x, y));
+            if on_anchor && !closes_on_anchor_click {
+                return PopupPress::Pass;
+            }
             click_through &= through;
             self.dismiss_popup();
             if on_anchor {
@@ -2323,6 +2356,7 @@ mod tests {
             }),
             restore_focus: None,
             click_through: false,
+            closes_on_anchor_click: true,
             open: Some(Readback::new(false)),
         }
     }
@@ -2499,6 +2533,37 @@ mod tests {
         let first = tree.absolute_rect(rows[0]).unwrap();
         assert_eq!(tree.popup_press(first.x + 5.0, first.y + 5.0), PopupPress::Consumed, "its own row just closes it");
         assert_eq!(tree.topmost_popup(), Some(parent));
+    }
+
+    #[test]
+    fn a_submenu_row_click_keeps_its_submenu_open() {
+        // Submenus opened on hover set `closes_on_anchor_click: false`: clicking the row again
+        // reaches the row (which only opens) instead of closing the submenu.
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        let (parent, rows) = open_menu(&mut tree, PopupAnchor::Widget(anchor, PopupSide::Below), false, 2);
+        let mut kind = popup_kind(PopupAnchor::Widget(rows[0], PopupSide::Right), false, None);
+        if let WidgetKind::Popup { closes_on_anchor_click, .. } = &mut kind {
+            *closes_on_anchor_click = false;
+        }
+        let child = tree.open_popup(kind, |_, _| {});
+        tree.compute_layout(200.0, 200.0);
+        let row = tree.absolute_rect(rows[0]).unwrap();
+        assert_eq!(tree.popup_press(row.x + 5.0, row.y + 5.0), PopupPress::Pass);
+        assert_eq!(tree.topmost_popup(), Some(child), "still open");
+        let _ = parent;
+    }
+
+    #[test]
+    fn hover_actions_are_a_side_table_cleared_with_their_widgets() {
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        tree.set_hover_action(anchor, Some(Arc::new(|| {})));
+        assert!(tree.hover_action(anchor).is_some());
+        tree.set_hover_action(anchor, None);
+        assert!(tree.hover_action(anchor).is_none());
+        let (popup, rows) = open_menu(&mut tree, PopupAnchor::Center, false, 1);
+        tree.set_hover_action(rows[0], Some(Arc::new(|| {})));
+        tree.close_popup(popup);
+        assert!(tree.hover_action(rows[0]).is_none(), "gone with the popup's content");
     }
 
     #[test]
