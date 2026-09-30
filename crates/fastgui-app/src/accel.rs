@@ -82,7 +82,7 @@ pub fn try_fire(tree: &WidgetTree, press: &KeyPress<'_>) -> bool {
         matches!(tree.kind(id), Some(WidgetKind::TextInput { .. } | WidgetKind::TextArea { .. }))
     });
     for (accel, callback) in tree.accelerators() {
-        if !matches(accel, press.key, press.modifiers) {
+        if !matches(accel, press.plain.unwrap_or(press.key), press.modifiers) {
             continue;
         }
         if text_focused && is_text_edit_chord(accel) {
@@ -138,6 +138,26 @@ mod tests {
     }
 
     #[test]
+    fn shortcuts_match_the_unmodified_key() {
+        // Shift+1 types "!" (and macOS Option+letter a special character): the shortcut must
+        // match on the key itself, which winit reports as `key_without_modifiers`.
+        let fired = Arc::new(AtomicUsize::new(0));
+        let counter = fired.clone();
+        let mut tree = WidgetTree::new();
+        tree.register_accelerator(
+            Accel::parse("Ctrl+Shift+1").unwrap(),
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let (typed, mods) = press_char("!", true, true);
+        let plain = Key::Character("1".into());
+        assert!(!try_fire(&tree, &KeyPress { key: &typed, plain: None, text: None, modifiers: mods }), "the typed \"!\" alone can't match");
+        assert!(try_fire(&tree, &KeyPress { key: &typed, plain: Some(&plain), text: None, modifiers: mods }));
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn try_fire_skips_text_edit_chords_when_typing() {
         let fired = Arc::new(AtomicUsize::new(0));
         let counter = fired.clone();
@@ -174,11 +194,11 @@ mod tests {
         );
 
         let (key, mods) = press_char("c", true, false);
-        let press = KeyPress { key: &key, text: None, modifiers: mods };
+        let press = KeyPress { key: &key, plain: None, text: None, modifiers: mods };
         assert!(!try_fire(&tree, &press));
 
         let (key, mods) = press_char("s", true, false);
-        let press = KeyPress { key: &key, text: None, modifiers: mods };
+        let press = KeyPress { key: &key, plain: None, text: None, modifiers: mods };
         assert!(try_fire(&tree, &press));
         assert_eq!(fired.load(Ordering::SeqCst), 1);
     }

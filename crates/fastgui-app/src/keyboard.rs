@@ -49,8 +49,10 @@ fn handle_key_inner(
         _ => {}
     }
     // Menu / MenuBar shortcuts — before the focused widget eats the key (text fields still
-    // keep A/C/V/X/Z; see `accel::try_fire`).
-    if crate::accel::try_fire(tree, press) {
+    // keep A/C/V/X/Z; see `accel::try_fire`). Not behind a modal dialog: its window's menus
+    // are unreachable until it closes.
+    let modal_open = tree.topmost_popup().is_some_and(|p| matches!(tree.kind(p), Some(WidgetKind::Popup { modal: true, .. })));
+    if !modal_open && crate::accel::try_fire(tree, press) {
         return true;
     }
     // Flat menu rows aren't focusable (no accent ring); drive them via hover + arrows.
@@ -249,17 +251,22 @@ fn handle_menu_popup_keys(tree: &mut WidgetTree, press: &KeyPress<'_>) -> bool {
     }
     let key = press.key;
     let current = tree.hovered().and_then(|id| buttons.iter().position(|&b| b == id));
-    let activate = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space | NamedKey::ArrowRight))
+    let right = matches!(key, Key::Named(NamedKey::ArrowRight));
+    let activate = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space))
         || matches!(key, Key::Character(c) if c == " ");
-    if activate {
+    if activate || right {
         let index = match current {
             Some(i) => i,
-            None if matches!(key, Key::Named(NamedKey::ArrowRight)) => {
+            None if right => {
                 tree.set_hovered(Some(buttons[0]));
                 return true;
             }
             None => return false,
         };
+        // Right only opens a submenu; on an ordinary item it does nothing (Enter runs it).
+        if right && !is_submenu_row(tree, buttons[index]) {
+            return false;
+        }
         if let Some(WidgetKind::Button { on_click: Some(callback), .. }) = tree.kind(buttons[index]) {
             let callback = callback.clone();
             callback();
@@ -286,6 +293,15 @@ fn handle_menu_popup_keys(tree: &mut WidgetTree, press: &KeyPress<'_>) -> bool {
         _ => false,
     }
 }
+
+/// A menu row that opens a submenu. Python's `Menu._item_label` ends those rows' text with
+/// `SUBMENU_MARK`; keep the two in step.
+fn is_submenu_row(tree: &WidgetTree, id: fastgui_core::widget::WidgetId) -> bool {
+    matches!(tree.kind(id), Some(WidgetKind::Button { text, .. }) if text.trim_end().ends_with(SUBMENU_MARK))
+}
+
+/// Suffix Python's `Menu` gives submenu rows (`"Recent    ▶"`).
+const SUBMENU_MARK: char = '▶';
 
 /// Set a slider's value and fire its `on_change` — unless the value didn't move (already at
 /// an end), so holding an arrow key against the stop doesn't spam the callback.
@@ -340,7 +356,7 @@ mod tests {
 
     fn press(tree: &mut WidgetTree, key: Key, shift: bool) -> bool {
         let modifiers = if shift { ModifiersState::SHIFT } else { ModifiersState::empty() };
-        handle_key(tree, &KeyPress { key: &key, text: None, modifiers }, &mut NoMeasure, &mut NoClipboard)
+        handle_key(tree, &KeyPress { key: &key, plain: None, text: None, modifiers }, &mut NoMeasure, &mut NoClipboard)
     }
 
     fn flat_button(on_click: Option<fastgui_core::widget::ClickCallback>) -> WidgetKind {
@@ -378,6 +394,77 @@ mod tests {
             thumb_color: Color::TRANSPARENT,
             on_change,
         }
+    }
+
+    /// A menu popup holding flat rows with the given labels; returns the row ids and a click
+    /// counter per row.
+    fn menu_with_rows(labels: &[&str], modal: bool) -> (WidgetTree, Vec<WidgetId>, Vec<Arc<AtomicUsize>>) {
+        use fastgui_core::widget::PopupAnchor;
+        let mut tree = WidgetTree::new();
+        let counters: Vec<_> = labels.iter().map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        let rows = std::cell::RefCell::new(Vec::new());
+        tree.open_popup(
+            WidgetKind::Popup {
+                anchor: PopupAnchor::Center,
+                modal,
+                background: Color::TRANSPARENT,
+                border: Color::TRANSPARENT,
+                on_dismiss: None,
+                restore_focus: None,
+                click_through: false,
+                open: None,
+            },
+            |tree, popup| {
+                for (label, counter) in labels.iter().zip(&counters) {
+                    let counter = counter.clone();
+                    let mut kind = flat_button(Some(Arc::new(move || {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    })));
+                    if let WidgetKind::Button { text, .. } = &mut kind {
+                        *text = (*label).into();
+                    }
+                    let row = tree.new_node(fixed(100.0, 20.0), kind);
+                    tree.add_child(popup, row);
+                    rows.borrow_mut().push(row);
+                }
+            },
+        );
+        tree.compute_layout(300.0, 300.0);
+        (tree, rows.into_inner(), counters)
+    }
+
+    #[test]
+    fn right_arrow_opens_submenus_but_never_runs_plain_items() {
+        let (mut tree, rows, clicks) = menu_with_rows(&["Save    Ctrl+S", "Recent    ▶"], false);
+        tree.set_hovered(Some(rows[0]));
+        assert!(!press(&mut tree, Key::Named(NamedKey::ArrowRight), false), "Right on a plain item does nothing");
+        assert_eq!(clicks[0].load(Ordering::SeqCst), 0);
+        tree.set_hovered(Some(rows[1]));
+        assert!(press(&mut tree, Key::Named(NamedKey::ArrowRight), false));
+        assert_eq!(clicks[1].load(Ordering::SeqCst), 1, "Right opens the submenu row");
+        tree.set_hovered(Some(rows[0]));
+        assert!(press(&mut tree, Key::Named(NamedKey::Enter), false));
+        assert_eq!(clicks[0].load(Ordering::SeqCst), 1, "Enter still runs it");
+    }
+
+    #[test]
+    fn shortcuts_do_not_fire_behind_a_modal_popup() {
+        let fired = Arc::new(AtomicUsize::new(0));
+        let counter = fired.clone();
+        let (mut tree, _, _) = menu_with_rows(&["OK"], true);
+        tree.register_accelerator(
+            fastgui_core::widget::Accel::parse("Ctrl+S").unwrap(),
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let primary = if cfg!(target_os = "macos") { ModifiersState::SUPER } else { ModifiersState::CONTROL };
+        let key = Key::Character("s".into());
+        handle_key(&mut tree, &KeyPress { key: &key, plain: None, text: None, modifiers: primary }, &mut NoMeasure, &mut NoClipboard);
+        assert_eq!(fired.load(Ordering::SeqCst), 0, "the dialog's window menus are out of reach");
+        tree.dismiss_popup();
+        handle_key(&mut tree, &KeyPress { key: &key, plain: None, text: None, modifiers: primary }, &mut NoMeasure, &mut NoClipboard);
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "and work again once it closes");
     }
 
     #[test]
@@ -429,6 +516,7 @@ mod tests {
             border: Color::TRANSPARENT,
             on_dismiss: None,
             restore_focus: None,
+            click_through: false,
             open: None,
         };
         let inner = std::cell::Cell::new(None);
@@ -507,6 +595,7 @@ mod tests {
             border: Color::TRANSPARENT,
             on_dismiss: None,
             restore_focus: None,
+            click_through: false,
             open: None,
         };
         let row_a = std::cell::Cell::new(None);

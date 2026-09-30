@@ -85,6 +85,8 @@ class Menu:
         self.items = list(items)
         self._popup = None
         self._open_submenu = None
+        # The menu this one is open as a submenu of (None for a top-level menu).
+        self._parent = None
         # Cleared after running once. Fired both on outside/Escape dismiss and on `close()`
         # (menu-item clicks use `Popup.close`, which does not call the Popup's on_dismiss).
         self._on_dismiss = None
@@ -117,6 +119,13 @@ class Menu:
         self._close_submenu()
         self._open_submenu = submenu
         submenu.show(anchor_button, side="right", on_dismiss=lambda: setattr(self, "_open_submenu", None))
+        submenu._parent = self
+
+    def _root(self):
+        menu = self
+        while menu._parent is not None:
+            menu = menu._parent
+        return menu
 
     def _build_row(self, item):
         theme = get_theme()
@@ -146,7 +155,9 @@ class Menu:
             if it.submenu is not None:
                 self._toggle_submenu(it.submenu, h["btn"])
                 return
-            self.close()
+            # A pick anywhere in a submenu chain closes the whole chain, from the top menu (whose
+            # on_dismiss also clears e.g. the MenuBar title highlight).
+            self._root().close()
             if it.on_click is not None:
                 it.on_click()
 
@@ -168,9 +179,12 @@ class Menu:
         self._on_dismiss = None
         return callback
 
-    def as_popup(self, on_dismiss=None):
-        """Fresh `Popup` for `context_menu=` / `Window.show_popup` (rebuilds each call)."""
+    def as_popup(self, on_dismiss=None, click_through=False):
+        """Fresh `Popup` for `context_menu=` / `Window.show_popup` (rebuilds each call).
+        `click_through`: a click outside that closes it also reaches the widget there (a
+        `MenuBar` uses it so clicking another title switches menus in one click)."""
         self._close_submenu()
+        self._parent = None
         rows = [self._build_row(item) for item in self.items]
 
         def wrapped_dismiss(cb=on_dismiss):
@@ -185,11 +199,12 @@ class Menu:
             Box(direction="column", gap=0.0, children=rows),
             padding=4.0,
             on_dismiss=wrapped_dismiss if on_dismiss is not None else None,
+            click_through=click_through,
         )
         return self._popup
 
-    def show(self, anchor, side="below", on_dismiss=None):
-        self.as_popup(on_dismiss=on_dismiss).show(anchor, side=side)
+    def show(self, anchor, side="below", on_dismiss=None, click_through=False):
+        self.as_popup(on_dismiss=on_dismiss, click_through=click_through).show(anchor, side=side)
 
     def show_at(self, near, x, y, on_dismiss=None):
         """Open at window point `(x, y)` using `near`'s window (an attached widget)."""
@@ -249,7 +264,10 @@ class MenuBar:
             title_button.set_background(None)
         else:
             # Clear open highlight if the menu is dismissed by outside click / Escape / item click.
-            menu.show(title_button, on_dismiss=lambda b=title_button: b.set_background(None))
+            # Click-through: with this menu open, clicking another title closes it *and* opens that
+            # one. Clicking this title again only closes it (a click on a popup's own anchor is
+            # spent closing it — see WidgetTree::popup_press).
+            menu.show(title_button, on_dismiss=lambda b=title_button: b.set_background(None), click_through=True)
             title_button.set_background(theme.surface_active)
 
     @property
@@ -421,6 +439,7 @@ def pick_color(window, initial=None, on_pick=None):
         state["g"] = g_spin.value / 255.0
         state["b"] = b_spin.value / 255.0
         readout.set_text(_rgb_text())
+        swatch.set_background((state["r"], state["g"], state["b"], state["a"]))
 
     r_spin = SpinBox(
         value=round(state["r"] * 255), min=0, max=255, step=1, decimals=0, width=72.0, on_change=sync_from_spins
@@ -432,6 +451,13 @@ def pick_color(window, initial=None, on_pick=None):
         value=round(state["b"] * 255), min=0, max=255, step=1, decimals=0, width=72.0, on_change=sync_from_spins
     )
 
+    swatch = Box(
+        direction="row",
+        height=28.0,
+        flex_grow=1.0,
+        background=(state["r"], state["g"], state["b"], state["a"]),
+        children=[],
+    )
     content = Box(
         direction="column",
         gap="small",
@@ -448,13 +474,7 @@ def pick_color(window, initial=None, on_pick=None):
                     b_spin,
                 ],
             ),
-            Box(
-                direction="row",
-                height=28.0,
-                flex_grow=1.0,
-                background=(state["r"], state["g"], state["b"], state["a"]),
-                children=[],
-            ),
+            swatch,
             readout,
         ],
     )

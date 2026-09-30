@@ -204,6 +204,7 @@ pub fn check_gpu_backend<G>(
                 border: Color([0.32, 0.35, 0.42, 1.0]),
                 on_dismiss: None,
                 restore_focus: None,
+                click_through: false,
                 open: None,
             },
             |tree, popup| {

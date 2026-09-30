@@ -692,6 +692,7 @@ fn popup_quads_form_the_overlay_range() {
         border: Color([0.3, 0.3, 0.4, 1.0]),
         on_dismiss: None,
         restore_focus: None,
+        click_through: false,
         open: None,
     };
     let popup = tree.open_popup(popup_kind(true), |tree, popup| {

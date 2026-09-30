@@ -218,6 +218,7 @@ class Popup:
         padding: Spacing = 6.0,
         background: RGBA | None = None,
         border: RGBA | None = None,
+        click_through: bool = False,
     ) -> None: ...
     def show(self, anchor: Widget, side: str = "below") -> None:
         """Open next to `anchor` (already shown in a window): "below", "above", "right" or "left",
@@ -300,8 +301,14 @@ class MenuSeparator:
 class Menu:
     """Popup menu of `MenuItem` / `MenuSeparator` rows."""
     def __init__(self, items: Sequence[MenuItem | MenuSeparator]) -> None: ...
-    def as_popup(self) -> Popup: ...
-    def show(self, anchor: Widget, side: str = "below") -> None: ...
+    def as_popup(self, on_dismiss: Callable[[], None] | None = None, click_through: bool = False) -> Popup: ...
+    def show(
+        self,
+        anchor: Widget,
+        side: str = "below",
+        on_dismiss: Callable[[], None] | None = None,
+        click_through: bool = False,
+    ) -> None: ...
     def show_at(self, near: Widget, x: float, y: float) -> None: ...
     def close(self) -> None: ...
     @property
@@ -534,6 +541,9 @@ class Box:
     def set_display(self, visible: bool) -> None:
         """Show or hide this box (`Display::None` when hidden)."""
         ...
+    def set_background(self, color: RGBA | None = None) -> None:
+        """Change the fill color (`None`: transparent). Works before showing; survives rebuilds."""
+
 
 class Splitter:
     """A draggable divider between `first` and `second`. `ratio` is `first`'s initial share

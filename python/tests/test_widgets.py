@@ -267,3 +267,64 @@ class MenuTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MenuChainTests(unittest.TestCase):
+    """Menu composite logic, with `Button` / `Popup` captured instead of shown."""
+
+    def setUp(self):
+        self._saved = (fg.Button, fg.Popup)
+        self.buttons = {}
+        self.popups = []
+        test = self
+
+        class FakeButton:
+            def __init__(self, text, on_click=None, **kwargs):
+                test.buttons[text.split("    ")[0].strip()] = on_click
+
+            def set_background(self, color=None):
+                pass
+
+        class FakePopup:
+            def __init__(self, content, **kwargs):
+                self.kwargs = kwargs
+                self.is_open = False
+                test.popups.append(self)
+
+            def show(self, anchor, side="below"):
+                self.is_open = True
+
+            def close(self):
+                self.is_open = False
+
+        fg.Button, fg.Popup = FakeButton, FakePopup
+
+    def tearDown(self):
+        fg.Button, fg.Popup = self._saved
+
+    def test_picking_in_a_submenu_closes_the_whole_chain(self):
+        picked, dismissed = [], []
+        sub = fg.Menu([fg.MenuItem("Doc", on_click=lambda: picked.append("doc"))])
+        root = fg.Menu([fg.MenuItem("Recent", submenu=sub)])
+        root.show(object(), on_dismiss=lambda: dismissed.append("root"))
+        self.buttons["Recent"]()  # open the submenu
+        self.assertTrue(sub.is_open and root.is_open)
+        self.buttons["Doc"]()  # pick in it
+        self.assertEqual(picked, ["doc"])
+        self.assertFalse(sub.is_open, "the submenu closes")
+        self.assertFalse(root.is_open, "and so does its parent")
+        self.assertEqual(dismissed, ["root"], "the top menu's on_dismiss runs (menu bar highlight)")
+
+    def test_menu_bar_menus_let_the_dismissing_click_through(self):
+        menu = fg.Menu([fg.MenuItem("Open")])
+        menu.show(object(), click_through=True)
+        self.assertTrue(self.popups[-1].kwargs["click_through"])
+        menu.show(object())
+        self.assertFalse(self.popups[-1].kwargs["click_through"], "other menus keep the default")
+
+
+class BoxTests(unittest.TestCase):
+    def test_set_background_before_showing(self):
+        box = fg.Box(children=[])
+        box.set_background((1.0, 0.0, 0.0, 1.0))
+        box.set_background(None)

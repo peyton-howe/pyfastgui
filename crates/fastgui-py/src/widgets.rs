@@ -1424,6 +1424,8 @@ pub(crate) struct Popup {
     background: Option<(f32, f32, f32, f32)>,
     border: Option<(f32, f32, f32, f32)>,
     on_dismiss: Option<Py<PyAny>>,
+    /// A click outside that dismisses it also reaches what's under it (menu bar menus).
+    click_through: bool,
     /// The open popup node, and the window it's in.
     id: IdCell,
     sender: SenderCell,
@@ -1440,7 +1442,9 @@ impl Popup {
         padding=Spacing::Units(6.0),
         background=None,
         border=None,
+        click_through=false,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         content: Py<PyAny>,
         modal: bool,
@@ -1448,6 +1452,7 @@ impl Popup {
         padding: Spacing,
         background: Option<(f32, f32, f32, f32)>,
         border: Option<(f32, f32, f32, f32)>,
+        click_through: bool,
     ) -> Self {
         Self {
             content,
@@ -1456,6 +1461,7 @@ impl Popup {
             background,
             border,
             on_dismiss,
+            click_through,
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
             open: Readback::new(false),
@@ -1543,6 +1549,7 @@ impl Popup {
             border: rgba(self.border.unwrap_or(crate::theme::palette().border)),
             on_dismiss: on_dismiss.map(wrap_callback0),
             restore_focus: None,
+            click_through: self.click_through,
             open: Some(self.open.clone()),
         };
         // Reopening in another window closes it in the old one first.
@@ -2731,7 +2738,8 @@ pub(crate) struct BoxWidget {
     flex_grow: f32,
     width: Option<f32>,
     height: Option<f32>,
-    background: (f32, f32, f32, f32),
+    /// Behind a mutex so `set_background` also applies to later rebuilds.
+    background: Mutex<(f32, f32, f32, f32)>,
     wrap: bool,
     /// Mirrored into taffy `Display` at attach / via `set_display`.
     visible: AtomicBool,
@@ -2743,6 +2751,23 @@ pub(crate) struct BoxWidget {
 
 #[pymethods]
 impl BoxWidget {
+    /// Change the fill color (`None`: transparent). Works before the box is shown, and survives
+    /// rebuilds (e.g. `Window.set_theme`).
+    #[pyo3(signature = (color=None))]
+    fn set_background(&self, color: Option<(f32, f32, f32, f32)>) -> PyResult<()> {
+        let color = color.unwrap_or((0.0, 0.0, 0.0, 0.0));
+        *self.background.lock().unwrap_or_else(|p| p.into_inner()) = color;
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        let fill = if color.3 > 0.0 { rgba(color) } else { transparent() };
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::Container { background, .. } = kind {
+                *background = fill;
+            }
+        })
+    }
+
     #[new]
     #[pyo3(signature = (
         children,
@@ -2798,7 +2823,7 @@ impl BoxWidget {
             flex_grow,
             width,
             height,
-            background,
+            background: Mutex::new(background),
             wrap,
             visible: AtomicBool::new(visible),
             children,
@@ -2858,7 +2883,10 @@ impl BoxWidget {
         Ok(DescribedWidget {
             style,
             kind: WidgetKind::Container {
-                background: if self.background.3 > 0.0 { rgba(self.background) } else { transparent() },
+                background: {
+                    let background = *self.background.lock().unwrap_or_else(|p| p.into_inner());
+                    if background.3 > 0.0 { rgba(background) } else { transparent() }
+                },
                 region_id: None,
             },
             id_cell: self.id.clone(),

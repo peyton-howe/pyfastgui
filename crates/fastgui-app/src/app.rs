@@ -12,7 +12,8 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{Key, ModifiersState};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::cloak::set_cloaked;
@@ -227,6 +228,9 @@ struct App<B: SurfaceBackend> {
     hover_since: Instant,
     /// Open tooltip popup node, if any.
     tooltip_popup: Option<WidgetId>,
+    /// The widget whose tooltip the user dismissed (click, scroll, key): it stays closed until
+    /// the cursor moves to another widget, instead of reopening after the hover delay.
+    tooltip_dismissed_for: Option<WidgetId>,
     error: Option<RunError<B::Error>>,
 }
 
@@ -263,10 +267,10 @@ impl<B: SurfaceBackend> App<B> {
                 Command::MutateWidgetTree(mutation) => {
                     mutation(&mut self.widget_tree);
                     self.has_widget_content = true;
-                    // Rebuilds drop popup nodes; clear tooltip hover handles.
-                    self.tooltip_popup = None;
-                    self.hover_id = None;
-                    self.widget_tree.set_hovered(None);
+                    // Most mutations (a label's `set_text`, a popup opening) leave the tooltip
+                    // and hover target alone; only drop handles to widgets that are gone (a
+                    // `set_content` rebuild removes every popup, the tooltip included).
+                    self.forget_removed_hover_state();
                 }
                 Command::MutateFloatingTree { region_id, mutation } => {
                     if let Some(&window_id) = self.floating_by_region.get(&region_id) {
@@ -587,6 +591,39 @@ impl<B: SurfaceBackend> App<B> {
         draws
     }
 
+    /// Drop tooltip/hover handles whose widgets no longer exist (after a tree mutation).
+    fn forget_removed_hover_state(&mut self) {
+        let tree = &self.widget_tree;
+        if self.tooltip_popup.is_some_and(|id| !matches!(tree.kind(id), Some(WidgetKind::Popup { .. }))) {
+            self.tooltip_popup = None;
+        }
+        if self.hover_id.is_some_and(|id| tree.kind(id).is_none()) {
+            self.hover_id = None;
+        }
+        if self.widget_tree.hovered().is_some_and(|id| self.widget_tree.kind(id).is_none()) {
+            self.widget_tree.set_hovered(None);
+        }
+    }
+
+    /// Close the tooltip because the user did something (click, scroll, key) and keep the
+    /// hovered widget's tooltip closed until the cursor moves to another widget.
+    fn suppress_tooltip(&mut self) {
+        self.dismiss_tooltip();
+        self.tooltip_dismissed_for = self.hover_id;
+    }
+
+    /// The cursor left the window: nothing is hovered, and no tooltip opens.
+    fn clear_hover(&mut self) {
+        self.dismiss_tooltip();
+        self.hover_id = None;
+        self.tooltip_dismissed_for = None;
+        if self.widget_tree.set_hovered(None) {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
     fn dismiss_tooltip(&mut self) {
         if let Some(id) = self.tooltip_popup.take() {
             if matches!(self.widget_tree.kind(id), Some(WidgetKind::Popup { .. })) {
@@ -615,6 +652,7 @@ impl<B: SurfaceBackend> App<B> {
             self.dismiss_tooltip();
             self.hover_id = hit;
             self.hover_since = Instant::now();
+            self.tooltip_dismissed_for = None;
         }
     }
 
@@ -629,7 +667,7 @@ impl<B: SurfaceBackend> App<B> {
     }
 
     fn maybe_open_tooltip(&mut self) {
-        if self.tooltip_popup.is_some() || self.tooltip_blocked() {
+        if self.tooltip_popup.is_some() || self.tooltip_blocked() || self.tooltip_dismissed_for == self.hover_id {
             return;
         }
         let Some(id) = self.hover_id else { return };
@@ -653,6 +691,7 @@ impl<B: SurfaceBackend> App<B> {
             border: theme.border,
             on_dismiss: None,
             restore_focus: None,
+            click_through: false,
             open: None,
         };
         let fg = theme.text;
@@ -686,7 +725,7 @@ impl<B: SurfaceBackend> App<B> {
     }
 
     fn handle_context_menu_press(&mut self) {
-        self.dismiss_tooltip();
+        self.suppress_tooltip();
         // Outside click still dismisses a non-modal menu/combo before opening a context menu.
         if forms::with_tree(&mut self.widget_tree, |tree| {
             tree.popup_press(self.cursor.0, self.cursor.1) == PopupPress::Consumed
@@ -711,7 +750,7 @@ impl<B: SurfaceBackend> App<B> {
     }
 
     fn handle_mouse_press(&mut self) {
-        self.dismiss_tooltip();
+        self.suppress_tooltip();
         // An outside click closes the open popup (or hits a modal one's backdrop) and stops here.
         if forms::with_tree(&mut self.widget_tree, |tree| {
             tree.popup_press(self.cursor.0, self.cursor.1) == PopupPress::Consumed
@@ -1815,6 +1854,7 @@ impl<B: SurfaceBackend> App<B> {
         // Wake when a hovered tooltip's delay elapses.
         if self.tooltip_popup.is_none()
             && !self.tooltip_blocked()
+            && self.tooltip_dismissed_for != self.hover_id
             && self.hover_id.is_some_and(|id| self.widget_tree.tooltip(id).is_some())
         {
             let elapsed = self.hover_since.elapsed();
@@ -2031,22 +2071,23 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
             } => {
                 self.handle_context_menu_press();
             }
+            WindowEvent::CursorLeft { .. } => self.clear_hover(),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                let press = key_press(&event, self.modifiers);
-                // Escape dismisses a tooltip via dismiss_popup; clear our handle if so.
-                let tip = self.tooltip_popup;
-                if handle_key(&mut self.widget_tree, &press, &mut self.chrome, &mut self.clipboard) {
-                    if tip.is_some_and(|id| self.widget_tree.kind(id).is_none()) {
-                        self.tooltip_popup = None;
-                    }
+                let plain = event.key_without_modifiers();
+                let press = key_press(&event, &plain, self.modifiers);
+                // Any key closes the tooltip (so Escape then acts on a menu or focus, not the
+                // tooltip) and keeps it closed until the cursor moves to another widget.
+                let had_tooltip = self.tooltip_popup.is_some();
+                self.suppress_tooltip();
+                if handle_key(&mut self.widget_tree, &press, &mut self.chrome, &mut self.clipboard) || had_tooltip {
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                self.dismiss_tooltip();
+                self.suppress_tooltip();
                 let (dx, dy) = wheel_delta(delta, self.scale_factor);
                 if self.widget_tree.scroll_at(self.cursor.0, self.cursor.1, dx, dy) {
                     self.render_now(event_loop);
@@ -2233,7 +2274,8 @@ impl<B: SurfaceBackend> App<B> {
             },
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                let press = key_press(&event, self.modifiers);
+                let plain = event.key_without_modifiers();
+                let press = key_press(&event, &plain, self.modifiers);
                 if let Some(floater) = self.floating.get_mut(&window_id) {
                     if handle_key(&mut floater.widget_tree, &press, &mut floater.chrome, &mut self.clipboard) {
                         floater.window.request_redraw();
@@ -2308,8 +2350,8 @@ fn is_text_input(tree: &WidgetTree, id: WidgetId) -> bool {
     matches!(tree.kind(id), Some(WidgetKind::TextInput { .. } | WidgetKind::TextArea { .. }))
 }
 
-fn key_press(event: &KeyEvent, modifiers: ModifiersState) -> KeyPress<'_> {
-    KeyPress { key: &event.logical_key, text: event.text.as_deref(), modifiers }
+fn key_press<'a>(event: &'a KeyEvent, plain: &'a Key, modifiers: ModifiersState) -> KeyPress<'a> {
+    KeyPress { key: &event.logical_key, plain: Some(plain), text: event.text.as_deref(), modifiers }
 }
 
 /// Mouse-up after pressing `pressed`: activate it if the cursor is still over it.
@@ -2427,6 +2469,7 @@ pub fn run<B: SurfaceBackend>(
         hover_id: None,
         hover_since: Instant::now(),
         tooltip_popup: None,
+        tooltip_dismissed_for: None,
         error: None,
     };
     event_loop.run_app(&mut app)?;

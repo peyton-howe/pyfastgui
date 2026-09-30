@@ -129,6 +129,16 @@ pub enum PopupAnchor {
     Center,
 }
 
+impl PopupAnchor {
+    /// The widget this popup is attached to, if it's attached to one.
+    pub fn widget(self) -> Option<WidgetId> {
+        match self {
+            PopupAnchor::Widget(id, _) | PopupAnchor::WidgetCentered(id, _) => Some(id),
+            PopupAnchor::Point(..) | PopupAnchor::Center => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PopupSide {
     Below,
@@ -412,6 +422,10 @@ pub enum WidgetKind {
         border: Color,
         on_dismiss: Option<ClickCallback>,
         restore_focus: Option<WidgetId>,
+        /// A click outside that dismisses this popup also reaches what's under it (menu bar
+        /// menus: clicking another title switches menus in one click). Otherwise the click is
+        /// spent dismissing it.
+        click_through: bool,
         open: Option<Readback<bool>>,
     },
     /// A GPU/CPU image rect composited on top of chrome. `frames` is the same latest-wins
@@ -1402,29 +1416,30 @@ impl WidgetTree {
     /// the click is dismissed so one outside click closes the whole menu hierarchy. A click
     /// that lands in a lower popup (parent menu while a submenu is open) only closes the
     /// layers above it and then `Pass`es through.
+    ///
+    /// Popups above the one the click lands in close (a click back in a parent menu closes its
+    /// submenu). A click on a dismissed popup's own anchor — the combo box, menu title or
+    /// submenu row that opened it — only closes it: letting it through would reopen it on
+    /// release. Once every open popup is dismissed, the click goes through only if they all
+    /// have `click_through`.
     pub fn popup_press(&mut self, x: f32, y: f32) -> PopupPress {
-        let Some(top) = self.topmost_popup() else { return PopupPress::Pass };
-        if self.absolute_rect(top).is_some_and(|r| r.contains(x, y)) {
-            return PopupPress::Pass;
-        }
-        match self.kind(top) {
-            Some(WidgetKind::Popup { modal: true, .. }) => PopupPress::Consumed,
-            _ => {
-                while let Some(id) = self.topmost_popup() {
-                    match self.kind(id) {
-                        Some(WidgetKind::Popup { modal: true, .. }) => return PopupPress::Consumed,
-                        Some(WidgetKind::Popup { .. }) => {
-                            if self.absolute_rect(id).is_some_and(|r| r.contains(x, y)) {
-                                return PopupPress::Pass;
-                            }
-                            self.dismiss_popup();
-                        }
-                        _ => break,
-                    }
-                }
-                PopupPress::Consumed
+        let mut click_through = true;
+        while let Some(id) = self.topmost_popup() {
+            if self.absolute_rect(id).is_some_and(|r| r.contains(x, y)) {
+                return PopupPress::Pass;
+            }
+            let Some(&WidgetKind::Popup { modal, anchor, click_through: through, .. }) = self.kind(id) else { break };
+            if modal {
+                return PopupPress::Consumed;
+            }
+            let on_anchor = anchor.widget().and_then(|a| self.absolute_rect(a)).is_some_and(|r| r.contains(x, y));
+            click_through &= through;
+            self.dismiss_popup();
+            if on_anchor {
+                return PopupPress::Consumed;
             }
         }
+        if click_through { PopupPress::Pass } else { PopupPress::Consumed }
     }
 
     /// Depth-first walk of `id`'s subtree (including `id`).
@@ -2307,6 +2322,7 @@ mod tests {
                 }) as ClickCallback
             }),
             restore_focus: None,
+            click_through: false,
             open: Some(Readback::new(false)),
         }
     }
@@ -2435,6 +2451,54 @@ mod tests {
         tree.close_popup(modal);
         tree.compute_layout(200.0, 200.0);
         assert_eq!(tree.hit_test(20.0, 25.0), Some(anchor), "gone from hit testing");
+    }
+
+    #[test]
+    fn clicking_a_popups_own_anchor_only_closes_it() {
+        // A combo box / menu title / submenu row pressed while its popup is open: the press
+        // closes the popup and stops there, so the release can't reopen it.
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        open_menu(&mut tree, PopupAnchor::Widget(anchor, PopupSide::Below), false, 1);
+        assert_eq!(tree.popup_press(20.0, 25.0), PopupPress::Consumed, "on the anchor");
+        assert!(tree.topmost_popup().is_none());
+    }
+
+    #[test]
+    fn click_through_popups_let_the_dismissing_click_reach_the_widget_under_it() {
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        let other = sized_button(&mut tree, 60.0, 20.0);
+        tree.add_child(tree.root(), other);
+        tree.compute_layout(200.0, 200.0);
+        let other_rect = tree.absolute_rect(other).unwrap();
+        let (x, y) = (other_rect.x + 5.0, other_rect.y + 5.0);
+        let kind = |through| {
+            let mut kind = popup_kind(PopupAnchor::Widget(anchor, PopupSide::Right), false, None);
+            if let WidgetKind::Popup { click_through, .. } = &mut kind {
+                *click_through = through;
+            }
+            kind
+        };
+        tree.open_popup(kind(true), |_, _| {});
+        tree.compute_layout(200.0, 200.0);
+        assert_eq!(tree.popup_press(x, y), PopupPress::Pass, "menu bar menu: the next title gets the click");
+        tree.open_popup(kind(false), |_, _| {});
+        tree.compute_layout(200.0, 200.0);
+        assert_eq!(tree.popup_press(x, y), PopupPress::Consumed, "ordinary popup: the click only dismisses");
+    }
+
+    #[test]
+    fn clicking_back_in_a_parent_menu_closes_the_submenu_and_passes() {
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        let (parent, rows) = open_menu(&mut tree, PopupAnchor::Widget(anchor, PopupSide::Below), false, 2);
+        let (child, _) = open_menu(&mut tree, PopupAnchor::Widget(rows[0], PopupSide::Right), false, 1);
+        let second = tree.absolute_rect(rows[1]).unwrap();
+        assert_eq!(tree.popup_press(second.x + 5.0, second.y + 5.0), PopupPress::Pass, "the other row gets the click");
+        assert_eq!(tree.topmost_popup(), Some(parent));
+        assert!(tree.kind(child).is_none());
+        let (_, _) = open_menu(&mut tree, PopupAnchor::Widget(rows[0], PopupSide::Right), false, 1);
+        let first = tree.absolute_rect(rows[0]).unwrap();
+        assert_eq!(tree.popup_press(first.x + 5.0, first.y + 5.0), PopupPress::Consumed, "its own row just closes it");
+        assert_eq!(tree.topmost_popup(), Some(parent));
     }
 
     #[test]
