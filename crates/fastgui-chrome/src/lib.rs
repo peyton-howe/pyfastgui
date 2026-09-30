@@ -409,6 +409,71 @@ impl ChromeRenderer {
                         ops.extend(clip_ops(grid_ops, Clip::from_rect(rect)));
                     }
                 }
+                WidgetKind::TreeView {
+                    data,
+                    expanded,
+                    row_height,
+                    font_size,
+                    scroll,
+                    selected,
+                    text_color,
+                    background,
+                    selection_color,
+                    ..
+                } => {
+                    push_fill(&mut ops, rect, *background);
+                    let expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+                    let visible = data.visible_ids(&expanded);
+                    let line = font_size * LINE_HEIGHT_RATIO;
+                    for flat in tree.tree_visible_rows(id) {
+                        let Some(&node_id) = visible.get(flat) else { continue };
+                        let Some(node) = data.nodes.get(node_id as usize) else { continue };
+                        let row = WidgetRect {
+                            x: logical_rect.x,
+                            y: logical_rect.y + flat as f32 * row_height - scroll,
+                            width: logical_rect.width,
+                            height: *row_height,
+                        };
+                        if *selected == Some(node_id) {
+                            push_fill(&mut ops, scale_rect(row, scale), *selection_color);
+                        }
+                        let gutter_x = row.x + node.depth as f32 * fastgui_core::widget::TREE_INDENT;
+                        let gutter = WidgetRect {
+                            x: gutter_x,
+                            y: row.y,
+                            width: fastgui_core::widget::TREE_GUTTER,
+                            height: row.height,
+                        };
+                        if !node.children.is_empty() {
+                            let mark = if expanded.contains(&node_id) { "▼" } else { "▶" };
+                            self.push_centered_text(
+                                &mut ops,
+                                scale_rect(gutter, scale),
+                                mark,
+                                font_size * scale * 0.75,
+                                *text_color,
+                            );
+                        }
+                        let text = WidgetRect {
+                            x: gutter_x + fastgui_core::widget::TREE_GUTTER,
+                            y: row.y + (row.height - line) / 2.0,
+                            width: (row.width
+                                - (gutter_x + fastgui_core::widget::TREE_GUTTER - row.x)
+                                - LIST_TEXT_INSET)
+                                .max(0.0),
+                            height: line,
+                        };
+                        self.push_text(
+                            &mut ops,
+                            scale_rect(text, scale),
+                            &node.label,
+                            font_size * scale,
+                            *text_color,
+                        );
+                    }
+                    drop(expanded);
+                    ops = clip_ops(ops, Clip::from_rect(rect));
+                }
                 WidgetKind::Popup { modal, background, border, .. } => {
                     if *modal {
                         let screen = WidgetRect { x: 0.0, y: 0.0, width: window.width as f32, height: window.height as f32 };
@@ -650,9 +715,12 @@ impl ChromeRenderer {
             in_overlay |= popups.contains(&id);
             let bar_color = match tree.kind(id) {
                 Some(WidgetKind::ScrollArea { bar_color, .. }) => bar_color,
-                Some(WidgetKind::ListView { .. } | WidgetKind::Table { .. } | WidgetKind::TextArea { .. }) => {
-                    &theme.scrollbar
-                }
+                Some(
+                    WidgetKind::ListView { .. }
+                    | WidgetKind::Table { .. }
+                    | WidgetKind::TreeView { .. }
+                    | WidgetKind::TextArea { .. },
+                ) => &theme.scrollbar,
                 _ => continue,
             };
             let mut ops = Vec::new();

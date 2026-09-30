@@ -10,6 +10,8 @@ from ._fastgui import (
     ListView,
     NumericScrub,
     Table,
+    TreeNode,
+    TreeView,
     Panel,
     Popup,
     ProgressBar,
@@ -660,6 +662,50 @@ class StackedWidget:
         return Box(direction="column", children=self._pages, flex_grow=1.0)
 
 
+class PropertyInspector:
+    """Label + editor rows composed from existing widgets (TextInput, SpinBox, Toggle, …).
+
+    `rows` is a sequence of `(label, editor)` pairs. Editors keep their own state/callbacks.
+    """
+
+    def __init__(self, rows, label_width=120.0, gap="small", padding="small"):
+        self.rows = [(str(label), editor) for label, editor in rows]
+        self.label_width = float(label_width)
+        self.gap = gap
+        self.padding = padding
+
+    @property
+    def _fastgui_widget(self):
+        theme = get_theme()
+        row_widgets = []
+        for label, editor in self.rows:
+            row_widgets.append(
+                Box(
+                    direction="row",
+                    gap="small",
+                    children=[
+                        Box(
+                            direction="column",
+                            width=self.label_width,
+                            flex_grow=0.0,
+                            children=[
+                                Label(label, font_size="small", color=theme.text_muted),
+                            ],
+                        ),
+                        Box(direction="column", flex_grow=1.0, children=[editor]),
+                    ],
+                )
+            )
+        return Box(
+            direction="column",
+            gap=self.gap,
+            padding=self.padding,
+            background=theme.surface,
+            children=row_widgets,
+            flex_grow=1.0,
+        )
+
+
 class DockArea:
     """A split-tree of titled `Panel`s (each region resizable by dragging its `Splitter`), with
     drag-to-rearrange: grab a `Panel`'s title bar and drop it on another region to move it there
@@ -1008,6 +1054,9 @@ __all__ = [
     "StatusBar",
     "Table",
     "Tabs",
+    "TreeNode",
+    "TreeView",
+    "PropertyInspector",
     "TextArea",
     "TextInput",
     "Theme",

@@ -170,6 +170,92 @@ fn handle_key_inner(
             tree.table_select(id, Some(target));
             true
         }
+        Some(WidgetKind::TreeView { .. }) => {
+            let visible = tree.tree_visible_ids(id);
+            if visible.is_empty() {
+                return false;
+            }
+            let page = tree.tree_page_rows(id);
+            let (current, activate, has_kids, is_expanded, parent, first_child) =
+                match tree.kind(id) {
+                    Some(WidgetKind::TreeView { data, expanded, selected, on_activate, .. }) => {
+                        let current = *selected;
+                        let activate = on_activate.clone();
+                        let expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+                        let (has_kids, is_expanded, parent, first_child) = current
+                            .and_then(|n| {
+                                let node = data.nodes.get(n as usize)?;
+                                Some((
+                                    !node.children.is_empty(),
+                                    expanded.contains(&n),
+                                    node.parent,
+                                    node.children.first().copied(),
+                                ))
+                            })
+                            .unwrap_or((false, false, None, None));
+                        let activate_path = current.map(|n| data.path_of(n));
+                        (current, activate.zip(activate_path), has_kids, is_expanded, parent, first_child)
+                    }
+                    _ => return false,
+                };
+            let flat = current.and_then(|n| visible.iter().position(|&v| v == n));
+            match key {
+                Key::Named(NamedKey::Enter) => {
+                    if let Some((callback, path)) = activate {
+                        callback(&path);
+                        return true;
+                    }
+                    false
+                }
+                Key::Named(NamedKey::ArrowLeft) => {
+                    let Some(node) = current else { return false };
+                    if has_kids && is_expanded {
+                        tree.tree_set_expanded(id, node, false);
+                        return true;
+                    }
+                    if let Some(parent) = parent {
+                        tree.tree_select(id, Some(parent));
+                        return true;
+                    }
+                    false
+                }
+                Key::Named(NamedKey::ArrowRight) => {
+                    let Some(node) = current else { return false };
+                    if !has_kids {
+                        return false;
+                    }
+                    if !is_expanded {
+                        tree.tree_set_expanded(id, node, true);
+                        return true;
+                    }
+                    if let Some(child) = first_child {
+                        tree.tree_select(id, Some(child));
+                        return true;
+                    }
+                    false
+                }
+                Key::Named(NamedKey::ArrowDown)
+                | Key::Named(NamedKey::ArrowUp)
+                | Key::Named(NamedKey::PageDown)
+                | Key::Named(NamedKey::PageUp)
+                | Key::Named(NamedKey::Home)
+                | Key::Named(NamedKey::End) => {
+                    let last = visible.len() - 1;
+                    let target_flat = match key {
+                        Key::Named(NamedKey::ArrowDown) => flat.map_or(0, |i| (i + 1).min(last)),
+                        Key::Named(NamedKey::ArrowUp) => flat.map_or(0, |i| i.saturating_sub(1)),
+                        Key::Named(NamedKey::PageDown) => flat.map_or(0, |i| (i + page).min(last)),
+                        Key::Named(NamedKey::PageUp) => flat.map_or(0, |i| i.saturating_sub(page)),
+                        Key::Named(NamedKey::Home) => 0,
+                        Key::Named(NamedKey::End) => last,
+                        _ => unreachable!(),
+                    };
+                    tree.tree_select(id, Some(visible[target_flat]));
+                    true
+                }
+                _ => false,
+            }
+        }
         Some(WidgetKind::Checkbox { .. } | WidgetKind::Toggle { .. }) => {
             let activate = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space))
                 || matches!(key, Key::Character(c) if c == " ");

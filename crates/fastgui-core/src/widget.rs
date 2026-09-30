@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use taffy::prelude::*;
@@ -221,6 +221,10 @@ pub const PROGRESS_HEIGHT: f32 = 8.0;
 pub const TABLE_CELL_INSET: f32 = 8.0;
 /// Fallback column width when `TableColumn::width` is unset and the view width is unknown.
 pub const TABLE_DEFAULT_COLUMN_WIDTH: f32 = 120.0;
+/// Per-depth indent for a `TreeView` row label (layout units).
+pub const TREE_INDENT: f32 = 16.0;
+/// Width of the disclosure gutter (`▶`/`▼`) on a `TreeView` row.
+pub const TREE_GUTTER: f32 = 18.0;
 
 /// Scrollbar thickness and inset from the scroll area's edge (layout units). Overlay bars:
 /// drawn over the content's edge rather than taking layout space.
@@ -291,6 +295,114 @@ impl TableData {
     /// Content width for scrolling: sum of resolved widths (using `view_width` for flex).
     pub fn content_width(&self, view_width: f32) -> f32 {
         self.resolved_widths(view_width).iter().sum()
+    }
+}
+
+/// Nested tree node as supplied from Python before flattening into [`TreeData`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreeNodeData {
+    pub label: String,
+    pub children: Vec<TreeNodeData>,
+}
+
+/// One flattened node in a [`TreeData`] (preorder ids, parent links, depth).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreeNode {
+    pub label: String,
+    pub parent: Option<u32>,
+    pub depth: u16,
+    pub children: Vec<u32>,
+}
+
+/// Flattened tree for a [`WidgetKind::TreeView`]. Shared via `Arc`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreeData {
+    pub nodes: Vec<TreeNode>,
+    pub roots: Vec<u32>,
+}
+
+impl TreeData {
+    /// Flatten nested `TreeNodeData` roots into preorder-indexed nodes.
+    pub fn from_nested(roots: &[TreeNodeData]) -> Self {
+        let mut data = Self { nodes: Vec::new(), roots: Vec::new() };
+        for root in roots {
+            let id = data.push_node(root, None, 0);
+            data.roots.push(id);
+        }
+        data
+    }
+
+    fn push_node(&mut self, node: &TreeNodeData, parent: Option<u32>, depth: u16) -> u32 {
+        let id = self.nodes.len() as u32;
+        self.nodes.push(TreeNode {
+            label: node.label.clone(),
+            parent,
+            depth,
+            children: Vec::new(),
+        });
+        let child_ids: Vec<u32> = node
+            .children
+            .iter()
+            .map(|child| self.push_node(child, Some(id), depth.saturating_add(1)))
+            .collect();
+        self.nodes[id as usize].children = child_ids;
+        id
+    }
+
+    /// Child-index path from the roots to `id` (empty if unknown).
+    pub fn path_of(&self, id: u32) -> Vec<u16> {
+        let mut chain = Vec::new();
+        let mut cur = id;
+        loop {
+            let Some(node) = self.nodes.get(cur as usize) else {
+                return Vec::new();
+            };
+            match node.parent {
+                None => {
+                    let idx = self.roots.iter().position(|&r| r == cur).unwrap_or(0) as u16;
+                    chain.push(idx);
+                    chain.reverse();
+                    return chain;
+                }
+                Some(parent) => {
+                    let idx = self.nodes[parent as usize]
+                        .children
+                        .iter()
+                        .position(|&c| c == cur)
+                        .unwrap_or(0) as u16;
+                    chain.push(idx);
+                    cur = parent;
+                }
+            }
+        }
+    }
+
+    /// Resolve a child-index path to a node id.
+    pub fn id_at_path(&self, path: &[u16]) -> Option<u32> {
+        let (&first, rest) = path.split_first()?;
+        let mut id = *self.roots.get(first as usize)?;
+        for &idx in rest {
+            id = *self.nodes.get(id as usize)?.children.get(idx as usize)?;
+        }
+        Some(id)
+    }
+
+    /// Preorder list of visible node ids given which parents are expanded.
+    pub fn visible_ids(&self, expanded: &HashSet<u32>) -> Vec<u32> {
+        let mut out = Vec::new();
+        fn walk(data: &TreeData, id: u32, expanded: &HashSet<u32>, out: &mut Vec<u32>) {
+            out.push(id);
+            let Some(node) = data.nodes.get(id as usize) else { return };
+            if !node.children.is_empty() && expanded.contains(&id) {
+                for &child in &node.children {
+                    walk(data, child, expanded, out);
+                }
+            }
+        }
+        for &root in &self.roots {
+            walk(self, root, expanded, &mut out);
+        }
+        out
     }
 }
 
@@ -546,6 +658,25 @@ pub enum WidgetKind {
         on_activate: Option<IndexCallback>,
         mirror: Option<Readback<Option<usize>>>,
     },
+    /// A virtualized tree (`QTreeView`-lite): nested nodes flattened by expand state; only the
+    /// visible rows are drawn. `expanded` holds parent node ids whose children are shown.
+    /// Selection is a node id; Python mirrors a child-index path. Click the gutter to toggle;
+    /// arrows / Left / Right navigate and expand/collapse.
+    TreeView {
+        data: Arc<TreeData>,
+        /// Shared with Python so UI toggles and `set_expanded` stay in sync across rebuilds.
+        expanded: Arc<std::sync::Mutex<HashSet<u32>>>,
+        row_height: f32,
+        font_size: f32,
+        scroll: f32,
+        selected: Option<u32>,
+        text_color: Color,
+        background: Color,
+        selection_color: Color,
+        on_select: Option<PathCallback>,
+        on_activate: Option<PathCallback>,
+        mirror: Option<Readback<Option<Vec<u16>>>>,
+    },
     /// An overlay (menu, dropdown list, tooltip, dialog): an absolutely positioned child of the
     /// root, so it paints above everything else and wins hit tests, placed after layout by
     /// `anchor` (see `WidgetTree::open_popup`). A click outside the topmost popup dismisses it
@@ -692,6 +823,7 @@ impl WidgetKind {
                 | WidgetKind::TextArea { .. }
                 | WidgetKind::ListView { .. }
                 | WidgetKind::Table { .. }
+                | WidgetKind::TreeView { .. }
                 | WidgetKind::Checkbox { .. }
                 | WidgetKind::Radio { .. }
                 | WidgetKind::Toggle { .. }
@@ -1110,6 +1242,14 @@ impl WidgetTree {
                     let max = max_scroll(layout.size, content);
                     *scroll = (scroll.0.clamp(0.0, max.0), scroll.1.clamp(0.0, max.1));
                 }
+                WidgetKind::TreeView { data, expanded, row_height, scroll, .. } => {
+                    let expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+                    let rows = data.visible_ids(&expanded).len() as f32;
+                    let content = Size { width: layout.size.width, height: rows * *row_height };
+                    drop(expanded);
+                    self.scroll_content.insert(id, content);
+                    *scroll = scroll.clamp(0.0, max_scroll(layout.size, content).1);
+                }
                 WidgetKind::TextArea { edit, font_size, scroll_y, .. } => {
                     // Same height math as caret-follow scroll: line stack + vertical padding.
                     let line_height = *font_size * LINE_HEIGHT_RATIO;
@@ -1383,13 +1523,165 @@ impl WidgetTree {
         ((body_h / row_height).floor() as usize).max(1)
     }
 
+    /// Visible `TreeView` node ids in paint order (expanded parents only).
+    pub fn tree_visible_ids(&self, id: WidgetId) -> Vec<u32> {
+        let Some(WidgetKind::TreeView { data, expanded, .. }) = self.kind(id) else {
+            return Vec::new();
+        };
+        let expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+        data.visible_ids(&expanded)
+    }
+
+    /// The visible flat-row range for `TreeView` `id` (indices into `tree_visible_ids`).
+    pub fn tree_visible_rows(&self, id: WidgetId) -> std::ops::Range<usize> {
+        let (Some(WidgetKind::TreeView { data, expanded, row_height, scroll, .. }), Some(rect)) =
+            (self.kind(id), self.absolute_rect(id))
+        else {
+            return 0..0;
+        };
+        if *row_height <= 0.0 {
+            return 0..0;
+        }
+        let expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+        let n = data.visible_ids(&expanded).len();
+        let first = (*scroll / row_height).floor().max(0.0) as usize;
+        let last = ((*scroll + rect.height) / row_height).ceil().max(0.0) as usize;
+        first.min(n)..last.min(n)
+    }
+
+    /// The `TreeView` node under window `(x, y)`, plus whether the press landed in the disclosure gutter.
+    pub fn tree_hit(&self, id: WidgetId, x: f32, y: f32) -> Option<(u32, bool)> {
+        let (Some(WidgetKind::TreeView { data, expanded, row_height, scroll, .. }), Some(rect)) =
+            (self.kind(id), self.absolute_rect(id))
+        else {
+            return None;
+        };
+        let expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+        let visible = data.visible_ids(&expanded);
+        let row = ((y - rect.y + scroll) / row_height).floor();
+        if row < 0.0 || (row as usize) >= visible.len() {
+            return None;
+        }
+        let node_id = visible[row as usize];
+        let depth = data.nodes.get(node_id as usize).map(|n| n.depth).unwrap_or(0);
+        let gutter_x0 = rect.x + depth as f32 * TREE_INDENT;
+        let gutter_x1 = gutter_x0 + TREE_GUTTER;
+        let in_gutter = x >= gutter_x0 && x < gutter_x1;
+        Some((node_id, in_gutter))
+    }
+
+    /// Select `TreeView` node `node` (or clear with `None`) and scroll it into view.
+    pub fn tree_select(&mut self, id: WidgetId, node: Option<u32>) {
+        let (node, ancestors, path) = {
+            let Some(WidgetKind::TreeView { data, .. }) = self.kind(id) else { return };
+            let node = node.filter(|&n| (n as usize) < data.nodes.len());
+            let mut ancestors = Vec::new();
+            if let Some(n) = node {
+                let mut cur = data.nodes.get(n as usize).and_then(|node| node.parent);
+                while let Some(p) = cur {
+                    ancestors.push(p);
+                    cur = data.nodes.get(p as usize).and_then(|node| node.parent);
+                }
+            }
+            let path = node.map(|n| data.path_of(n));
+            (node, ancestors, path)
+        };
+        let view = self.absolute_rects.get(&id).map_or(0.0, |r| r.height);
+        let Some(WidgetKind::TreeView {
+            data,
+            expanded,
+            row_height,
+            scroll,
+            selected,
+            on_select,
+            mirror,
+            ..
+        }) = self.kinds.get_mut(&id)
+        else {
+            return;
+        };
+        {
+            let mut expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+            for p in ancestors {
+                expanded.insert(p);
+            }
+        }
+        let changed = *selected != node;
+        *selected = node;
+        if let Some(n) = node {
+            let expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+            let visible = data.visible_ids(&expanded);
+            drop(expanded);
+            if let Some(flat) = visible.iter().position(|&v| v == n) {
+                let (top, bottom) = (flat as f32 * *row_height, (flat + 1) as f32 * *row_height);
+                *scroll = scroll.min(top).max(bottom - view);
+            }
+        }
+        let (callback, mirror) = (on_select.clone(), mirror.clone());
+        self.mark_dirty();
+        if changed {
+            if let Some(mirror) = mirror {
+                mirror.set(path.clone());
+            }
+            if let (Some(callback), Some(path)) = (callback, path) {
+                callback(&path);
+            }
+        }
+    }
+
+    /// Toggle expand/collapse for `node` in `TreeView` `id` (no-op on leaves).
+    pub fn tree_toggle(&mut self, id: WidgetId, node: u32) {
+        let Some(WidgetKind::TreeView { data, expanded, .. }) = self.kinds.get_mut(&id) else {
+            return;
+        };
+        let Some(tree_node) = data.nodes.get(node as usize) else { return };
+        if tree_node.children.is_empty() {
+            return;
+        }
+        let mut expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+        if !expanded.remove(&node) {
+            expanded.insert(node);
+        }
+        drop(expanded);
+        self.mark_dirty();
+    }
+
+    /// Expand or collapse `node` explicitly.
+    pub fn tree_set_expanded(&mut self, id: WidgetId, node: u32, open: bool) {
+        let Some(WidgetKind::TreeView { data, expanded, .. }) = self.kinds.get_mut(&id) else {
+            return;
+        };
+        let Some(tree_node) = data.nodes.get(node as usize) else { return };
+        if tree_node.children.is_empty() {
+            return;
+        }
+        let mut expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+        if open {
+            expanded.insert(node);
+        } else {
+            expanded.remove(&node);
+        }
+        drop(expanded);
+        self.mark_dirty();
+    }
+
+    /// How many whole rows fit in `TreeView` `id` (at least 1).
+    pub fn tree_page_rows(&self, id: WidgetId) -> usize {
+        let (Some(WidgetKind::TreeView { row_height, .. }), Some(rect)) = (self.kind(id), self.absolute_rect(id))
+        else {
+            return 1;
+        };
+        ((rect.height / row_height).floor() as usize).max(1)
+    }
+
     /// A scrollable widget's current offset (`ScrollArea`, a `ListView`'s vertical scroll, a
-    /// `Table`'s `(x, y)`, or a `TextArea`'s `scroll_y`).
+    /// `Table`'s `(x, y)`, a `TreeView`'s vertical scroll, or a `TextArea`'s `scroll_y`).
     pub fn scroll_offset(&self, id: WidgetId) -> Option<(f32, f32)> {
         match self.kind(id)? {
             WidgetKind::ScrollArea { offset, .. } => Some(*offset),
             WidgetKind::ListView { scroll, .. } => Some((0.0, *scroll)),
             WidgetKind::Table { scroll, .. } => Some(*scroll),
+            WidgetKind::TreeView { scroll, .. } => Some((0.0, *scroll)),
             WidgetKind::TextArea { scroll_y, .. } => Some((0.0, *scroll_y)),
             _ => None,
         }
@@ -1406,6 +1698,7 @@ impl WidgetTree {
             Some(WidgetKind::ScrollArea { offset, .. }) => *offset = target,
             Some(WidgetKind::ListView { scroll, .. }) => *scroll = target.1,
             Some(WidgetKind::Table { scroll, .. }) => *scroll = target,
+            Some(WidgetKind::TreeView { scroll, .. }) => *scroll = target.1,
             Some(WidgetKind::TextArea { scroll_y, .. }) => *scroll_y = target.1,
             _ => return false,
         }
@@ -2144,6 +2437,11 @@ fn measure_leaf<'m>(
                 width: TABLE_DEFAULT_COLUMN_WIDTH * cols.min(4.0),
                 height: header_height + row_height * data.nrows.clamp(1, 8) as f32,
             }
+        }
+        Some(WidgetKind::TreeView { data, expanded, row_height, .. }) => {
+            let expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+            let rows = data.visible_ids(&expanded).len().clamp(1, 8) as f32;
+            Size { width: 200.0, height: row_height * rows }
         }
     };
     Size {
@@ -3069,6 +3367,79 @@ mod tests {
         assert_eq!(*selections.lock().unwrap(), [10, 2, 49]);
         assert_eq!(mirror.get(), Some(49));
         assert_eq!(tree.table_page_rows(table), 4);
+    }
+
+    fn sample_tree_data() -> TreeData {
+        TreeData::from_nested(&[
+            TreeNodeData {
+                label: "Sensors".into(),
+                children: vec![
+                    TreeNodeData { label: "Camera".into(), children: vec![] },
+                    TreeNodeData {
+                        label: "IMU".into(),
+                        children: vec![
+                            TreeNodeData { label: "accel".into(), children: vec![] },
+                            TreeNodeData { label: "gyro".into(), children: vec![] },
+                        ],
+                    },
+                ],
+            },
+            TreeNodeData { label: "Logs".into(), children: vec![] },
+        ])
+    }
+
+    #[test]
+    fn tree_flatten_expand_and_paths() {
+        let data = sample_tree_data();
+        assert_eq!(data.nodes.len(), 6);
+        assert_eq!(data.path_of(0), vec![0]);
+        assert_eq!(data.path_of(4), vec![0, 1, 1]); // gyro
+        assert_eq!(data.id_at_path(&[0, 1, 0]), Some(3)); // accel
+        let collapsed = HashSet::new();
+        assert_eq!(data.visible_ids(&collapsed), vec![0, 5]);
+        let mut expanded = HashSet::new();
+        expanded.insert(0);
+        expanded.insert(2);
+        assert_eq!(data.visible_ids(&expanded), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn tree_view_toggle_select_and_scroll() {
+        let data = Arc::new(sample_tree_data());
+        let expanded = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let mirror = Readback::new(None);
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let view = tree.new_node(
+            Style {
+                size: Size { width: Dimension::length(200.0), height: Dimension::length(100.0) },
+                ..Default::default()
+            },
+            WidgetKind::TreeView {
+                data,
+                expanded: expanded.clone(),
+                row_height: 20.0,
+                font_size: 14.0,
+                scroll: 0.0,
+                selected: None,
+                text_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                selection_color: Color::TRANSPARENT,
+                on_select: None,
+                on_activate: None,
+                mirror: Some(mirror.clone()),
+            },
+        );
+        tree.add_child(root, view);
+        tree.compute_layout(300.0, 300.0);
+        assert_eq!(tree.tree_visible_ids(view), vec![0, 5]);
+        tree.tree_toggle(view, 0);
+        assert_eq!(tree.tree_visible_ids(view), vec![0, 1, 2, 5]);
+        tree.tree_select(view, Some(4)); // gyro — expands ancestors
+        assert!(expanded.lock().unwrap().contains(&0));
+        assert!(expanded.lock().unwrap().contains(&2));
+        assert_eq!(mirror.get(), Some(vec![0, 1, 1]));
+        assert_eq!(tree.tree_visible_ids(view), vec![0, 1, 2, 3, 4, 5]);
     }
 
     #[test]
