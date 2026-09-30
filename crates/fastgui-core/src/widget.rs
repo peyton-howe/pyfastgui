@@ -32,8 +32,10 @@ pub type TabSelectCallback = Arc<dyn Fn(usize) + Send + Sync>;
 /// `Float` (tear a docked panel out into an OS window); `None` for ordinary dock rearrange.
 pub type PanelDropCallback =
     Arc<dyn Fn(u64, u64, DropZone, Option<(f32, f32, f32, f32)>) + Send + Sync>;
-/// A `ListView` row index (`on_select` / `on_activate`).
+/// A `ListView` / `Table` row index (`on_select` / `on_activate`).
 pub type IndexCallback = Arc<dyn Fn(usize) + Send + Sync>;
+/// A `TreeView` node path from the roots (`on_select` / `on_activate`).
+pub type PathCallback = Arc<dyn Fn(&[u16]) + Send + Sync>;
 /// A `TextInput`'s edited text (`on_change`) or submitted text (`on_submit`, Enter).
 pub type TextCallback = Arc<dyn Fn(String) + Send + Sync>;
 /// Fired when the user clicks a panel/tab close control — argument is that panel's region id.
@@ -215,6 +217,10 @@ pub const TOGGLE_HEIGHT: f32 = 22.0;
 pub const SPIN_BUTTON_WIDTH: f32 = 22.0;
 /// Default track thickness for a `ProgressBar` when style doesn't pin height.
 pub const PROGRESS_HEIGHT: f32 = 8.0;
+/// Default body/header text inset inside a `Table` cell (layout units).
+pub const TABLE_CELL_INSET: f32 = 8.0;
+/// Fallback column width when `TableColumn::width` is unset and the view width is unknown.
+pub const TABLE_DEFAULT_COLUMN_WIDTH: f32 = 120.0;
 
 /// Scrollbar thickness and inset from the scroll area's edge (layout units). Overlay bars:
 /// drawn over the content's edge rather than taking layout space.
@@ -222,6 +228,71 @@ pub const SCROLLBAR_WIDTH: f32 = 6.0;
 const SCROLLBAR_INSET: f32 = 2.0;
 /// Shortest a scrollbar thumb gets, so a very long list still has something to grab.
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
+/// One column in a virtualized [`WidgetKind::Table`]: header label and optional fixed width
+/// (layout units). `width <= 0.0` means "share leftover view width equally with other flex
+/// columns" — no horizontal scroll unless explicit widths exceed the view.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableColumn {
+    pub header: String,
+    pub width: f32,
+}
+
+/// Column-oriented string cells for a [`WidgetKind::Table`]. Shared via `Arc` so `set_columns`
+/// can swap million-row payloads without cloning on every describe.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableData {
+    pub columns: Vec<TableColumn>,
+    /// `cells[col][row]` — every column the same length (`nrows`).
+    pub cells: Vec<Vec<String>>,
+    pub nrows: usize,
+}
+
+impl TableData {
+    /// Build from parallel column vectors. Returns `None` when column lengths disagree.
+    pub fn new(columns: Vec<TableColumn>, cells: Vec<Vec<String>>) -> Option<Self> {
+        if columns.len() != cells.len() {
+            return None;
+        }
+        let nrows = cells.first().map_or(0, Vec::len);
+        if cells.iter().any(|col| col.len() != nrows) {
+            return None;
+        }
+        Some(Self { columns, cells, nrows })
+    }
+
+    /// Resolve per-column widths for `view_width`: explicit widths stay fixed; `width <= 0`
+    /// columns split the leftover (at least 0). With no columns, returns empty.
+    pub fn resolved_widths(&self, view_width: f32) -> Vec<f32> {
+        if self.columns.is_empty() {
+            return Vec::new();
+        }
+        let mut widths = Vec::with_capacity(self.columns.len());
+        let mut fixed = 0.0_f32;
+        let mut flex = 0_usize;
+        for col in &self.columns {
+            if col.width > 0.0 {
+                fixed += col.width;
+            } else {
+                flex += 1;
+            }
+        }
+        let leftover = if flex > 0 {
+            ((view_width - fixed).max(0.0)) / flex as f32
+        } else {
+            0.0
+        };
+        for col in &self.columns {
+            widths.push(if col.width > 0.0 { col.width } else { leftover.max(1.0) });
+        }
+        widths
+    }
+
+    /// Content width for scrolling: sum of resolved widths (using `view_width` for flex).
+    pub fn content_width(&self, view_width: f32) -> f32 {
+        self.resolved_widths(view_width).iter().sum()
+    }
+}
 
 /// How far (layout units, each side, across the bar) a press still grabs a `Splitter` bar —
 /// see `WidgetTree::splitter_at`. The bar keeps its drawn thickness; only the hit area grows.
@@ -455,6 +526,26 @@ pub enum WidgetKind {
         on_activate: Option<IndexCallback>,
         mirror: Option<Readback<Option<usize>>>,
     },
+    /// A virtualized multi-column table (`QTableView`-lite): `data` can be huge — only the
+    /// rows in view are shaped and drawn. Sticky header (scrolls in x with the body, fixed in
+    /// y). `scroll` is `(x, y)` layout units through the same wheel/scrollbar machinery as
+    /// `ScrollArea`. Click or arrow keys select a row; double-click or Enter activates.
+    Table {
+        data: Arc<TableData>,
+        row_height: f32,
+        header_height: f32,
+        font_size: f32,
+        scroll: (f32, f32),
+        selected: Option<usize>,
+        text_color: Color,
+        header_color: Color,
+        background: Color,
+        selection_color: Color,
+        grid_color: Color,
+        on_select: Option<IndexCallback>,
+        on_activate: Option<IndexCallback>,
+        mirror: Option<Readback<Option<usize>>>,
+    },
     /// An overlay (menu, dropdown list, tooltip, dialog): an absolutely positioned child of the
     /// root, so it paints above everything else and wins hit tests, placed after layout by
     /// `anchor` (see `WidgetTree::open_popup`). A click outside the topmost popup dismisses it
@@ -600,6 +691,7 @@ impl WidgetKind {
                 | WidgetKind::TextInput { .. }
                 | WidgetKind::TextArea { .. }
                 | WidgetKind::ListView { .. }
+                | WidgetKind::Table { .. }
                 | WidgetKind::Checkbox { .. }
                 | WidgetKind::Radio { .. }
                 | WidgetKind::Toggle { .. }
@@ -1008,6 +1100,16 @@ impl WidgetTree {
                     self.scroll_content.insert(id, content);
                     *scroll = scroll.clamp(0.0, max_scroll(layout.size, content).1);
                 }
+                WidgetKind::Table { data, row_height, header_height, scroll, .. } => {
+                    let body_h = data.nrows as f32 * *row_height;
+                    let content = Size {
+                        width: data.content_width(layout.size.width),
+                        height: *header_height + body_h,
+                    };
+                    self.scroll_content.insert(id, content);
+                    let max = max_scroll(layout.size, content);
+                    *scroll = (scroll.0.clamp(0.0, max.0), scroll.1.clamp(0.0, max.1));
+                }
                 WidgetKind::TextArea { edit, font_size, scroll_y, .. } => {
                     // Same height math as caret-follow scroll: line stack + vertical padding.
                     let line_height = *font_size * LINE_HEIGHT_RATIO;
@@ -1185,12 +1287,109 @@ impl WidgetTree {
         ((rect.height / row_height).floor() as usize).max(1)
     }
 
-    /// A scrollable widget's current offset (`ScrollArea`, a `ListView`'s vertical scroll, or a
-    /// `TextArea`'s `scroll_y`).
+    /// Body area below the sticky header for `Table` `id` (window layout units).
+    pub fn table_body_rect(&self, id: WidgetId) -> Option<Rect> {
+        let (Some(WidgetKind::Table { header_height, .. }), Some(rect)) = (self.kind(id), self.absolute_rect(id))
+        else {
+            return None;
+        };
+        Some(Rect {
+            x: rect.x,
+            y: rect.y + header_height,
+            width: rect.width,
+            height: (rect.height - header_height).max(0.0),
+        })
+    }
+
+    /// Resolved column widths for `Table` `id` at its current layout width.
+    pub fn table_column_widths(&self, id: WidgetId) -> Vec<f32> {
+        let (Some(WidgetKind::Table { data, .. }), Some(rect)) = (self.kind(id), self.absolute_rect(id)) else {
+            return Vec::new();
+        };
+        data.resolved_widths(rect.width)
+    }
+
+    /// The `Table` body rows at least partly in view (for drawing), from the last layout.
+    pub fn table_visible_rows(&self, id: WidgetId) -> std::ops::Range<usize> {
+        let (Some(WidgetKind::Table { data, row_height, header_height, scroll, .. }), Some(rect)) =
+            (self.kind(id), self.absolute_rect(id))
+        else {
+            return 0..0;
+        };
+        if *row_height <= 0.0 {
+            return 0..0;
+        }
+        let body_h = (rect.height - header_height).max(0.0);
+        let first = (scroll.1 / row_height).floor().max(0.0) as usize;
+        let last = ((scroll.1 + body_h) / row_height).ceil().max(0.0) as usize;
+        first.min(data.nrows)..last.min(data.nrows)
+    }
+
+    /// The `Table` body row under window y, if any (header clicks return `None`).
+    pub fn table_row_at(&self, id: WidgetId, y: f32) -> Option<usize> {
+        let (Some(WidgetKind::Table { data, row_height, header_height, scroll, .. }), Some(rect)) =
+            (self.kind(id), self.absolute_rect(id))
+        else {
+            return None;
+        };
+        let body_y = rect.y + header_height;
+        if y < body_y {
+            return None;
+        }
+        let row = ((y - body_y + scroll.1) / row_height).floor();
+        (row >= 0.0 && (row as usize) < data.nrows).then_some(row as usize)
+    }
+
+    /// Select row `index` of `Table` `id` (clamped; `None` clears) and scroll it into the body
+    /// view. Fires `on_select` and updates the mirror when the selection changes.
+    pub fn table_select(&mut self, id: WidgetId, index: Option<usize>) {
+        let Some(WidgetKind::Table { data, row_height, header_height, scroll, selected, on_select, mirror, .. }) =
+            self.kinds.get_mut(&id)
+        else {
+            return;
+        };
+        let nrows = data.nrows;
+        let index = index.filter(|_| nrows > 0).map(|i| i.min(nrows - 1));
+        let changed = *selected != index;
+        *selected = index;
+        let view = self
+            .absolute_rects
+            .get(&id)
+            .map_or(0.0, |r| (r.height - *header_height).max(0.0));
+        if let Some(i) = index {
+            let (top, bottom) = (i as f32 * *row_height, (i + 1) as f32 * *row_height);
+            scroll.1 = scroll.1.min(top).max(bottom - view);
+        }
+        let (callback, mirror) = (on_select.clone(), mirror.clone());
+        self.mark_dirty();
+        if changed {
+            if let Some(mirror) = mirror {
+                mirror.set(index);
+            }
+            if let (Some(callback), Some(i)) = (callback, index) {
+                callback(i);
+            }
+        }
+    }
+
+    /// How many whole body rows fit in `Table` `id` (at least 1) — PageUp/PageDown's step.
+    pub fn table_page_rows(&self, id: WidgetId) -> usize {
+        let (Some(WidgetKind::Table { row_height, header_height, .. }), Some(rect)) =
+            (self.kind(id), self.absolute_rect(id))
+        else {
+            return 1;
+        };
+        let body_h = (rect.height - header_height).max(0.0);
+        ((body_h / row_height).floor() as usize).max(1)
+    }
+
+    /// A scrollable widget's current offset (`ScrollArea`, a `ListView`'s vertical scroll, a
+    /// `Table`'s `(x, y)`, or a `TextArea`'s `scroll_y`).
     pub fn scroll_offset(&self, id: WidgetId) -> Option<(f32, f32)> {
         match self.kind(id)? {
             WidgetKind::ScrollArea { offset, .. } => Some(*offset),
             WidgetKind::ListView { scroll, .. } => Some((0.0, *scroll)),
+            WidgetKind::Table { scroll, .. } => Some(*scroll),
             WidgetKind::TextArea { scroll_y, .. } => Some((0.0, *scroll_y)),
             _ => None,
         }
@@ -1206,6 +1405,7 @@ impl WidgetTree {
         match self.kinds.get_mut(&id) {
             Some(WidgetKind::ScrollArea { offset, .. }) => *offset = target,
             Some(WidgetKind::ListView { scroll, .. }) => *scroll = target.1,
+            Some(WidgetKind::Table { scroll, .. }) => *scroll = target,
             Some(WidgetKind::TextArea { scroll_y, .. }) => *scroll_y = target.1,
             _ => return false,
         }
@@ -1937,6 +2137,13 @@ fn measure_leaf<'m>(
         Some(WidgetKind::ListView { row_height, items, .. }) => {
             // Up to eight rows tall unless stretched or sized; wide enough to read.
             Size { width: 160.0, height: row_height * items.len().clamp(1, 8) as f32 }
+        }
+        Some(WidgetKind::Table { data, row_height, header_height, .. }) => {
+            let cols = data.columns.len().max(1) as f32;
+            Size {
+                width: TABLE_DEFAULT_COLUMN_WIDTH * cols.min(4.0),
+                height: header_height + row_height * data.nrows.clamp(1, 8) as f32,
+            }
         }
     };
     Size {
@@ -2784,6 +2991,84 @@ mod tests {
         let (mut empty, id, _, _) = list_tree(0);
         empty.list_select(id, Some(0));
         assert_eq!(empty.list_row_at(id, 5.0), None);
+    }
+
+    fn table_tree(n: usize, col_width: f32) -> (WidgetTree, WidgetId, Selections, Readback<Option<usize>>) {
+        let selections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = selections.clone();
+        let mirror = Readback::new(None);
+        let data = TableData::new(
+            vec![
+                TableColumn { header: "i".into(), width: col_width },
+                TableColumn { header: "label".into(), width: col_width },
+            ],
+            vec![
+                (0..n).map(|i| i.to_string()).collect(),
+                (0..n).map(|i| format!("row {i}")).collect(),
+            ],
+        )
+        .unwrap();
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let table = tree.new_node(
+            Style {
+                size: Size { width: Dimension::length(200.0), height: Dimension::length(120.0) },
+                ..Default::default()
+            },
+            WidgetKind::Table {
+                data: Arc::new(data),
+                row_height: 20.0,
+                header_height: 24.0,
+                font_size: 14.0,
+                scroll: (0.0, 0.0),
+                selected: None,
+                text_color: Color::TRANSPARENT,
+                header_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                selection_color: Color::TRANSPARENT,
+                grid_color: Color::TRANSPARENT,
+                on_select: Some(Arc::new(move |i| sink.lock().unwrap().push(i))),
+                on_activate: None,
+                mirror: Some(mirror.clone()),
+            },
+        );
+        tree.add_child(root, table);
+        tree.compute_layout(400.0, 400.0);
+        (tree, table, selections, mirror)
+    }
+
+    #[test]
+    fn table_draws_only_visible_rows_of_a_million() {
+        let (mut tree, table, _, _) = table_tree(1_000_000, 100.0);
+        // Body is 120 - 24 = 96 → 5 whole rows; partly visible sixth.
+        assert_eq!(tree.table_visible_rows(table), 0..5);
+        assert_eq!(tree.table_row_at(table, 10.0), None, "header is not a body row");
+        assert_eq!(tree.table_row_at(table, 30.0), Some(0));
+        assert!(tree.scroll_at(10.0, 40.0, 0.0, 40.0));
+        assert_eq!(tree.table_visible_rows(table), 2..7);
+        // Explicit columns 100+100 with view 200 → no horizontal overflow.
+        assert_eq!(tree.scroll_extent(table).map(|e| e.0), Some(0.0));
+        // Wider columns → horizontal scroll.
+        let (mut wide, id, _, _) = table_tree(100, 200.0);
+        wide.compute_layout(400.0, 400.0);
+        assert!(wide.scroll_extent(id).unwrap().0 > 0.0);
+        assert!(wide.scroll_at(10.0, 40.0, 50.0, 0.0));
+        assert!(wide.scrollbar_thumbs(id).0.is_some());
+    }
+
+    #[test]
+    fn table_selection_scrolls_into_view_and_notifies() {
+        let (mut tree, table, selections, mirror) = table_tree(50, 100.0);
+        tree.table_select(table, Some(10));
+        // Body view 96; row 10 bottom-aligned → scroll_y = 11*20 - 96 = 124.
+        assert_eq!(tree.scroll_offset(table), Some((0.0, 124.0)));
+        tree.table_select(table, Some(10));
+        tree.table_select(table, Some(2));
+        assert_eq!(tree.scroll_offset(table), Some((0.0, 40.0)));
+        tree.table_select(table, Some(999));
+        assert_eq!(*selections.lock().unwrap(), [10, 2, 49]);
+        assert_eq!(mirror.get(), Some(49));
+        assert_eq!(tree.table_page_rows(table), 4);
     }
 
     #[test]

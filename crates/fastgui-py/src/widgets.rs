@@ -7,7 +7,7 @@ use fastgui_core::taffy::style::LengthPercentage;
 use fastgui_core::widget::{
     clamp_range, round_to_decimals, Accel, BoolCallback, ChangeCallback, ClickCallback, Color, IndexCallback,
     PanelCloseCallback, PanelDropCallback, PointCallback, PopupAnchor, PopupSide, SplitDirection,
-    TabSelectCallback, TextCallback, WidgetId, WidgetKind, WidgetTree,
+    TabSelectCallback, TableColumn, TableData, TextCallback, WidgetId, WidgetKind, WidgetTree,
 };
 use fastgui_core::text_edit::TextEdit;
 use fastgui_core::{CpuFrame, FrameSlot, PixelFormat, Readback, MAX_CPU_FRAME_EXTENT};
@@ -15,7 +15,7 @@ use crate::theme::{FontSize, Spacing};
 use crate::backend::{Command, CommandDispatch};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyList};
+use pyo3::types::{PyAny, PyDict, PyList, PySequence};
 
 type IdCell = Arc<Mutex<Option<WidgetId>>>;
 type SenderCell = Arc<Mutex<Option<CommandDispatch>>>;
@@ -435,6 +435,9 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
     if let Ok(w) = obj.cast::<ListView>() {
         return Ok(w.borrow().describe());
     }
+    if let Ok(w) = obj.cast::<Table>() {
+        return Ok(w.borrow().describe());
+    }
     if obj.cast::<Popup>().is_ok() {
         return Err(PyTypeError::new_err("a Popup isn't placed in the layout; open it with popup.show(anchor)"));
     }
@@ -488,7 +491,7 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
         return Ok(w.borrow().describe_widget());
     }
     Err(PyTypeError::new_err(
-        "expected a fastgui widget (Box, Grid, Label, Button, Slider, TextInput, TextArea, ScrollArea, Checkbox, Radio, Toggle, SpinBox, NumericScrub, ProgressBar, ComboBox, Image, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
+        "expected a fastgui widget (Box, Grid, Label, Button, Slider, TextInput, TextArea, ScrollArea, ListView, Table, Checkbox, Radio, Toggle, SpinBox, NumericScrub, ProgressBar, ComboBox, Image, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
     ))
 }
 
@@ -1443,6 +1446,268 @@ impl ListView {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+        }
+    }
+}
+
+/// Compact cell formatting for table ingest (floats without noisy trailing zeros).
+fn format_table_cell(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok(v) = value.extract::<bool>() {
+        // Check bool before int — bool is a subclass of int in Python.
+        return Ok(if v { "True".into() } else { "False".into() });
+    }
+    if let Ok(v) = value.extract::<i64>() {
+        return Ok(v.to_string());
+    }
+    if let Ok(v) = value.extract::<f64>() {
+        if !v.is_finite() {
+            return Ok(v.to_string());
+        }
+        let rounded = (v * 1_000_000.0).round() / 1_000_000.0;
+        let s = format!("{rounded}");
+        return Ok(s);
+    }
+    if value.is_none() {
+        return Ok(String::new());
+    }
+    value.str()?.extract()
+}
+
+/// Turn one column sequence (list, numpy 1-D, pyarrow-ish iterable) into string cells.
+fn column_to_strings(col: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    if let Ok(to_pylist) = col.call_method0("to_pylist") {
+        return column_to_strings(&to_pylist);
+    }
+    if let Ok(tolist) = col.call_method0("tolist") {
+        return column_to_strings(&tolist);
+    }
+    let seq = col.cast::<PySequence>().map_err(|_| {
+        PyTypeError::new_err("each table column must be a sequence (list, numpy array, …)")
+    })?;
+    let mut out = Vec::with_capacity(seq.len().unwrap_or(0) as usize);
+    for i in 0..seq.len()? {
+        out.push(format_table_cell(&seq.get_item(i)?)?);
+    }
+    Ok(out)
+}
+
+/// Normalize `columns=` (dict or sequence of `(name, values)`) plus optional widths into `TableData`.
+fn coerce_table_data(
+    columns: &Bound<'_, PyAny>,
+    column_widths: Option<Vec<f32>>,
+) -> PyResult<Arc<TableData>> {
+    let mut headers: Vec<String> = Vec::new();
+    let mut cells: Vec<Vec<String>> = Vec::new();
+    if let Ok(dict) = columns.cast::<PyDict>() {
+        for (key, value) in dict.iter() {
+            headers.push(key.str()?.to_string_lossy().into_owned());
+            cells.push(column_to_strings(&value)?);
+        }
+    } else {
+        let seq = columns.cast::<PySequence>().map_err(|_| {
+            PyTypeError::new_err("columns must be a dict or a sequence of (name, values) pairs")
+        })?;
+        for i in 0..seq.len()? {
+            let pair = seq.get_item(i)?;
+            let pair_seq = pair.cast::<PySequence>().map_err(|_| {
+                PyTypeError::new_err("each columns entry must be a (name, values) pair")
+            })?;
+            if pair_seq.len()? != 2 {
+                return Err(PyValueError::new_err("each columns entry must be a (name, values) pair"));
+            }
+            headers.push(pair_seq.get_item(0)?.str()?.to_string_lossy().into_owned());
+            cells.push(column_to_strings(&pair_seq.get_item(1)?)?);
+        }
+    }
+    if let Some(widths) = column_widths.as_ref() {
+        if !widths.is_empty() && widths.len() != headers.len() {
+            return Err(PyValueError::new_err(
+                "column_widths length must match the number of columns",
+            ));
+        }
+    }
+    let cols: Vec<TableColumn> = headers
+        .into_iter()
+        .enumerate()
+        .map(|(i, header)| TableColumn {
+            header,
+            width: column_widths
+                .as_ref()
+                .and_then(|w| w.get(i).copied())
+                .unwrap_or(0.0),
+        })
+        .collect();
+    TableData::new(cols, cells)
+        .map(Arc::new)
+        .ok_or_else(|| PyValueError::new_err("all table columns must have the same length"))
+}
+
+/// A virtualized multi-column table: only rows in view are drawn, so it handles millions.
+#[pyclass]
+pub(crate) struct Table {
+    id: IdCell,
+    sender: SenderCell,
+    data: Arc<Mutex<Arc<TableData>>>,
+    selected: Readback<Option<usize>>,
+    row_height: f32,
+    header_height: f32,
+    font_size: Option<FontSize>,
+    flex_grow: f32,
+    width: Option<f32>,
+    height: Option<f32>,
+    text_color: Option<(f32, f32, f32, f32)>,
+    header_color: Option<(f32, f32, f32, f32)>,
+    background: Option<(f32, f32, f32, f32)>,
+    selection_color: Option<(f32, f32, f32, f32)>,
+    grid_color: Option<(f32, f32, f32, f32)>,
+    on_select: Option<Py<PyAny>>,
+    on_activate: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl Table {
+    #[new]
+    #[pyo3(signature = (
+        columns,
+        on_select=None,
+        on_activate=None,
+        row_height=24.0,
+        header_height=28.0,
+        column_widths=None,
+        font_size=None,
+        flex_grow=1.0,
+        width=None,
+        height=None,
+        text_color=None,
+        header_color=None,
+        background=None,
+        selection_color=None,
+        grid_color=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        columns: &Bound<'_, PyAny>,
+        on_select: Option<Py<PyAny>>,
+        on_activate: Option<Py<PyAny>>,
+        row_height: f32,
+        header_height: f32,
+        column_widths: Option<Vec<f32>>,
+        font_size: Option<FontSize>,
+        flex_grow: f32,
+        width: Option<f32>,
+        height: Option<f32>,
+        text_color: Option<(f32, f32, f32, f32)>,
+        header_color: Option<(f32, f32, f32, f32)>,
+        background: Option<(f32, f32, f32, f32)>,
+        selection_color: Option<(f32, f32, f32, f32)>,
+        grid_color: Option<(f32, f32, f32, f32)>,
+    ) -> PyResult<Self> {
+        if row_height <= 0.0 {
+            return Err(PyValueError::new_err("row_height must be positive"));
+        }
+        if header_height < 0.0 {
+            return Err(PyValueError::new_err("header_height must be non-negative"));
+        }
+        let data = coerce_table_data(columns, column_widths)?;
+        Ok(Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            data: Arc::new(Mutex::new(data)),
+            selected: Readback::new(None),
+            row_height,
+            header_height,
+            font_size,
+            flex_grow,
+            width,
+            height,
+            text_color,
+            header_color,
+            background,
+            selection_color,
+            grid_color,
+            on_select,
+            on_activate,
+        })
+    }
+
+    /// Replace columns (clears selection and scrolls to the origin). Works before attaching.
+    #[pyo3(signature = (columns, column_widths=None))]
+    fn set_columns(&self, columns: &Bound<'_, PyAny>, column_widths: Option<Vec<f32>>) -> PyResult<()> {
+        let data = coerce_table_data(columns, column_widths)?;
+        *self.data.lock().unwrap_or_else(|p| p.into_inner()) = data.clone();
+        self.selected.set(None);
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::Table { data: current, selected, scroll, .. } = kind {
+                *current = data;
+                *selected = None;
+                *scroll = (0.0, 0.0);
+            }
+        })
+    }
+
+    /// Select row `index` (clamped) and scroll it into view; `None` clears the selection.
+    #[pyo3(signature = (index))]
+    fn select(&self, index: Option<usize>) -> PyResult<()> {
+        let id = *self.id.lock().unwrap_or_else(|p| p.into_inner());
+        let sender = self.sender.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let (Some(id), Some(sender)) = (id, sender) else {
+            let nrows = self.data.lock().unwrap_or_else(|p| p.into_inner()).nrows;
+            self.selected.set(index.filter(|_| nrows > 0).map(|i| i.min(nrows - 1)));
+            return Ok(());
+        };
+        send_tree_mutation(&sender, move |tree| tree.table_select(id, index))
+    }
+
+    #[getter]
+    fn selected(&self) -> Option<usize> {
+        self.selected.get()
+    }
+
+    fn __len__(&self) -> usize {
+        self.data.lock().unwrap_or_else(|p| p.into_inner()).nrows
+    }
+}
+
+impl Table {
+    fn describe(&self) -> DescribedWidget {
+        let (on_select, on_activate) = Python::attach(|py| {
+            (
+                self.on_select.as_ref().map(|cb| cb.clone_ref(py)),
+                self.on_activate.as_ref().map(|cb| cb.clone_ref(py)),
+            )
+        });
+        let data = self.data.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let selected = self.selected.get().filter(|&i| i < data.nrows);
+        let palette = crate::theme::palette();
+        DescribedWidget {
+            style: StyleParams::leaf(self.flex_grow, self.width, self.height),
+            kind: WidgetKind::Table {
+                data,
+                row_height: self.row_height,
+                header_height: self.header_height,
+                font_size: self.font_size.unwrap_or(FontSize::Small).resolve(),
+                scroll: (0.0, 0.0),
+                selected,
+                text_color: rgba(self.text_color.unwrap_or(palette.text)),
+                header_color: rgba(self.header_color.unwrap_or(palette.text_muted)),
+                background: rgba(self.background.unwrap_or(palette.surface_alt)),
+                selection_color: rgba(self.selection_color.unwrap_or(palette.selection)),
+                grid_color: rgba(self.grid_color.unwrap_or(palette.border)),
+                on_select: on_select.map(wrap_index_callback),
+                on_activate: on_activate.map(wrap_index_callback),
+                mirror: Some(self.selected.clone()),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
         }
     }
 }
@@ -3480,6 +3745,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ScrollArea>()?;
     m.add_class::<Popup>()?;
     m.add_class::<ListView>()?;
+    m.add_class::<Table>()?;
     m.add_class::<Checkbox>()?;
     m.add_class::<Radio>()?;
     m.add_class::<Toggle>()?;

@@ -285,6 +285,130 @@ impl ChromeRenderer {
                     // Rows past the list's edges are cut to it.
                     ops = clip_ops(ops, Clip::from_rect(rect));
                 }
+                WidgetKind::Table {
+                    data,
+                    row_height,
+                    header_height,
+                    font_size,
+                    scroll,
+                    selected,
+                    text_color,
+                    header_color,
+                    background,
+                    selection_color,
+                    grid_color,
+                    ..
+                } => {
+                    push_fill(&mut ops, rect, *background);
+                    let widths = data.resolved_widths(logical_rect.width);
+                    let (scroll_x, scroll_y) = *scroll;
+                    let line = font_size * LINE_HEIGHT_RATIO;
+                    let inset = fastgui_core::widget::TABLE_CELL_INSET;
+
+                    // Sticky header: fixed in y, scrolls with body in x.
+                    let header = WidgetRect {
+                        x: logical_rect.x,
+                        y: logical_rect.y,
+                        width: logical_rect.width,
+                        height: *header_height,
+                    };
+                    let mut header_ops = Vec::new();
+                    push_fill(&mut header_ops, scale_rect(header, scale), theme.surface_alt);
+                    let mut x = logical_rect.x - scroll_x;
+                    for (col, width) in widths.iter().enumerate() {
+                        let cell = WidgetRect {
+                            x,
+                            y: logical_rect.y,
+                            width: *width,
+                            height: *header_height,
+                        };
+                        let text = WidgetRect {
+                            x: cell.x + inset,
+                            y: cell.y + (cell.height - line) / 2.0,
+                            width: (cell.width - 2.0 * inset).max(0.0),
+                            height: line,
+                        };
+                        let header_text = data.columns.get(col).map(|c| c.header.as_str()).unwrap_or("");
+                        self.push_text(
+                            &mut header_ops,
+                            scale_rect(text, scale),
+                            header_text,
+                            font_size * scale,
+                            *header_color,
+                        );
+                        x += width;
+                    }
+                    ops.extend(clip_ops(header_ops, Clip::from_rect(scale_rect(header, scale))));
+
+                    // Body rows below the header (clipped so they never paint over it).
+                    let body = WidgetRect {
+                        x: logical_rect.x,
+                        y: logical_rect.y + header_height,
+                        width: logical_rect.width,
+                        height: (logical_rect.height - header_height).max(0.0),
+                    };
+                    let mut body_ops = Vec::new();
+                    for index in tree.table_visible_rows(id) {
+                        let row = WidgetRect {
+                            x: logical_rect.x,
+                            y: body.y + index as f32 * row_height - scroll_y,
+                            width: logical_rect.width,
+                            height: *row_height,
+                        };
+                        if *selected == Some(index) {
+                            push_fill(&mut body_ops, scale_rect(row, scale), *selection_color);
+                        }
+                        let mut cx = logical_rect.x - scroll_x;
+                        for (col, width) in widths.iter().enumerate() {
+                            let text = WidgetRect {
+                                x: cx + inset,
+                                y: row.y + (row.height - line) / 2.0,
+                                width: (width - 2.0 * inset).max(0.0),
+                                height: line,
+                            };
+                            let cell = data
+                                .cells
+                                .get(col)
+                                .and_then(|c| c.get(index))
+                                .map(String::as_str)
+                                .unwrap_or("");
+                            self.push_text(
+                                &mut body_ops,
+                                scale_rect(text, scale),
+                                cell,
+                                font_size * scale,
+                                *text_color,
+                            );
+                            cx += width;
+                        }
+                    }
+                    ops.extend(clip_ops(body_ops, Clip::from_rect(scale_rect(body, scale))));
+
+                    // Vertical grid lines across the full table, clipped to its bounds.
+                    if grid_color.0[3] > 0.001 {
+                        let mut grid_ops = Vec::new();
+                        let mut gx = logical_rect.x - scroll_x;
+                        for (col, width) in widths.iter().enumerate() {
+                            gx += width;
+                            if col + 1 < widths.len() {
+                                push_fill(
+                                    &mut grid_ops,
+                                    scale_rect(
+                                        WidgetRect {
+                                            x: gx,
+                                            y: logical_rect.y,
+                                            width: 1.0,
+                                            height: logical_rect.height,
+                                        },
+                                        scale,
+                                    ),
+                                    *grid_color,
+                                );
+                            }
+                        }
+                        ops.extend(clip_ops(grid_ops, Clip::from_rect(rect)));
+                    }
+                }
                 WidgetKind::Popup { modal, background, border, .. } => {
                     if *modal {
                         let screen = WidgetRect { x: 0.0, y: 0.0, width: window.width as f32, height: window.height as f32 };
@@ -526,7 +650,9 @@ impl ChromeRenderer {
             in_overlay |= popups.contains(&id);
             let bar_color = match tree.kind(id) {
                 Some(WidgetKind::ScrollArea { bar_color, .. }) => bar_color,
-                Some(WidgetKind::ListView { .. } | WidgetKind::TextArea { .. }) => &theme.scrollbar,
+                Some(WidgetKind::ListView { .. } | WidgetKind::Table { .. } | WidgetKind::TextArea { .. }) => {
+                    &theme.scrollbar
+                }
                 _ => continue,
             };
             let mut ops = Vec::new();

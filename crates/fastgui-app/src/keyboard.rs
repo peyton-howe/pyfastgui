@@ -145,6 +145,31 @@ fn handle_key_inner(
             tree.list_select(id, Some(target));
             true
         }
+        Some(WidgetKind::Table { data, selected, on_activate, .. }) => {
+            let (count, current) = (data.nrows, *selected);
+            let page = tree.table_page_rows(id);
+            let last = count.saturating_sub(1);
+            let target = match key {
+                Key::Named(NamedKey::Enter) => {
+                    if let (Some(callback), Some(row)) = (on_activate.clone(), current) {
+                        callback(row);
+                    }
+                    return current.is_some();
+                }
+                Key::Named(NamedKey::ArrowDown) => current.map_or(0, |i| (i + 1).min(last)),
+                Key::Named(NamedKey::ArrowUp) => current.map_or(0, |i| i.saturating_sub(1)),
+                Key::Named(NamedKey::PageDown) => current.map_or(0, |i| (i + page).min(last)),
+                Key::Named(NamedKey::PageUp) => current.map_or(0, |i| i.saturating_sub(page)),
+                Key::Named(NamedKey::Home) => 0,
+                Key::Named(NamedKey::End) => last,
+                _ => return false,
+            };
+            if count == 0 {
+                return false;
+            }
+            tree.table_select(id, Some(target));
+            true
+        }
         Some(WidgetKind::Checkbox { .. } | WidgetKind::Toggle { .. }) => {
             let activate = matches!(key, Key::Named(NamedKey::Enter | NamedKey::Space))
                 || matches!(key, Key::Character(c) if c == " ");

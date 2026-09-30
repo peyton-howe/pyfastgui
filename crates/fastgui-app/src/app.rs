@@ -895,6 +895,12 @@ impl<B: SurfaceBackend> App<B> {
                     list_press(tree, id, self.cursor.1, double);
                 });
             }
+            WidgetKind::Table { .. } => {
+                let double = is_double_click(&mut self.last_click, self.cursor);
+                forms::with_tree(&mut self.widget_tree, |tree| {
+                    table_press(tree, id, self.cursor.1, double);
+                });
+            }
             WidgetKind::TextInput { .. } | WidgetKind::TextArea { .. } => {
                 let double = is_double_click(&mut self.last_click, self.cursor);
                 let extend = self.modifiers.shift_key();
@@ -1071,6 +1077,14 @@ impl<B: SurfaceBackend> App<B> {
                     let double = is_double_click(&mut floater.last_click, cursor);
                     forms::with_tree(&mut floater.widget_tree, |tree| {
                         list_press(tree, id, cursor.1, double);
+                    });
+                }
+            }
+            WidgetKind::Table { .. } => {
+                if let Some(floater) = self.floating.get_mut(&window_id) {
+                    let double = is_double_click(&mut floater.last_click, cursor);
+                    forms::with_tree(&mut floater.widget_tree, |tree| {
+                        table_press(tree, id, cursor.1, double);
                     });
                 }
             }
@@ -2510,6 +2524,17 @@ fn list_press(tree: &mut WidgetTree, id: WidgetId, y: f32, double: bool) {
     tree.list_select(id, Some(row));
     if double {
         if let Some(WidgetKind::ListView { on_activate: Some(callback), .. }) = tree.kind(id) {
+            callback.clone()(row);
+        }
+    }
+}
+
+/// A press at window y in `Table` `id`: select the body row there, or activate on double-click.
+fn table_press(tree: &mut WidgetTree, id: WidgetId, y: f32, double: bool) {
+    let Some(row) = tree.table_row_at(id, y) else { return };
+    tree.table_select(id, Some(row));
+    if double {
+        if let Some(WidgetKind::Table { on_activate: Some(callback), .. }) = tree.kind(id) {
             callback.clone()(row);
         }
     }

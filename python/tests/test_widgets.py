@@ -41,6 +41,38 @@ class ListViewTests(unittest.TestCase):
         self.assertEqual(len(fg.ListView([str(i) for i in range(1_000_000)])), 1_000_000)
 
 
+class TableTests(unittest.TestCase):
+    def test_dict_columns_select_and_set_columns(self):
+        table = fg.Table(columns={"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        self.assertEqual((len(table), table.selected), (3, None))
+        table.select(1)
+        self.assertEqual(table.selected, 1)
+        table.select(99)
+        self.assertEqual(table.selected, 2)
+        table.select(None)
+        self.assertIsNone(table.selected)
+        table.set_columns([("n", [10, 20])])
+        self.assertEqual((len(table), table.selected), (2, None))
+
+    def test_rejects_mismatched_lengths_and_bad_sizes(self):
+        with self.assertRaises(ValueError):
+            fg.Table(columns={"a": [1, 2], "b": [1]})
+        with self.assertRaises(ValueError):
+            fg.Table(columns={"a": [1]}, row_height=0)
+        with self.assertRaises(ValueError):
+            fg.Table(columns={"a": [1]}, column_widths=[10.0, 20.0])
+
+    def test_numpy_columns(self):
+        import numpy as np
+
+        n = 10_000
+        table = fg.Table(
+            columns={"i": np.arange(n), "x": np.linspace(0.0, 1.0, n)},
+            column_widths=[60.0, 80.0],
+        )
+        self.assertEqual(len(table), n)
+
+
 class PopupTests(unittest.TestCase):
     def test_closed_until_shown_and_close_is_a_no_op(self):
         popup = fg.Popup(fg.Label("hi"))
