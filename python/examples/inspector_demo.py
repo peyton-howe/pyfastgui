@@ -1,11 +1,20 @@
-"""M7 7D demo: `PropertyInspector` (label + 7B editors) driven by a `TreeView` selection."""
+"""M7 7D demo: `PropertyInspector` (label + 7B editors) driven by a `TreeView` selection.
+
+Selecting a node loads its label into Name; editing Name renames the selected node.
+"""
 
 import fastgui as fg
 
 
 def main() -> None:
     window = fg.Window(title="fastgui — M7 property inspector", width=640, height=420)
-    name = fg.TextInput("Camera A", on_change=lambda t: status.set_text(f"name → {t!r}"))
+
+    def on_rename(text: str) -> None:
+        if tree.selected is not None:
+            tree.set_label(tree.selected, text)
+            status.set_text(f"Renamed to {text!r}")
+
+    name = fg.TextInput("Camera A", on_change=on_rename)
     gain = fg.SpinBox(value=1.0, min=0.0, max=10.0, step=0.1, decimals=1)
     enabled = fg.Toggle(checked=True)
     mode = fg.ComboBox(["Raw", "Calibrated", "Preview"], selected=0)
@@ -22,13 +31,7 @@ def main() -> None:
     )
 
     def on_select(path) -> None:
-        labels = {
-            (0,): "Sensors",
-            (0, 0): "Camera A",
-            (0, 1): "IMU",
-            (1,): "Logs",
-        }
-        label = labels.get(tuple(path), f"node {tuple(path)}")
+        label = tree.label(path)
         name.set_text(label)
         status.set_text(f"Inspecting {label}")
 
@@ -45,6 +48,7 @@ def main() -> None:
         flex_grow=0.0,
     )
     tree.set_expanded((0,), True)
+    tree.select((0, 0))  # matches the Name field's initial "Camera A"
 
     window.set_content(
         fg.Box(

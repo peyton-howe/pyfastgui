@@ -1966,6 +1966,36 @@ impl TreeView {
         send_tree_mutation(&sender, move |tree| tree.tree_set_expanded(id, node, expanded))
     }
 
+    /// The label of the node at `path`.
+    fn label(&self, path: &Bound<'_, PyAny>) -> PyResult<String> {
+        let path = path_from_py(Some(path))?.ok_or_else(|| PyValueError::new_err("path required"))?;
+        let data = self.data.lock().unwrap_or_else(|p| p.into_inner());
+        let node = data.id_at_path(&path).ok_or_else(|| PyValueError::new_err("path does not resolve to a node"))?;
+        Ok(data.nodes[node as usize].label.clone())
+    }
+
+    /// Rename the node at `path`, keeping expand state, selection and scroll. Works before
+    /// attaching. Copies the tree once per call while the window shares it, so it's meant for
+    /// edits, not bulk updates (use `set_nodes`).
+    fn set_label(&self, path: &Bound<'_, PyAny>, label: String) -> PyResult<()> {
+        let path = path_from_py(Some(path))?.ok_or_else(|| PyValueError::new_err("path required"))?;
+        let data = {
+            let mut data = self.data.lock().unwrap_or_else(|p| p.into_inner());
+            let node =
+                data.id_at_path(&path).ok_or_else(|| PyValueError::new_err("path does not resolve to a node"))?;
+            Arc::make_mut(&mut data).nodes[node as usize].label = label;
+            data.clone()
+        };
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::TreeView { data: current, .. } = kind {
+                *current = data;
+            }
+        })
+    }
+
     /// Selected node path as a list of child indices, or `None`.
     #[getter]
     fn selected(&self) -> Option<Vec<usize>> {

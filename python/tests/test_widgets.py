@@ -96,6 +96,19 @@ class TreeViewTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fg.TreeView([fg.TreeNode("x")], row_height=0)
 
+    def test_set_label_renames_in_place(self):
+        tree = fg.TreeView([fg.TreeNode("root", children=[fg.TreeNode("child")])])
+        tree.set_expanded((0,), True)
+        tree.select((0, 0))
+        tree.set_label((0, 0), "renamed")
+        self.assertEqual(tree.label((0, 0)), "renamed")
+        self.assertEqual(tree.label((0,)), "root")
+        self.assertEqual(tree.selected, [0, 0], "rename keeps the selection")
+        with self.assertRaises(ValueError):
+            tree.set_label((0, 5), "nope")
+        with self.assertRaises(ValueError):
+            tree.label((3,))
+
 
 class PropertyInspectorTests(unittest.TestCase):
     def test_builds_composite(self):
