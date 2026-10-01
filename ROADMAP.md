@@ -1382,7 +1382,10 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
   virtualized lists; new `Table` (column-oriented `Arc<TableData>`, sticky header, numpy /
   sequence / `to_pylist` ingest → strings at the Python boundary) and `TreeView` /
   `TreeNode` (flatten-by-expand, path selection, Left/Right expand). Demos `table_demo.py`,
-  `tree_demo.py`. Follow-ups: typed/zero-copy columns, sort/resize, cell editing.
+  `tree_demo.py`. Follow-ups: typed/zero-copy columns, sort/resize, cell editing; cache the
+  `TreeView` visible-row list (rebuilt only on expand/data change) instead of re-walking the
+  tree several times per frame; make tree flatten/walk iterative so very deep trees can't
+  overflow the stack.
 - Property inspector (label + editor per row) — **Done (2026-09-29):** Python
   `PropertyInspector` composite over 7B editors; demo `inspector_demo.py`.
 

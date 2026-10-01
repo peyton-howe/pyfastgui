@@ -1776,7 +1776,7 @@ impl TreeNode {
 }
 
 fn wrap_path_callback(callback: Py<PyAny>) -> PathCallback {
-    Arc::new(move |path: &[u16]| {
+    Arc::new(move |path: &[u32]| {
         Python::attach(|py| {
             let tuple = path.iter().map(|&i| i as usize).collect::<Vec<_>>();
             if let Err(err) = callback.call1(py, (tuple,)) {
@@ -1801,7 +1801,7 @@ fn coerce_tree_roots(nodes: &Bound<'_, PyAny>) -> PyResult<Arc<TreeData>> {
     Ok(Arc::new(TreeData::from_nested(&roots)))
 }
 
-fn path_from_py(path: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<u16>>> {
+fn path_from_py(path: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<u32>>> {
     let Some(path) = path else { return Ok(None) };
     if path.is_none() {
         return Ok(None);
@@ -1812,7 +1812,7 @@ fn path_from_py(path: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<u16>>> {
     let mut out = Vec::with_capacity(seq.len()?);
     for i in 0..seq.len()? {
         let idx: usize = seq.get_item(i)?.extract()?;
-        out.push(u16::try_from(idx).map_err(|_| PyValueError::new_err("path index too large"))?);
+        out.push(u32::try_from(idx).map_err(|_| PyValueError::new_err("path index too large"))?);
     }
     Ok(Some(out))
 }
@@ -1825,7 +1825,7 @@ pub(crate) struct TreeView {
     data: Arc<Mutex<Arc<TreeData>>>,
     /// Expanded node ids — kept so describe / set_nodes can restore expand state.
     expanded: Arc<Mutex<HashSet<u32>>>,
-    selected: Readback<Option<Vec<u16>>>,
+    selected: Readback<Option<Vec<u32>>>,
     row_height: f32,
     font_size: Option<FontSize>,
     flex_grow: f32,
@@ -4066,7 +4066,7 @@ mod tests {
 
     #[test]
     fn table_floats_keep_small_and_large_magnitudes() {
-        assert_eq!(format_table_float(3.14159265), "3.141593");
+        assert_eq!(format_table_float(1.23456789), "1.234568");
         assert_eq!(format_table_float(2.5), "2.5");
         assert_eq!(format_table_float(-0.0), "0");
         assert_eq!(format_table_float(1e-4), "0.0001");

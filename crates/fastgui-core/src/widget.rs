@@ -35,7 +35,7 @@ pub type PanelDropCallback =
 /// A `ListView` / `Table` row index (`on_select` / `on_activate`).
 pub type IndexCallback = Arc<dyn Fn(usize) + Send + Sync>;
 /// A `TreeView` node path from the roots (`on_select` / `on_activate`).
-pub type PathCallback = Arc<dyn Fn(&[u16]) + Send + Sync>;
+pub type PathCallback = Arc<dyn Fn(&[u32]) + Send + Sync>;
 /// A `TextInput`'s edited text (`on_change`) or submitted text (`on_submit`, Enter).
 pub type TextCallback = Arc<dyn Fn(String) + Send + Sync>;
 /// Fired when the user clicks a panel/tab close control — argument is that panel's region id.
@@ -350,7 +350,7 @@ impl TreeData {
     }
 
     /// Child-index path from the roots to `id` (empty if unknown).
-    pub fn path_of(&self, id: u32) -> Vec<u16> {
+    pub fn path_of(&self, id: u32) -> Vec<u32> {
         let mut chain = Vec::new();
         let mut cur = id;
         loop {
@@ -359,7 +359,7 @@ impl TreeData {
             };
             match node.parent {
                 None => {
-                    let idx = self.roots.iter().position(|&r| r == cur).unwrap_or(0) as u16;
+                    let idx = self.roots.iter().position(|&r| r == cur).unwrap_or(0) as u32;
                     chain.push(idx);
                     chain.reverse();
                     return chain;
@@ -369,7 +369,7 @@ impl TreeData {
                         .children
                         .iter()
                         .position(|&c| c == cur)
-                        .unwrap_or(0) as u16;
+                        .unwrap_or(0) as u32;
                     chain.push(idx);
                     cur = parent;
                 }
@@ -378,7 +378,7 @@ impl TreeData {
     }
 
     /// Resolve a child-index path to a node id.
-    pub fn id_at_path(&self, path: &[u16]) -> Option<u32> {
+    pub fn id_at_path(&self, path: &[u32]) -> Option<u32> {
         let (&first, rest) = path.split_first()?;
         let mut id = *self.roots.get(first as usize)?;
         for &idx in rest {
@@ -675,7 +675,7 @@ pub enum WidgetKind {
         selection_color: Color,
         on_select: Option<PathCallback>,
         on_activate: Option<PathCallback>,
-        mirror: Option<Readback<Option<Vec<u16>>>>,
+        mirror: Option<Readback<Option<Vec<u32>>>>,
     },
     /// An overlay (menu, dropdown list, tooltip, dialog): an absolutely positioned child of the
     /// root, so it paints above everything else and wins hit tests, placed after layout by
@@ -3401,6 +3401,15 @@ mod tests {
         expanded.insert(0);
         expanded.insert(2);
         assert_eq!(data.visible_ids(&expanded), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn tree_paths_reach_past_u16_siblings() {
+        let children = (0..70_000).map(|i| TreeNodeData { label: i.to_string(), children: vec![] }).collect();
+        let data = TreeData::from_nested(&[TreeNodeData { label: "big".into(), children }]);
+        let last = data.id_at_path(&[0, 69_999]).unwrap();
+        assert_eq!(data.nodes[last as usize].label, "69999");
+        assert_eq!(data.path_of(last), vec![0, 69_999]);
     }
 
     #[test]
