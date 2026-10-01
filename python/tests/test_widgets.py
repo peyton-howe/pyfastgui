@@ -265,9 +265,6 @@ class MenuTests(unittest.TestCase):
         self.assertEqual([s for s, _ in accels], ["Cmd+T", "Cmd+D"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class MenuChainTests(unittest.TestCase):
     """Menu composite logic, with `Button` / `Popup` captured instead of shown."""
@@ -356,3 +353,23 @@ class SubmenuHoverTests(MenuChainTests):
         root.show(object())
         self.hovers["Recent"]()
         self.assertFalse(sub.is_open)
+
+
+class ShortcutAndTextPersistenceTests(unittest.TestCase):
+    def test_menu_item_rejects_shortcuts_that_can_never_fire(self):
+        for bad in ("Ctrl++", "Ctrl+Bogus", "Alt+F4", ""):
+            if bad:
+                with self.assertRaises(ValueError, msg=bad):
+                    fg.MenuItem("x", shortcut=bad)
+        for good in ("Ctrl+S", "Cmd+Shift+N", "F5", "Del", "Ctrl+Enter", "Alt+Left"):
+            fg.MenuItem("x", shortcut=good)
+
+    def test_label_and_button_set_text_before_showing(self):
+        label = fg.Label("a")
+        label.set_text("b")
+        button = fg.Button("a")
+        button.set_text("b")
+
+
+if __name__ == "__main__":
+    unittest.main()

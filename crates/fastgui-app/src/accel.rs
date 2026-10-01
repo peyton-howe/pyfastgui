@@ -1,6 +1,6 @@
 //! Keyboard accelerator parsing helpers and firing against a `WidgetTree` table.
 
-use fastgui_core::widget::{Accel, AccelKey, WidgetKind, WidgetTree};
+use fastgui_core::widget::{Accel, AccelKey, AccelNamed, WidgetKind, WidgetTree};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::text_input::KeyPress;
@@ -46,7 +46,28 @@ pub fn matches(accel: &Accel, key: &Key, modifiers: ModifiersState) -> bool {
             }
         }
         (AccelKey::F(n), Key::Named(named)) => f_key(*n) == Some(*named),
+        (AccelKey::Named(want), Key::Named(named)) => named_key(*want) == *named,
+        (AccelKey::Named(AccelNamed::Space), Key::Character(got)) => got.as_str() == " ",
         _ => false,
+    }
+}
+
+fn named_key(key: AccelNamed) -> NamedKey {
+    match key {
+        AccelNamed::Delete => NamedKey::Delete,
+        AccelNamed::Backspace => NamedKey::Backspace,
+        AccelNamed::Enter => NamedKey::Enter,
+        AccelNamed::Tab => NamedKey::Tab,
+        AccelNamed::Space => NamedKey::Space,
+        AccelNamed::Insert => NamedKey::Insert,
+        AccelNamed::Home => NamedKey::Home,
+        AccelNamed::End => NamedKey::End,
+        AccelNamed::PageUp => NamedKey::PageUp,
+        AccelNamed::PageDown => NamedKey::PageDown,
+        AccelNamed::Up => NamedKey::ArrowUp,
+        AccelNamed::Down => NamedKey::ArrowDown,
+        AccelNamed::Left => NamedKey::ArrowLeft,
+        AccelNamed::Right => NamedKey::ArrowRight,
     }
 }
 
@@ -88,8 +109,9 @@ pub fn try_fire(tree: &WidgetTree, press: &KeyPress<'_>) -> bool {
         if text_focused && is_text_edit_chord(accel) {
             continue;
         }
-        // Unmodified / non-primary keys while typing stay with the field.
-        if text_focused && !accel.primary && !accel.alt {
+        // Unmodified / non-primary keys while typing stay with the field — except F1–F12,
+        // which never type text (F5 Refresh should still work from a focused field).
+        if text_focused && !accel.primary && !accel.alt && !matches!(accel.key, AccelKey::F(_)) {
             continue;
         }
         callback();

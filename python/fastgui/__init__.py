@@ -39,6 +39,10 @@ _REGIONS = ("center", "left", "right", "top", "bottom")
 _ROOT_REGION_ID = 0
 
 
+def _noop():
+    pass
+
+
 class MenuItem:
     """One actionable row in a `Menu`.
 
@@ -71,6 +75,9 @@ class MenuItem:
             raise TypeError(f"submenu must be a Menu, got {type(submenu)!r}")
         if shortcut and submenu is not None:
             raise ValueError("MenuItem cannot have both shortcut and submenu")
+        if shortcut:
+            # Validate now (Box parses shortcuts), not when the MenuBar is first shown.
+            Box(children=[], accelerators=[(shortcut, _noop)])
 
 
 class MenuSeparator:
@@ -293,7 +300,9 @@ class MenuBar:
         theme = get_theme()
         buttons = []
         accelerators = []
-        self._titles = []
+        # Build into a local list and publish it once: a rebuild on another thread (3.14t)
+        # must never expose a half-filled `_titles` to `_toggle` / callers.
+        titles_built = []
         for title, menu in self.menus:
             if not isinstance(menu, Menu):
                 raise TypeError(f"MenuBar menus must be Menu instances, got {type(menu)!r}")
@@ -312,8 +321,9 @@ class MenuBar:
             )
             holder["btn"] = btn
             buttons.append(btn)
-            self._titles.append((btn, menu))
+            titles_built.append((btn, menu))
             accelerators.extend(_menu_accelerators(menu))
+        self._titles = titles_built
         # Row of titles + 1px bottom border — reads as a menubar, not a button toolbar.
         titles = Box(
             direction="row",

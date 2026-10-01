@@ -136,6 +136,11 @@ struct FloatingWindow<B: SurfaceBackend> {
     pressed_button: Option<WidgetId>,
     last_click: Option<(Instant, (f32, f32))>,
     ime_allowed: bool,
+    /// Hovered widget in this floater (flat hover fills, `on_hover` actions such as submenu
+    /// hover-open), when it became hovered, and whether its hover action already ran.
+    hover_id: Option<WidgetId>,
+    hover_since: Instant,
+    hover_action_done: Option<WidgetId>,
 }
 
 /// A scrollbar thumb being dragged: the `ScrollArea`, which bar, and where along the bar the
@@ -448,6 +453,9 @@ impl<B: SurfaceBackend> App<B> {
             pressed_button: None,
             last_click: None,
             ime_allowed: false,
+            hover_id: None,
+            hover_since: Instant::now(),
+            hover_action_done: None,
         };
         self.floating_by_region.insert(region_id, window_id);
         self.floating.insert(window_id, floater);
@@ -755,6 +763,62 @@ impl<B: SurfaceBackend> App<B> {
         }
     }
 
+    /// Floater counterpart of `update_hover_for_tooltip` + `update_hovered_widget` (no tooltips).
+    fn update_floating_hover(floater: &mut FloatingWindow<B>) {
+        let hit = floater.widget_tree.hit_test(floater.cursor.0, floater.cursor.1);
+        if hit != floater.hover_id {
+            floater.hover_id = hit;
+            floater.hover_since = Instant::now();
+            floater.hover_action_done = None;
+        }
+        if floater.widget_tree.set_hovered(hit) {
+            floater.window.request_redraw();
+        }
+    }
+
+    fn floating_hover_action_deadline(floater: &FloatingWindow<B>) -> Option<Instant> {
+        let id = floater.hover_id?;
+        (floater.hover_action_done != Some(id) && floater.widget_tree.hover_action(id).is_some())
+            .then(|| floater.hover_since + HOVER_ACTION_DELAY)
+    }
+
+    fn maybe_run_floating_hover_actions(&mut self) {
+        let due: Vec<WindowId> = self
+            .floating
+            .iter()
+            .filter(|(_, f)| Self::floating_hover_action_deadline(f).is_some_and(|at| at <= Instant::now()))
+            .map(|(id, _)| *id)
+            .collect();
+        for window_id in due {
+            let Some(floater) = self.floating.get_mut(&window_id) else { continue };
+            let Some(id) = floater.hover_id else { continue };
+            let Some(callback) = floater.widget_tree.hover_action(id).cloned() else { continue };
+            floater.hover_action_done = Some(id);
+            forms::with_tree(&mut floater.widget_tree, |_| callback());
+            floater.window.request_redraw();
+        }
+    }
+
+    /// Floater counterpart of `handle_context_menu_press`.
+    fn handle_floating_context_menu_press(&mut self, window_id: WindowId) {
+        let Some(floater) = self.floating.get_mut(&window_id) else { return };
+        let (x, y) = floater.cursor;
+        if forms::with_tree(&mut floater.widget_tree, |tree| tree.popup_press(x, y) == PopupPress::Consumed) {
+            floater.window.request_redraw();
+            return;
+        }
+        let Some(id) = floater.widget_tree.hit_test(x, y) else { return };
+        let mut node = Some(id);
+        while let Some(current) = node {
+            if let Some(callback) = floater.widget_tree.context_menu(current).cloned() {
+                callback(x, y);
+                floater.window.request_redraw();
+                return;
+            }
+            node = floater.widget_tree.parent(current);
+        }
+    }
+
     fn handle_context_menu_press(&mut self) {
         self.suppress_tooltip();
         // Outside click still dismisses a non-modal menu/combo before opening a context menu.
@@ -800,8 +864,12 @@ impl<B: SurfaceBackend> App<B> {
             return;
         }
         let hit = self.widget_tree.hit_test(self.cursor.0, self.cursor.1);
-        // Clicking a focusable widget focuses it; clicking anything else clears focus.
-        self.widget_tree.set_focus(hit);
+        // Clicking a focusable widget focuses it; clicking anything else clears focus — except
+        // flat buttons (menu titles/rows, toolbar chrome), which leave focus where it was so
+        // e.g. Edit > Copy still acts on the focused text field.
+        if !is_flat_button(&self.widget_tree, hit) {
+            self.widget_tree.set_focus(hit);
+        }
         let Some(id) = hit else { return };
         let Some(kind) = self.widget_tree.kind(id) else { return };
         match kind {
@@ -959,7 +1027,9 @@ impl<B: SurfaceBackend> App<B> {
         }
         let hit = floater.widget_tree.hit_test(cursor.0, cursor.1);
         let Some(floater) = self.floating.get_mut(&window_id) else { return };
-        floater.widget_tree.set_focus(hit);
+        if !is_flat_button(&floater.widget_tree, hit) {
+            floater.widget_tree.set_focus(hit);
+        }
         let floater = &*floater;
         let Some(id) = hit else { return };
         let Some(kind) = floater.widget_tree.kind(id) else { return };
@@ -1888,7 +1958,8 @@ impl<B: SurfaceBackend> App<B> {
             && self.tooltip_dismissed_for != self.hover_id
             && self.hover_id.is_some_and(|id| self.widget_tree.tooltip(id).is_some()))
         .then(|| self.hover_since + TOOLTIP_DELAY);
-        let next = [tooltip_due, self.hover_action_deadline()].into_iter().flatten().min();
+        let floater_hover = self.floating.values().filter_map(Self::floating_hover_action_deadline);
+        let next = [tooltip_due, self.hover_action_deadline()].into_iter().flatten().chain(floater_hover).min();
         match next {
             Some(at) if at > Instant::now() => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
             _ => event_loop.set_control_flow(ControlFlow::Wait),
@@ -2147,6 +2218,7 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.maybe_run_hover_action();
+        self.maybe_run_floating_hover_actions();
         self.maybe_open_tooltip();
         self.schedule_control_flow(event_loop);
     }
@@ -2246,6 +2318,11 @@ impl<B: SurfaceBackend> App<B> {
                 } else if dragging_window {
                     self.update_dragged_floating_panel();
                 }
+                if !(dragging_widget || dragging_window || resizing) {
+                    if let Some(floater) = self.floating.get_mut(&window_id) {
+                        Self::update_floating_hover(floater);
+                    }
+                }
                 self.update_floating_cursor_icon(window_id);
                 if (dragging_widget || dragging_window || resizing)
                     && self.last_drag_render.elapsed() >= DRAG_RENDER_INTERVAL
@@ -2300,6 +2377,19 @@ impl<B: SurfaceBackend> App<B> {
                     }
                 }
             },
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => self.handle_floating_context_menu_press(window_id),
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(floater) = self.floating.get_mut(&window_id) {
+                    floater.hover_id = None;
+                    if floater.widget_tree.set_hovered(None) {
+                        floater.window.request_redraw();
+                    }
+                }
+            }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let plain = event.key_without_modifiers();
@@ -2546,4 +2636,9 @@ mod tests {
         release_button(&mut tree, None, (40.0, 15.0));
         assert_eq!(clicks.load(Ordering::SeqCst), 1, "nothing was pressed");
     }
+}
+
+/// Whether `hit` is a flat `Button` (menu title/row chrome): pressing one keeps keyboard focus.
+fn is_flat_button(tree: &WidgetTree, hit: Option<WidgetId>) -> bool {
+    matches!(hit.and_then(|id| tree.kind(id)), Some(WidgetKind::Button { flat: true, .. }))
 }

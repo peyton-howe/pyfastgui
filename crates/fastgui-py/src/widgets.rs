@@ -589,8 +589,9 @@ pub(crate) fn attach(
         tree.set_hover_action(id, Some(callback));
     }
     for (shortcut, callback) in accelerators {
+        // Unparseable shortcuts are rejected when the Box is constructed (`parse_accelerators`).
         if let Some(accel) = Accel::parse(&shortcut) {
-            tree.register_accelerator(accel, callback);
+            tree.register_accelerator_for(id, accel, callback);
         }
     }
 
@@ -743,7 +744,9 @@ fn mutate(id_cell: &IdCell, sender_cell: &SenderCell, mutation: impl FnOnce(&mut
 pub(crate) struct Label {
     id: IdCell,
     sender: SenderCell,
-    text: String,
+    /// Latest text (constructor or `set_text`), so a rebuild (`set_theme`, `set_content`,
+    /// dock rearrange) shows what was last set instead of the constructor's text.
+    text: Mutex<String>,
     font_size: Option<FontSize>,
     color: Option<(f32, f32, f32, f32)>,
     tooltip: Option<String>,
@@ -764,7 +767,7 @@ impl Label {
         Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
-            text,
+            text: Mutex::new(text),
             font_size,
             color,
             tooltip,
@@ -772,9 +775,13 @@ impl Label {
         }
     }
 
-    /// Change the displayed text. Safe to call from any thread, only once this label has been
-    /// attached via `window.set_content(...)`.
+    /// Change the displayed text. Safe to call from any thread, before or after attaching;
+    /// the new text survives rebuilds.
     fn set_text(&self, text: String) -> PyResult<()> {
+        *self.text.lock().unwrap_or_else(|p| p.into_inner()) = text.clone();
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
         mutate(&self.id, &self.sender, move |kind| {
             if let WidgetKind::Label { text: current, .. } = kind {
                 *current = text;
@@ -791,7 +798,7 @@ impl Label {
         });
         DescribedWidget {
             style: StyleParams::leaf(0.0, None, None),
-            kind: WidgetKind::Label { text: self.text.clone(), font_size: self.font_size.unwrap_or(FontSize::Body).resolve(), color: rgba(self.color.unwrap_or(crate::theme::palette().text)) },
+            kind: WidgetKind::Label { text: self.text.lock().unwrap_or_else(|p| p.into_inner()).clone(), font_size: self.font_size.unwrap_or(FontSize::Body).resolve(), color: rgba(self.color.unwrap_or(crate::theme::palette().text)) },
             id_cell: self.id.clone(),
             sender_cell: self.sender.clone(),
             children: Vec::new(),
@@ -810,7 +817,8 @@ impl Label {
 pub(crate) struct Button {
     id: IdCell,
     sender: SenderCell,
-    text: String,
+    /// Latest text (constructor or `set_text`); survives rebuilds.
+    text: Mutex<String>,
     font_size: Option<FontSize>,
     text_color: Option<(f32, f32, f32, f32)>,
     background: Option<(f32, f32, f32, f32)>,
@@ -851,7 +859,7 @@ impl Button {
         Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
-            text,
+            text: Mutex::new(text),
             font_size,
             text_color,
             background,
@@ -864,6 +872,10 @@ impl Button {
     }
 
     fn set_text(&self, text: String) -> PyResult<()> {
+        *self.text.lock().unwrap_or_else(|p| p.into_inner()) = text.clone();
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
         mutate(&self.id, &self.sender, move |kind| {
             if let WidgetKind::Button { text: current, .. } = kind {
                 *current = text;
@@ -903,7 +915,7 @@ impl Button {
         DescribedWidget {
             style: StyleParams::leaf(0.0, None, None),
             kind: WidgetKind::Button {
-                text: self.text.clone(),
+                text: self.text.lock().unwrap_or_else(|p| p.into_inner()).clone(),
                 font_size: self.font_size.unwrap_or(FontSize::Body).resolve(),
                 text_color: rgba(self.text_color.unwrap_or(default_fg)),
                 background: rgba(self.background.unwrap_or(default_bg)),
@@ -2846,6 +2858,14 @@ impl BoxWidget {
         if let Some(list) = accelerators {
             for item in list.iter() {
                 let (shortcut, callback): (String, Py<PyAny>) = item.extract()?;
+                // A shortcut that can never fire would still be drawn in its menu row.
+                if Accel::parse(&shortcut).is_none() {
+                    return Err(PyValueError::new_err(format!(
+                        "unsupported shortcut {shortcut:?}: use modifiers (Ctrl/Cmd, Shift, Alt) plus \
+                         one letter/digit, F1-F12, or Del/Backspace/Enter/Tab/Space/Insert/Home/End/\
+                         PageUp/PageDown/Up/Down/Left/Right (Alt+F4 is reserved)"
+                    )));
+                }
                 accel.push((shortcut, callback));
             }
         }

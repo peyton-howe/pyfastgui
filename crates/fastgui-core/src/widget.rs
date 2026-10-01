@@ -57,6 +57,49 @@ pub enum AccelKey {
     Char(char),
     /// Function key 1..=12.
     F(u8),
+    /// A non-character key commonly used in menu shortcuts (`Del`, `Enter`, `Home`, …).
+    Named(AccelNamed),
+}
+
+/// Named keys an `Accel` can use. Escape is left out: it dismisses popups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccelNamed {
+    Delete,
+    Backspace,
+    Enter,
+    Tab,
+    Space,
+    Insert,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl AccelNamed {
+    fn parse(lower: &str) -> Option<Self> {
+        Some(match lower {
+            "del" | "delete" => Self::Delete,
+            "backspace" => Self::Backspace,
+            "enter" | "return" => Self::Enter,
+            "tab" => Self::Tab,
+            "space" => Self::Space,
+            "ins" | "insert" => Self::Insert,
+            "home" => Self::Home,
+            "end" => Self::End,
+            "pgup" | "pageup" => Self::PageUp,
+            "pgdn" | "pagedown" => Self::PageDown,
+            "up" => Self::Up,
+            "down" => Self::Down,
+            "left" => Self::Left,
+            "right" => Self::Right,
+            _ => return None,
+        })
+    }
 }
 
 impl Accel {
@@ -86,6 +129,10 @@ impl Accel {
                             key = Some(AccelKey::F(n));
                             continue;
                         }
+                    }
+                    if let Some(named) = AccelNamed::parse(&lower) {
+                        key = Some(AccelKey::Named(named));
+                        continue;
                     }
                     let mut chars = token.chars();
                     let c = chars.next()?;
@@ -724,7 +771,9 @@ pub struct WidgetTree {
     /// moment — a menu's submenu row opening its submenu. Cleared on `reset`.
     hover_actions: HashMap<WidgetId, ClickCallback>,
     /// Menu / MenuBar shortcuts registered at attach, cleared on `reset`.
-    accelerators: Vec<(Accel, ClickCallback)>,
+    /// Keyboard shortcuts, each with the widget that registered it (if any) so closing a popup
+    /// that contained that widget drops its shortcuts along with its side-table entries.
+    accelerators: Vec<(Option<WidgetId>, Accel, ClickCallback)>,
     /// Widget under the cursor (for hover fills). Cleared on `reset`.
     hovered: Option<WidgetId>,
 }
@@ -896,6 +945,10 @@ impl WidgetTree {
     pub fn mutate_kind(&mut self, id: WidgetId, f: impl FnOnce(&mut WidgetKind)) {
         if let Some(kind) = self.kinds.get_mut(&id) {
             f(kind);
+            // Dirty the node itself (taffy propagates to the root) so a text change re-measures
+            // it — marking only the root keeps the old cached size, and a shrink-to-fit Label
+            // then clips its new text to the old width.
+            let _ = self.taffy.mark_dirty(id);
             self.mark_dirty();
         }
     }
@@ -1293,6 +1346,7 @@ impl WidgetTree {
         if self.focused.is_none_or(|f| inside.contains(&f)) {
             self.focused = restore;
         }
+        self.accelerators.retain(|(owner, _, _)| owner.is_none_or(|o| !inside.contains(&o)));
         for node in inside {
             self.kinds.remove(&node);
             self.absolute_rects.remove(&node);
@@ -1372,11 +1426,17 @@ impl WidgetTree {
 
     /// Register a keyboard shortcut. Cleared by `reset` (e.g. `set_content`).
     pub fn register_accelerator(&mut self, accel: Accel, callback: ClickCallback) {
-        self.accelerators.push((accel, callback));
+        self.accelerators.push((None, accel, callback));
     }
 
-    pub fn accelerators(&self) -> &[(Accel, ClickCallback)] {
-        &self.accelerators
+    /// Like `register_accelerator`, owned by `owner`: dropped when `owner` is removed with a
+    /// closed popup (e.g. a `Dialog` containing a `MenuBar`).
+    pub fn register_accelerator_for(&mut self, owner: WidgetId, accel: Accel, callback: ClickCallback) {
+        self.accelerators.push((Some(owner), accel, callback));
+    }
+
+    pub fn accelerators(&self) -> impl Iterator<Item = (&Accel, &ClickCallback)> {
+        self.accelerators.iter().map(|(_, accel, callback)| (accel, callback))
     }
 
     /// Close the topmost popup as the user did (outside click, Escape): fires its `on_dismiss`.
@@ -2437,6 +2497,23 @@ mod tests {
     }
 
     #[test]
+    fn closing_a_popup_drops_accelerators_registered_inside_it() {
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        tree.register_accelerator(Accel::parse("Ctrl+S").unwrap(), Arc::new(|| {}));
+        let mut inner = None;
+        let popup = tree.open_popup(popup_kind(PopupAnchor::Widget(anchor, PopupSide::Below), false, None), |tree, popup| {
+            let b = sized_button(tree, 40.0, 20.0);
+            tree.add_child(popup, b);
+            inner = Some(b);
+        });
+        tree.register_accelerator_for(inner.unwrap(), Accel::parse("Ctrl+K").unwrap(), Arc::new(|| {}));
+        assert_eq!(tree.accelerators().count(), 2);
+        tree.close_popup(popup);
+        let left: Vec<_> = tree.accelerators().map(|(a, _)| a.clone()).collect();
+        assert_eq!(left, vec![Accel::parse("Ctrl+S").unwrap()], "only the popup's shortcut is dropped");
+    }
+
+    #[test]
     fn outside_press_dismisses_nested_non_modal_stack() {
         let (mut tree, anchor) = popup_tree(10.0, 20.0);
         let (parent, items) = open_menu(&mut tree, PopupAnchor::Widget(anchor, PopupSide::Below), false, 2);
@@ -2832,6 +2909,41 @@ mod tests {
     }
 
     #[test]
+    fn changing_a_label_text_remeasures_it() {
+        struct Wide;
+        impl TextMeasure for Wide {
+            fn caret_x(&mut self, text: &str, _: f32, index: usize) -> f32 {
+                text[..index].chars().count() as f32 * 20.0
+            }
+            fn index_at(&mut self, _: &str, _: f32, _: f32) -> usize {
+                0
+            }
+        }
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let row = tree.new_node(
+            Style { flex_direction: FlexDirection::Row, align_items: Some(AlignItems::FLEX_START), ..Default::default() },
+            WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+        );
+        tree.add_child(root, row);
+        let label = tree.new_node(
+            Style::default(),
+            WidgetKind::Label { text: "Ready".into(), font_size: 14.0, color: Color::TRANSPARENT },
+        );
+        tree.add_child(row, label);
+        tree.compute_layout_measured(600.0, 200.0, &mut Wide);
+        let before = tree.absolute_rect(label).unwrap().width;
+        tree.mutate_kind(label, |kind| {
+            if let WidgetKind::Label { text, .. } = kind {
+                *text = "Ready and much longer".into();
+            }
+        });
+        tree.compute_layout_measured(600.0, 200.0, &mut Wide);
+        let after = tree.absolute_rect(label).unwrap().width;
+        assert!(after > before + 100.0, "set_text must re-measure a shrink-to-fit label ({before} -> {after})");
+    }
+
+    #[test]
     fn measured_layout_sizes_labels_by_real_text_width() {
         /// "Shaping" where every character is 20 wide — far wider than the 0.55 × 14 = 7.7
         /// the estimate assumes — so the result shows which one layout used.
@@ -3096,5 +3208,9 @@ mod tests {
         assert!(Accel::parse("Alt+F4").is_none());
         assert!(Accel::parse("").is_none());
         assert!(Accel::parse("Ctrl+").is_none());
+        assert_eq!(Accel::parse("Del").unwrap().key, AccelKey::Named(AccelNamed::Delete));
+        let s = Accel::parse("Ctrl+Shift+Enter").unwrap();
+        assert!(s.primary && s.shift && s.key == AccelKey::Named(AccelNamed::Enter));
+        assert!(Accel::parse("Ctrl+Bogus").is_none());
     }
 }
