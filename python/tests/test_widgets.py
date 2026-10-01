@@ -41,6 +41,87 @@ class ListViewTests(unittest.TestCase):
         self.assertEqual(len(fg.ListView([str(i) for i in range(1_000_000)])), 1_000_000)
 
 
+class TableTests(unittest.TestCase):
+    def test_dict_columns_select_and_set_columns(self):
+        table = fg.Table(columns={"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        self.assertEqual((len(table), table.selected), (3, None))
+        table.select(1)
+        self.assertEqual(table.selected, 1)
+        table.select(99)
+        self.assertEqual(table.selected, 2)
+        table.select(None)
+        self.assertIsNone(table.selected)
+        table.set_columns([("n", [10, 20])])
+        self.assertEqual((len(table), table.selected), (2, None))
+
+    def test_rejects_mismatched_lengths_and_bad_sizes(self):
+        with self.assertRaises(ValueError):
+            fg.Table(columns={"a": [1, 2], "b": [1]})
+        with self.assertRaises(ValueError):
+            fg.Table(columns={"a": [1]}, row_height=0)
+        with self.assertRaises(ValueError):
+            fg.Table(columns={"a": [1]}, column_widths=[10.0, 20.0])
+
+    def test_numpy_columns(self):
+        import numpy as np
+
+        n = 10_000
+        table = fg.Table(
+            columns={"i": np.arange(n), "x": np.linspace(0.0, 1.0, n)},
+            column_widths=[60.0, 80.0],
+        )
+        self.assertEqual(len(table), n)
+
+
+class TreeViewTests(unittest.TestCase):
+    def test_select_and_expand_before_showing(self):
+        tree = fg.TreeView(
+            [
+                fg.TreeNode("root", children=[fg.TreeNode("child"), fg.TreeNode("other")]),
+                fg.TreeNode("leaf"),
+            ]
+        )
+        self.assertIsNone(tree.selected)
+        tree.select((0, 1))
+        self.assertEqual(tree.selected, [0, 1])
+        tree.set_expanded((0,), True)
+        tree.set_expanded((0,), False)
+        self.assertEqual(tree.selected, [0], "collapsing hides the selection, so it moves up")
+        tree.select(None)
+        self.assertIsNone(tree.selected)
+        tree.set_nodes([fg.TreeNode("only")])
+        self.assertIsNone(tree.selected)
+
+    def test_rejects_bad_row_height(self):
+        with self.assertRaises(ValueError):
+            fg.TreeView([fg.TreeNode("x")], row_height=0)
+
+    def test_set_label_renames_in_place(self):
+        tree = fg.TreeView([fg.TreeNode("root", children=[fg.TreeNode("child")])])
+        tree.set_expanded((0,), True)
+        tree.select((0, 0))
+        tree.set_label((0, 0), "renamed")
+        self.assertEqual(tree.label((0, 0)), "renamed")
+        self.assertEqual(tree.label((0,)), "root")
+        self.assertEqual(tree.selected, [0, 0], "rename keeps the selection")
+        with self.assertRaises(ValueError):
+            tree.set_label((0, 5), "nope")
+        with self.assertRaises(ValueError):
+            tree.label((3,))
+
+
+class PropertyInspectorTests(unittest.TestCase):
+    def test_builds_composite(self):
+        inspector = fg.PropertyInspector(
+            [
+                ("Name", fg.TextInput("a")),
+                ("On", fg.Toggle(checked=True)),
+            ]
+        )
+        widget = inspector._fastgui_widget
+        self.assertIsNotNone(widget)
+
+
 class PopupTests(unittest.TestCase):
     def test_closed_until_shown_and_close_is_a_no_op(self):
         popup = fg.Popup(fg.Label("hi"))

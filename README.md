@@ -117,6 +117,9 @@ All under [`python/examples/`](python/examples/), runnable directly once install
 | [`form_controls_demo.py`](python/examples/form_controls_demo.py) | M7 form controls: `Checkbox`, `Radio`, `Toggle`, `SpinBox`, `NumericScrub`, `ProgressBar`, `ComboBox`, `Grid`, `Image`, `TextArea`. |
 | [`menus_demo.py`](python/examples/menus_demo.py) | M7 7C: `MenuBar` / submenus / check-radio-icon rows, context menus, hover tooltips, accelerators, `Toolbar`, `StatusBar`. |
 | [`app_chrome_demo.py`](python/examples/app_chrome_demo.py) | M7 7C: `Dialog`, file/color pickers, `GroupBox`, `CollapsibleSection`, `StackedWidget`. |
+| [`table_demo.py`](python/examples/table_demo.py) | M7 7D: virtualized `Table` of 1,000,000 numpy rows with sticky header and keyboard selection. |
+| [`tree_demo.py`](python/examples/tree_demo.py) | M7 7D: `TreeView` expand/collapse, path selection, Left/Right navigation. |
+| [`inspector_demo.py`](python/examples/inspector_demo.py) | M7 7D: `PropertyInspector` (label + 7B editors) driven by a tree selection. |
 | [`dock_layout.py`](python/examples/dock_layout.py) | A `DockArea` of resizable, titled `Panel`s with a live `Viewport` in the center. |
 | [`dock_rearrange_demo.py`](python/examples/dock_rearrange_demo.py) | Drag a panel's title bar to split or tab-merge regions, including dropping at the window's outer edge to span the whole dock area. |
 | [`tabs_demo.py`](python/examples/tabs_demo.py) | Multiple `Panel`s sharing one `DockArea` region via `Tabs`, switched by clicking a header segment. |

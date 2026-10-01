@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use taffy::prelude::*;
@@ -32,8 +32,10 @@ pub type TabSelectCallback = Arc<dyn Fn(usize) + Send + Sync>;
 /// `Float` (tear a docked panel out into an OS window); `None` for ordinary dock rearrange.
 pub type PanelDropCallback =
     Arc<dyn Fn(u64, u64, DropZone, Option<(f32, f32, f32, f32)>) + Send + Sync>;
-/// A `ListView` row index (`on_select` / `on_activate`).
+/// A `ListView` / `Table` row index (`on_select` / `on_activate`).
 pub type IndexCallback = Arc<dyn Fn(usize) + Send + Sync>;
+/// A `TreeView` node path from the roots (`on_select` / `on_activate`).
+pub type PathCallback = Arc<dyn Fn(&[u32]) + Send + Sync>;
 /// A `TextInput`'s edited text (`on_change`) or submitted text (`on_submit`, Enter).
 pub type TextCallback = Arc<dyn Fn(String) + Send + Sync>;
 /// Fired when the user clicks a panel/tab close control — argument is that panel's region id.
@@ -215,6 +217,14 @@ pub const TOGGLE_HEIGHT: f32 = 22.0;
 pub const SPIN_BUTTON_WIDTH: f32 = 22.0;
 /// Default track thickness for a `ProgressBar` when style doesn't pin height.
 pub const PROGRESS_HEIGHT: f32 = 8.0;
+/// Default body/header text inset inside a `Table` cell (layout units).
+pub const TABLE_CELL_INSET: f32 = 8.0;
+/// Fallback column width when `TableColumn::width` is unset and the view width is unknown.
+pub const TABLE_DEFAULT_COLUMN_WIDTH: f32 = 120.0;
+/// Per-depth indent for a `TreeView` row label (layout units).
+pub const TREE_INDENT: f32 = 16.0;
+/// Width of the disclosure gutter (`▶`/`▼`) on a `TreeView` row.
+pub const TREE_GUTTER: f32 = 18.0;
 
 /// Scrollbar thickness and inset from the scroll area's edge (layout units). Overlay bars:
 /// drawn over the content's edge rather than taking layout space.
@@ -222,6 +232,191 @@ pub const SCROLLBAR_WIDTH: f32 = 6.0;
 const SCROLLBAR_INSET: f32 = 2.0;
 /// Shortest a scrollbar thumb gets, so a very long list still has something to grab.
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
+/// One column in a virtualized [`WidgetKind::Table`]: header label and optional fixed width
+/// (layout units). `width <= 0.0` means "share leftover view width equally with other flex
+/// columns" — no horizontal scroll unless explicit widths exceed the view.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableColumn {
+    pub header: String,
+    pub width: f32,
+}
+
+/// Column-oriented string cells for a [`WidgetKind::Table`]. Shared via `Arc` so `set_columns`
+/// can swap million-row payloads without cloning on every describe.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableData {
+    pub columns: Vec<TableColumn>,
+    /// `cells[col][row]` — every column the same length (`nrows`).
+    pub cells: Vec<Vec<String>>,
+    pub nrows: usize,
+}
+
+impl TableData {
+    /// Build from parallel column vectors. Returns `None` when column lengths disagree.
+    pub fn new(columns: Vec<TableColumn>, cells: Vec<Vec<String>>) -> Option<Self> {
+        if columns.len() != cells.len() {
+            return None;
+        }
+        let nrows = cells.first().map_or(0, Vec::len);
+        if cells.iter().any(|col| col.len() != nrows) {
+            return None;
+        }
+        Some(Self { columns, cells, nrows })
+    }
+
+    /// Resolve per-column widths for `view_width`: explicit widths stay fixed; `width <= 0`
+    /// columns split the leftover (at least 0). With no columns, returns empty.
+    pub fn resolved_widths(&self, view_width: f32) -> Vec<f32> {
+        if self.columns.is_empty() {
+            return Vec::new();
+        }
+        let mut widths = Vec::with_capacity(self.columns.len());
+        let mut fixed = 0.0_f32;
+        let mut flex = 0_usize;
+        for col in &self.columns {
+            if col.width > 0.0 {
+                fixed += col.width;
+            } else {
+                flex += 1;
+            }
+        }
+        let leftover = if flex > 0 {
+            ((view_width - fixed).max(0.0)) / flex as f32
+        } else {
+            0.0
+        };
+        for col in &self.columns {
+            widths.push(if col.width > 0.0 { col.width } else { leftover.max(1.0) });
+        }
+        widths
+    }
+
+    /// Content width for scrolling: sum of resolved widths (using `view_width` for flex).
+    pub fn content_width(&self, view_width: f32) -> f32 {
+        self.resolved_widths(view_width).iter().sum()
+    }
+}
+
+/// Nested tree node as supplied from Python before flattening into [`TreeData`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreeNodeData {
+    pub label: String,
+    pub children: Vec<TreeNodeData>,
+}
+
+/// One flattened node in a [`TreeData`] (preorder ids, parent links, depth).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreeNode {
+    pub label: String,
+    pub parent: Option<u32>,
+    pub depth: u16,
+    pub children: Vec<u32>,
+}
+
+/// Flattened tree for a [`WidgetKind::TreeView`]. Shared via `Arc`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreeData {
+    pub nodes: Vec<TreeNode>,
+    pub roots: Vec<u32>,
+}
+
+impl TreeData {
+    /// Flatten nested `TreeNodeData` roots into preorder-indexed nodes.
+    pub fn from_nested(roots: &[TreeNodeData]) -> Self {
+        let mut data = Self { nodes: Vec::new(), roots: Vec::new() };
+        for root in roots {
+            let id = data.push_node(root, None, 0);
+            data.roots.push(id);
+        }
+        data
+    }
+
+    fn push_node(&mut self, node: &TreeNodeData, parent: Option<u32>, depth: u16) -> u32 {
+        let id = self.nodes.len() as u32;
+        self.nodes.push(TreeNode {
+            label: node.label.clone(),
+            parent,
+            depth,
+            children: Vec::new(),
+        });
+        let child_ids: Vec<u32> = node
+            .children
+            .iter()
+            .map(|child| self.push_node(child, Some(id), depth.saturating_add(1)))
+            .collect();
+        self.nodes[id as usize].children = child_ids;
+        id
+    }
+
+    /// Child-index path from the roots to `id` (empty if unknown).
+    pub fn path_of(&self, id: u32) -> Vec<u32> {
+        let mut chain = Vec::new();
+        let mut cur = id;
+        loop {
+            let Some(node) = self.nodes.get(cur as usize) else {
+                return Vec::new();
+            };
+            match node.parent {
+                None => {
+                    let idx = self.roots.iter().position(|&r| r == cur).unwrap_or(0) as u32;
+                    chain.push(idx);
+                    chain.reverse();
+                    return chain;
+                }
+                Some(parent) => {
+                    let idx = self.nodes[parent as usize]
+                        .children
+                        .iter()
+                        .position(|&c| c == cur)
+                        .unwrap_or(0) as u32;
+                    chain.push(idx);
+                    cur = parent;
+                }
+            }
+        }
+    }
+
+    /// Whether `ancestor` is a strict ancestor of `node`.
+    pub fn is_ancestor(&self, ancestor: u32, node: u32) -> bool {
+        let mut cur = self.nodes.get(node as usize).and_then(|n| n.parent);
+        while let Some(p) = cur {
+            if p == ancestor {
+                return true;
+            }
+            cur = self.nodes.get(p as usize).and_then(|n| n.parent);
+        }
+        false
+    }
+
+    /// Resolve a child-index path to a node id.
+    pub fn id_at_path(&self, path: &[u32]) -> Option<u32> {
+        let (&first, rest) = path.split_first()?;
+        let mut id = *self.roots.get(first as usize)?;
+        for &idx in rest {
+            id = *self.nodes.get(id as usize)?.children.get(idx as usize)?;
+        }
+        Some(id)
+    }
+
+    /// Preorder list of visible node ids given which parents are expanded.
+    pub fn visible_ids(&self, expanded: &HashSet<u32>) -> Vec<u32> {
+        let mut out = Vec::new();
+        fn walk(data: &TreeData, id: u32, expanded: &HashSet<u32>, out: &mut Vec<u32>) {
+            out.push(id);
+            let Some(node) = data.nodes.get(id as usize) else { return };
+            if !node.children.is_empty() && expanded.contains(&id) {
+                for &child in &node.children {
+                    walk(data, child, expanded, out);
+                }
+            }
+        }
+        for &root in &self.roots {
+            walk(self, root, expanded, &mut out);
+        }
+        out
+    }
+}
 
 /// How far (layout units, each side, across the bar) a press still grabs a `Splitter` bar —
 /// see `WidgetTree::splitter_at`. The bar keeps its drawn thickness; only the hit area grows.
@@ -455,6 +650,45 @@ pub enum WidgetKind {
         on_activate: Option<IndexCallback>,
         mirror: Option<Readback<Option<usize>>>,
     },
+    /// A virtualized multi-column table (`QTableView`-lite): `data` can be huge — only the
+    /// rows in view are shaped and drawn. Sticky header (scrolls in x with the body, fixed in
+    /// y). `scroll` is `(x, y)` layout units through the same wheel/scrollbar machinery as
+    /// `ScrollArea`. Click or arrow keys select a row; double-click or Enter activates.
+    Table {
+        data: Arc<TableData>,
+        row_height: f32,
+        header_height: f32,
+        font_size: f32,
+        scroll: (f32, f32),
+        selected: Option<usize>,
+        text_color: Color,
+        header_color: Color,
+        background: Color,
+        selection_color: Color,
+        grid_color: Color,
+        on_select: Option<IndexCallback>,
+        on_activate: Option<IndexCallback>,
+        mirror: Option<Readback<Option<usize>>>,
+    },
+    /// A virtualized tree (`QTreeView`-lite): nested nodes flattened by expand state; only the
+    /// visible rows are drawn. `expanded` holds parent node ids whose children are shown.
+    /// Selection is a node id; Python mirrors a child-index path. Click the gutter to toggle;
+    /// arrows / Left / Right navigate and expand/collapse.
+    TreeView {
+        data: Arc<TreeData>,
+        /// Shared with Python so UI toggles and `set_expanded` stay in sync across rebuilds.
+        expanded: Arc<std::sync::Mutex<HashSet<u32>>>,
+        row_height: f32,
+        font_size: f32,
+        scroll: f32,
+        selected: Option<u32>,
+        text_color: Color,
+        background: Color,
+        selection_color: Color,
+        on_select: Option<PathCallback>,
+        on_activate: Option<PathCallback>,
+        mirror: Option<Readback<Option<Vec<u32>>>>,
+    },
     /// An overlay (menu, dropdown list, tooltip, dialog): an absolutely positioned child of the
     /// root, so it paints above everything else and wins hit tests, placed after layout by
     /// `anchor` (see `WidgetTree::open_popup`). A click outside the topmost popup dismisses it
@@ -600,6 +834,8 @@ impl WidgetKind {
                 | WidgetKind::TextInput { .. }
                 | WidgetKind::TextArea { .. }
                 | WidgetKind::ListView { .. }
+                | WidgetKind::Table { .. }
+                | WidgetKind::TreeView { .. }
                 | WidgetKind::Checkbox { .. }
                 | WidgetKind::Radio { .. }
                 | WidgetKind::Toggle { .. }
@@ -1008,6 +1244,24 @@ impl WidgetTree {
                     self.scroll_content.insert(id, content);
                     *scroll = scroll.clamp(0.0, max_scroll(layout.size, content).1);
                 }
+                WidgetKind::Table { data, row_height, header_height, scroll, .. } => {
+                    let body_h = data.nrows as f32 * *row_height;
+                    let content = Size {
+                        width: data.content_width(layout.size.width),
+                        height: *header_height + body_h,
+                    };
+                    self.scroll_content.insert(id, content);
+                    let max = max_scroll(layout.size, content);
+                    *scroll = (scroll.0.clamp(0.0, max.0), scroll.1.clamp(0.0, max.1));
+                }
+                WidgetKind::TreeView { data, expanded, row_height, scroll, .. } => {
+                    let expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+                    let rows = data.visible_ids(&expanded).len() as f32;
+                    let content = Size { width: layout.size.width, height: rows * *row_height };
+                    drop(expanded);
+                    self.scroll_content.insert(id, content);
+                    *scroll = scroll.clamp(0.0, max_scroll(layout.size, content).1);
+                }
                 WidgetKind::TextArea { edit, font_size, scroll_y, .. } => {
                     // Same height math as caret-follow scroll: line stack + vertical padding.
                     let line_height = *font_size * LINE_HEIGHT_RATIO;
@@ -1185,12 +1439,256 @@ impl WidgetTree {
         ((rect.height / row_height).floor() as usize).max(1)
     }
 
-    /// A scrollable widget's current offset (`ScrollArea`, a `ListView`'s vertical scroll, or a
-    /// `TextArea`'s `scroll_y`).
+    /// Body area below the sticky header for `Table` `id` (window layout units).
+    pub fn table_body_rect(&self, id: WidgetId) -> Option<Rect> {
+        let (Some(WidgetKind::Table { header_height, .. }), Some(rect)) = (self.kind(id), self.absolute_rect(id))
+        else {
+            return None;
+        };
+        Some(Rect {
+            x: rect.x,
+            y: rect.y + header_height,
+            width: rect.width,
+            height: (rect.height - header_height).max(0.0),
+        })
+    }
+
+    /// Resolved column widths for `Table` `id` at its current layout width.
+    pub fn table_column_widths(&self, id: WidgetId) -> Vec<f32> {
+        let (Some(WidgetKind::Table { data, .. }), Some(rect)) = (self.kind(id), self.absolute_rect(id)) else {
+            return Vec::new();
+        };
+        data.resolved_widths(rect.width)
+    }
+
+    /// The `Table` body rows at least partly in view (for drawing), from the last layout.
+    pub fn table_visible_rows(&self, id: WidgetId) -> std::ops::Range<usize> {
+        let (Some(WidgetKind::Table { data, row_height, header_height, scroll, .. }), Some(rect)) =
+            (self.kind(id), self.absolute_rect(id))
+        else {
+            return 0..0;
+        };
+        if *row_height <= 0.0 {
+            return 0..0;
+        }
+        let body_h = (rect.height - header_height).max(0.0);
+        let first = (scroll.1 / row_height).floor().max(0.0) as usize;
+        let last = ((scroll.1 + body_h) / row_height).ceil().max(0.0) as usize;
+        first.min(data.nrows)..last.min(data.nrows)
+    }
+
+    /// The `Table` body row under window y, if any (header clicks return `None`).
+    pub fn table_row_at(&self, id: WidgetId, y: f32) -> Option<usize> {
+        let (Some(WidgetKind::Table { data, row_height, header_height, scroll, .. }), Some(rect)) =
+            (self.kind(id), self.absolute_rect(id))
+        else {
+            return None;
+        };
+        let body_y = rect.y + header_height;
+        if y < body_y {
+            return None;
+        }
+        let row = ((y - body_y + scroll.1) / row_height).floor();
+        (row >= 0.0 && (row as usize) < data.nrows).then_some(row as usize)
+    }
+
+    /// Select row `index` of `Table` `id` (clamped; `None` clears) and scroll it into the body
+    /// view. Fires `on_select` and updates the mirror when the selection changes.
+    pub fn table_select(&mut self, id: WidgetId, index: Option<usize>) {
+        let Some(WidgetKind::Table { data, row_height, header_height, scroll, selected, on_select, mirror, .. }) =
+            self.kinds.get_mut(&id)
+        else {
+            return;
+        };
+        let nrows = data.nrows;
+        let index = index.filter(|_| nrows > 0).map(|i| i.min(nrows - 1));
+        let changed = *selected != index;
+        *selected = index;
+        let view = self
+            .absolute_rects
+            .get(&id)
+            .map_or(0.0, |r| (r.height - *header_height).max(0.0));
+        if let Some(i) = index {
+            let (top, bottom) = (i as f32 * *row_height, (i + 1) as f32 * *row_height);
+            scroll.1 = scroll.1.min(top).max(bottom - view);
+        }
+        let (callback, mirror) = (on_select.clone(), mirror.clone());
+        self.mark_dirty();
+        if changed {
+            if let Some(mirror) = mirror {
+                mirror.set(index);
+            }
+            if let (Some(callback), Some(i)) = (callback, index) {
+                callback(i);
+            }
+        }
+    }
+
+    /// How many whole body rows fit in `Table` `id` (at least 1) — PageUp/PageDown's step.
+    pub fn table_page_rows(&self, id: WidgetId) -> usize {
+        let (Some(WidgetKind::Table { row_height, header_height, .. }), Some(rect)) =
+            (self.kind(id), self.absolute_rect(id))
+        else {
+            return 1;
+        };
+        let body_h = (rect.height - header_height).max(0.0);
+        ((body_h / row_height).floor() as usize).max(1)
+    }
+
+    /// Visible `TreeView` node ids in paint order (expanded parents only).
+    pub fn tree_visible_ids(&self, id: WidgetId) -> Vec<u32> {
+        let Some(WidgetKind::TreeView { data, expanded, .. }) = self.kind(id) else {
+            return Vec::new();
+        };
+        let expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+        data.visible_ids(&expanded)
+    }
+
+    /// The visible flat-row range for `TreeView` `id` (indices into `tree_visible_ids`).
+    pub fn tree_visible_rows(&self, id: WidgetId) -> std::ops::Range<usize> {
+        let (Some(WidgetKind::TreeView { data, expanded, row_height, scroll, .. }), Some(rect)) =
+            (self.kind(id), self.absolute_rect(id))
+        else {
+            return 0..0;
+        };
+        if *row_height <= 0.0 {
+            return 0..0;
+        }
+        let expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+        let n = data.visible_ids(&expanded).len();
+        let first = (*scroll / row_height).floor().max(0.0) as usize;
+        let last = ((*scroll + rect.height) / row_height).ceil().max(0.0) as usize;
+        first.min(n)..last.min(n)
+    }
+
+    /// The `TreeView` node under window `(x, y)`, plus whether the press landed in the disclosure gutter.
+    pub fn tree_hit(&self, id: WidgetId, x: f32, y: f32) -> Option<(u32, bool)> {
+        let (Some(WidgetKind::TreeView { data, expanded, row_height, scroll, .. }), Some(rect)) =
+            (self.kind(id), self.absolute_rect(id))
+        else {
+            return None;
+        };
+        let expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+        let visible = data.visible_ids(&expanded);
+        let row = ((y - rect.y + scroll) / row_height).floor();
+        if row < 0.0 || (row as usize) >= visible.len() {
+            return None;
+        }
+        let node_id = visible[row as usize];
+        let depth = data.nodes.get(node_id as usize).map(|n| n.depth).unwrap_or(0);
+        let gutter_x0 = rect.x + depth as f32 * TREE_INDENT;
+        let gutter_x1 = gutter_x0 + TREE_GUTTER;
+        let in_gutter = x >= gutter_x0 && x < gutter_x1;
+        Some((node_id, in_gutter))
+    }
+
+    /// Select `TreeView` node `node` (or clear with `None`) and scroll it into view.
+    pub fn tree_select(&mut self, id: WidgetId, node: Option<u32>) {
+        let (node, ancestors, path) = {
+            let Some(WidgetKind::TreeView { data, .. }) = self.kind(id) else { return };
+            let node = node.filter(|&n| (n as usize) < data.nodes.len());
+            let mut ancestors = Vec::new();
+            if let Some(n) = node {
+                let mut cur = data.nodes.get(n as usize).and_then(|node| node.parent);
+                while let Some(p) = cur {
+                    ancestors.push(p);
+                    cur = data.nodes.get(p as usize).and_then(|node| node.parent);
+                }
+            }
+            let path = node.map(|n| data.path_of(n));
+            (node, ancestors, path)
+        };
+        let view = self.absolute_rects.get(&id).map_or(0.0, |r| r.height);
+        let Some(WidgetKind::TreeView {
+            data,
+            expanded,
+            row_height,
+            scroll,
+            selected,
+            on_select,
+            mirror,
+            ..
+        }) = self.kinds.get_mut(&id)
+        else {
+            return;
+        };
+        {
+            let mut expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+            for p in ancestors {
+                expanded.insert(p);
+            }
+        }
+        let changed = *selected != node;
+        *selected = node;
+        if let Some(n) = node {
+            let expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+            let visible = data.visible_ids(&expanded);
+            drop(expanded);
+            if let Some(flat) = visible.iter().position(|&v| v == n) {
+                let (top, bottom) = (flat as f32 * *row_height, (flat + 1) as f32 * *row_height);
+                *scroll = scroll.min(top).max(bottom - view);
+            }
+        }
+        let (callback, mirror) = (on_select.clone(), mirror.clone());
+        self.mark_dirty();
+        if changed {
+            if let Some(mirror) = mirror {
+                mirror.set(path.clone());
+            }
+            if let (Some(callback), Some(path)) = (callback, path) {
+                callback(&path);
+            }
+        }
+    }
+
+    /// Toggle expand/collapse for `node` in `TreeView` `id` (no-op on leaves).
+    pub fn tree_toggle(&mut self, id: WidgetId, node: u32) {
+        let Some(WidgetKind::TreeView { expanded, .. }) = self.kind(id) else { return };
+        let open = !expanded.lock().unwrap_or_else(|p| p.into_inner()).contains(&node);
+        self.tree_set_expanded(id, node, open);
+    }
+
+    /// Expand or collapse `node` explicitly. Collapsing an ancestor of the selection moves the
+    /// selection up to `node` (as Qt / Explorer do) so it never sits on a hidden row.
+    pub fn tree_set_expanded(&mut self, id: WidgetId, node: u32, open: bool) {
+        let Some(WidgetKind::TreeView { data, expanded, selected, .. }) = self.kinds.get_mut(&id) else {
+            return;
+        };
+        let Some(tree_node) = data.nodes.get(node as usize) else { return };
+        if tree_node.children.is_empty() {
+            return;
+        }
+        let hides_selection = !open && selected.is_some_and(|s| data.is_ancestor(node, s));
+        let mut expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+        if open {
+            expanded.insert(node);
+        } else {
+            expanded.remove(&node);
+        }
+        drop(expanded);
+        if hides_selection {
+            self.tree_select(id, Some(node));
+        }
+        self.mark_dirty();
+    }
+
+    /// How many whole rows fit in `TreeView` `id` (at least 1).
+    pub fn tree_page_rows(&self, id: WidgetId) -> usize {
+        let (Some(WidgetKind::TreeView { row_height, .. }), Some(rect)) = (self.kind(id), self.absolute_rect(id))
+        else {
+            return 1;
+        };
+        ((rect.height / row_height).floor() as usize).max(1)
+    }
+
+    /// A scrollable widget's current offset (`ScrollArea`, a `ListView`'s vertical scroll, a
+    /// `Table`'s `(x, y)`, a `TreeView`'s vertical scroll, or a `TextArea`'s `scroll_y`).
     pub fn scroll_offset(&self, id: WidgetId) -> Option<(f32, f32)> {
         match self.kind(id)? {
             WidgetKind::ScrollArea { offset, .. } => Some(*offset),
             WidgetKind::ListView { scroll, .. } => Some((0.0, *scroll)),
+            WidgetKind::Table { scroll, .. } => Some(*scroll),
+            WidgetKind::TreeView { scroll, .. } => Some((0.0, *scroll)),
             WidgetKind::TextArea { scroll_y, .. } => Some((0.0, *scroll_y)),
             _ => None,
         }
@@ -1206,6 +1704,8 @@ impl WidgetTree {
         match self.kinds.get_mut(&id) {
             Some(WidgetKind::ScrollArea { offset, .. }) => *offset = target,
             Some(WidgetKind::ListView { scroll, .. }) => *scroll = target.1,
+            Some(WidgetKind::Table { scroll, .. }) => *scroll = target,
+            Some(WidgetKind::TreeView { scroll, .. }) => *scroll = target.1,
             Some(WidgetKind::TextArea { scroll_y, .. }) => *scroll_y = target.1,
             _ => return false,
         }
@@ -1937,6 +2437,18 @@ fn measure_leaf<'m>(
         Some(WidgetKind::ListView { row_height, items, .. }) => {
             // Up to eight rows tall unless stretched or sized; wide enough to read.
             Size { width: 160.0, height: row_height * items.len().clamp(1, 8) as f32 }
+        }
+        Some(WidgetKind::Table { data, row_height, header_height, .. }) => {
+            let cols = data.columns.len().max(1) as f32;
+            Size {
+                width: TABLE_DEFAULT_COLUMN_WIDTH * cols.min(4.0),
+                height: header_height + row_height * data.nrows.clamp(1, 8) as f32,
+            }
+        }
+        Some(WidgetKind::TreeView { data, expanded, row_height, .. }) => {
+            let expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
+            let rows = data.visible_ids(&expanded).len().clamp(1, 8) as f32;
+            Size { width: 200.0, height: row_height * rows }
         }
     };
     Size {
@@ -2784,6 +3296,177 @@ mod tests {
         let (mut empty, id, _, _) = list_tree(0);
         empty.list_select(id, Some(0));
         assert_eq!(empty.list_row_at(id, 5.0), None);
+    }
+
+    fn table_tree(n: usize, col_width: f32) -> (WidgetTree, WidgetId, Selections, Readback<Option<usize>>) {
+        let selections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = selections.clone();
+        let mirror = Readback::new(None);
+        let data = TableData::new(
+            vec![
+                TableColumn { header: "i".into(), width: col_width },
+                TableColumn { header: "label".into(), width: col_width },
+            ],
+            vec![
+                (0..n).map(|i| i.to_string()).collect(),
+                (0..n).map(|i| format!("row {i}")).collect(),
+            ],
+        )
+        .unwrap();
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let table = tree.new_node(
+            Style {
+                size: Size { width: Dimension::length(200.0), height: Dimension::length(120.0) },
+                ..Default::default()
+            },
+            WidgetKind::Table {
+                data: Arc::new(data),
+                row_height: 20.0,
+                header_height: 24.0,
+                font_size: 14.0,
+                scroll: (0.0, 0.0),
+                selected: None,
+                text_color: Color::TRANSPARENT,
+                header_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                selection_color: Color::TRANSPARENT,
+                grid_color: Color::TRANSPARENT,
+                on_select: Some(Arc::new(move |i| sink.lock().unwrap().push(i))),
+                on_activate: None,
+                mirror: Some(mirror.clone()),
+            },
+        );
+        tree.add_child(root, table);
+        tree.compute_layout(400.0, 400.0);
+        (tree, table, selections, mirror)
+    }
+
+    #[test]
+    fn table_draws_only_visible_rows_of_a_million() {
+        let (mut tree, table, _, _) = table_tree(1_000_000, 100.0);
+        // Body is 120 - 24 = 96 → 5 whole rows; partly visible sixth.
+        assert_eq!(tree.table_visible_rows(table), 0..5);
+        assert_eq!(tree.table_row_at(table, 10.0), None, "header is not a body row");
+        assert_eq!(tree.table_row_at(table, 30.0), Some(0));
+        assert!(tree.scroll_at(10.0, 40.0, 0.0, 40.0));
+        assert_eq!(tree.table_visible_rows(table), 2..7);
+        // Explicit columns 100+100 with view 200 → no horizontal overflow.
+        assert_eq!(tree.scroll_extent(table).map(|e| e.0), Some(0.0));
+        // Wider columns → horizontal scroll.
+        let (mut wide, id, _, _) = table_tree(100, 200.0);
+        wide.compute_layout(400.0, 400.0);
+        assert!(wide.scroll_extent(id).unwrap().0 > 0.0);
+        assert!(wide.scroll_at(10.0, 40.0, 50.0, 0.0));
+        assert!(wide.scrollbar_thumbs(id).0.is_some());
+    }
+
+    #[test]
+    fn table_selection_scrolls_into_view_and_notifies() {
+        let (mut tree, table, selections, mirror) = table_tree(50, 100.0);
+        tree.table_select(table, Some(10));
+        // Body view 96; row 10 bottom-aligned → scroll_y = 11*20 - 96 = 124.
+        assert_eq!(tree.scroll_offset(table), Some((0.0, 124.0)));
+        tree.table_select(table, Some(10));
+        tree.table_select(table, Some(2));
+        assert_eq!(tree.scroll_offset(table), Some((0.0, 40.0)));
+        tree.table_select(table, Some(999));
+        assert_eq!(*selections.lock().unwrap(), [10, 2, 49]);
+        assert_eq!(mirror.get(), Some(49));
+        assert_eq!(tree.table_page_rows(table), 4);
+    }
+
+    fn sample_tree_data() -> TreeData {
+        TreeData::from_nested(&[
+            TreeNodeData {
+                label: "Sensors".into(),
+                children: vec![
+                    TreeNodeData { label: "Camera".into(), children: vec![] },
+                    TreeNodeData {
+                        label: "IMU".into(),
+                        children: vec![
+                            TreeNodeData { label: "accel".into(), children: vec![] },
+                            TreeNodeData { label: "gyro".into(), children: vec![] },
+                        ],
+                    },
+                ],
+            },
+            TreeNodeData { label: "Logs".into(), children: vec![] },
+        ])
+    }
+
+    #[test]
+    fn tree_flatten_expand_and_paths() {
+        let data = sample_tree_data();
+        assert_eq!(data.nodes.len(), 6);
+        assert_eq!(data.path_of(0), vec![0]);
+        assert_eq!(data.path_of(4), vec![0, 1, 1]); // gyro
+        assert_eq!(data.id_at_path(&[0, 1, 0]), Some(3)); // accel
+        let collapsed = HashSet::new();
+        assert_eq!(data.visible_ids(&collapsed), vec![0, 5]);
+        let mut expanded = HashSet::new();
+        expanded.insert(0);
+        expanded.insert(2);
+        assert_eq!(data.visible_ids(&expanded), vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn tree_paths_reach_past_u16_siblings() {
+        let children = (0..70_000).map(|i| TreeNodeData { label: i.to_string(), children: vec![] }).collect();
+        let data = TreeData::from_nested(&[TreeNodeData { label: "big".into(), children }]);
+        let last = data.id_at_path(&[0, 69_999]).unwrap();
+        assert_eq!(data.nodes[last as usize].label, "69999");
+        assert_eq!(data.path_of(last), vec![0, 69_999]);
+    }
+
+    #[test]
+    fn tree_view_toggle_select_and_scroll() {
+        let data = Arc::new(sample_tree_data());
+        let expanded = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let mirror = Readback::new(None);
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let view = tree.new_node(
+            Style {
+                size: Size { width: Dimension::length(200.0), height: Dimension::length(100.0) },
+                ..Default::default()
+            },
+            WidgetKind::TreeView {
+                data,
+                expanded: expanded.clone(),
+                row_height: 20.0,
+                font_size: 14.0,
+                scroll: 0.0,
+                selected: None,
+                text_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                selection_color: Color::TRANSPARENT,
+                on_select: None,
+                on_activate: None,
+                mirror: Some(mirror.clone()),
+            },
+        );
+        tree.add_child(root, view);
+        tree.compute_layout(300.0, 300.0);
+        assert_eq!(tree.tree_visible_ids(view), vec![0, 5]);
+        tree.tree_toggle(view, 0);
+        assert_eq!(tree.tree_visible_ids(view), vec![0, 1, 2, 5]);
+        tree.tree_select(view, Some(4)); // gyro — expands ancestors
+        assert!(expanded.lock().unwrap().contains(&0));
+        assert!(expanded.lock().unwrap().contains(&2));
+        assert_eq!(mirror.get(), Some(vec![0, 1, 1]));
+        assert_eq!(tree.tree_visible_ids(view), vec![0, 1, 2, 3, 4, 5]);
+
+        // Collapsing an ancestor of the selection moves it to the collapsed node.
+        tree.tree_set_expanded(view, 0, false);
+        assert_eq!(mirror.get(), Some(vec![0]));
+        tree.tree_select(view, Some(3)); // accel
+        tree.tree_toggle(view, 2); // IMU via the gutter
+        assert_eq!(mirror.get(), Some(vec![0, 1]));
+        tree.tree_toggle(view, 0);
+        assert_eq!(mirror.get(), Some(vec![0]), "IMU is under Sensors too");
+        tree.tree_set_expanded(view, 5, false); // a leaf: no-op
+        assert_eq!(mirror.get(), Some(vec![0]));
     }
 
     #[test]

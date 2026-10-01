@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -6,8 +6,9 @@ use fastgui_core::taffy::prelude::*;
 use fastgui_core::taffy::style::LengthPercentage;
 use fastgui_core::widget::{
     clamp_range, round_to_decimals, Accel, BoolCallback, ChangeCallback, ClickCallback, Color, IndexCallback,
-    PanelCloseCallback, PanelDropCallback, PointCallback, PopupAnchor, PopupSide, SplitDirection,
-    TabSelectCallback, TextCallback, WidgetId, WidgetKind, WidgetTree,
+    PanelCloseCallback, PanelDropCallback, PathCallback, PointCallback, PopupAnchor, PopupSide, SplitDirection,
+    TabSelectCallback, TableColumn, TableData, TextCallback, TreeData, TreeNodeData, WidgetId, WidgetKind,
+    WidgetTree,
 };
 use fastgui_core::text_edit::TextEdit;
 use fastgui_core::{CpuFrame, FrameSlot, PixelFormat, Readback, MAX_CPU_FRAME_EXTENT};
@@ -15,7 +16,7 @@ use crate::theme::{FontSize, Spacing};
 use crate::backend::{Command, CommandDispatch};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyList};
+use pyo3::types::{PyAny, PyDict, PyList, PySequence};
 
 type IdCell = Arc<Mutex<Option<WidgetId>>>;
 type SenderCell = Arc<Mutex<Option<CommandDispatch>>>;
@@ -435,6 +436,12 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
     if let Ok(w) = obj.cast::<ListView>() {
         return Ok(w.borrow().describe());
     }
+    if let Ok(w) = obj.cast::<Table>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<TreeView>() {
+        return Ok(w.borrow().describe());
+    }
     if obj.cast::<Popup>().is_ok() {
         return Err(PyTypeError::new_err("a Popup isn't placed in the layout; open it with popup.show(anchor)"));
     }
@@ -488,7 +495,7 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
         return Ok(w.borrow().describe_widget());
     }
     Err(PyTypeError::new_err(
-        "expected a fastgui widget (Box, Grid, Label, Button, Slider, TextInput, TextArea, ScrollArea, Checkbox, Radio, Toggle, SpinBox, NumericScrub, ProgressBar, ComboBox, Image, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
+        "expected a fastgui widget (Box, Grid, Label, Button, Slider, TextInput, TextArea, ScrollArea, ListView, Table, TreeView, Checkbox, Radio, Toggle, SpinBox, NumericScrub, ProgressBar, ComboBox, Image, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
     ))
 }
 
@@ -1432,6 +1439,596 @@ impl ListView {
                 selection_color: rgba(self.selection_color.unwrap_or(crate::theme::palette().selection)),
                 on_select: on_select.map(wrap_index_callback),
                 on_activate: on_activate.map(wrap_index_callback),
+                mirror: Some(self.selected.clone()),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
+            hover_action: None,
+        }
+    }
+}
+
+/// Compact cell formatting for table ingest (floats without noisy trailing zeros).
+fn format_table_cell(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok(v) = value.extract::<bool>() {
+        // Check bool before int — bool is a subclass of int in Python.
+        return Ok(if v { "True".into() } else { "False".into() });
+    }
+    if let Ok(v) = value.extract::<i64>() {
+        return Ok(v.to_string());
+    }
+    if let Ok(v) = value.extract::<f64>() {
+        return Ok(format_table_float(v));
+    }
+    if value.is_none() {
+        return Ok(String::new());
+    }
+    value.str()?.extract()
+}
+
+/// Six decimals with trailing zeros trimmed; scientific notation outside `[1e-4, 1e15)` so tiny
+/// values don't collapse to `0` and huge ones don't print as long digit runs.
+fn format_table_float(v: f64) -> String {
+    if !v.is_finite() {
+        return v.to_string();
+    }
+    if v == 0.0 {
+        return "0".into();
+    }
+    fn trim(s: &str) -> &str {
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.')
+        } else {
+            s
+        }
+    }
+    if (1e-4..1e15).contains(&v.abs()) {
+        trim(&format!("{v:.6}")).to_string()
+    } else {
+        let s = format!("{v:.5e}");
+        let (mantissa, exp) = s.split_once('e').unwrap_or((&s, "0"));
+        format!("{}e{exp}", trim(mantissa))
+    }
+}
+
+/// Turn one column sequence (list, numpy 1-D, pyarrow-ish iterable) into string cells.
+fn column_to_strings(col: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    if let Ok(to_pylist) = col.call_method0("to_pylist") {
+        return column_to_strings(&to_pylist);
+    }
+    if let Ok(tolist) = col.call_method0("tolist") {
+        return column_to_strings(&tolist);
+    }
+    let seq = col.cast::<PySequence>().map_err(|_| {
+        PyTypeError::new_err("each table column must be a sequence (list, numpy array, …)")
+    })?;
+    let mut out = Vec::with_capacity(seq.len().unwrap_or(0));
+    for i in 0..seq.len()? {
+        out.push(format_table_cell(&seq.get_item(i)?)?);
+    }
+    Ok(out)
+}
+
+/// Normalize `columns=` (dict or sequence of `(name, values)`) plus optional widths into `TableData`.
+fn coerce_table_data(
+    columns: &Bound<'_, PyAny>,
+    column_widths: Option<Vec<f32>>,
+) -> PyResult<Arc<TableData>> {
+    let mut headers: Vec<String> = Vec::new();
+    let mut cells: Vec<Vec<String>> = Vec::new();
+    if let Ok(dict) = columns.cast::<PyDict>() {
+        for (key, value) in dict.iter() {
+            headers.push(key.str()?.to_string_lossy().into_owned());
+            cells.push(column_to_strings(&value)?);
+        }
+    } else {
+        let seq = columns.cast::<PySequence>().map_err(|_| {
+            PyTypeError::new_err("columns must be a dict or a sequence of (name, values) pairs")
+        })?;
+        for i in 0..seq.len()? {
+            let pair = seq.get_item(i)?;
+            let pair_seq = pair.cast::<PySequence>().map_err(|_| {
+                PyTypeError::new_err("each columns entry must be a (name, values) pair")
+            })?;
+            if pair_seq.len()? != 2 {
+                return Err(PyValueError::new_err("each columns entry must be a (name, values) pair"));
+            }
+            headers.push(pair_seq.get_item(0)?.str()?.to_string_lossy().into_owned());
+            cells.push(column_to_strings(&pair_seq.get_item(1)?)?);
+        }
+    }
+    if let Some(widths) = column_widths.as_ref() {
+        if !widths.is_empty() && widths.len() != headers.len() {
+            return Err(PyValueError::new_err(
+                "column_widths length must match the number of columns",
+            ));
+        }
+    }
+    let cols: Vec<TableColumn> = headers
+        .into_iter()
+        .enumerate()
+        .map(|(i, header)| TableColumn {
+            header,
+            width: column_widths
+                .as_ref()
+                .and_then(|w| w.get(i).copied())
+                .unwrap_or(0.0),
+        })
+        .collect();
+    TableData::new(cols, cells)
+        .map(Arc::new)
+        .ok_or_else(|| PyValueError::new_err("all table columns must have the same length"))
+}
+
+/// A virtualized multi-column table: only rows in view are drawn, so it handles millions.
+#[pyclass]
+pub(crate) struct Table {
+    id: IdCell,
+    sender: SenderCell,
+    data: Arc<Mutex<Arc<TableData>>>,
+    selected: Readback<Option<usize>>,
+    row_height: f32,
+    header_height: f32,
+    font_size: Option<FontSize>,
+    flex_grow: f32,
+    width: Option<f32>,
+    height: Option<f32>,
+    text_color: Option<(f32, f32, f32, f32)>,
+    header_color: Option<(f32, f32, f32, f32)>,
+    background: Option<(f32, f32, f32, f32)>,
+    selection_color: Option<(f32, f32, f32, f32)>,
+    grid_color: Option<(f32, f32, f32, f32)>,
+    on_select: Option<Py<PyAny>>,
+    on_activate: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl Table {
+    #[new]
+    #[pyo3(signature = (
+        columns,
+        on_select=None,
+        on_activate=None,
+        row_height=24.0,
+        header_height=28.0,
+        column_widths=None,
+        font_size=None,
+        flex_grow=1.0,
+        width=None,
+        height=None,
+        text_color=None,
+        header_color=None,
+        background=None,
+        selection_color=None,
+        grid_color=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        columns: &Bound<'_, PyAny>,
+        on_select: Option<Py<PyAny>>,
+        on_activate: Option<Py<PyAny>>,
+        row_height: f32,
+        header_height: f32,
+        column_widths: Option<Vec<f32>>,
+        font_size: Option<FontSize>,
+        flex_grow: f32,
+        width: Option<f32>,
+        height: Option<f32>,
+        text_color: Option<(f32, f32, f32, f32)>,
+        header_color: Option<(f32, f32, f32, f32)>,
+        background: Option<(f32, f32, f32, f32)>,
+        selection_color: Option<(f32, f32, f32, f32)>,
+        grid_color: Option<(f32, f32, f32, f32)>,
+    ) -> PyResult<Self> {
+        if row_height <= 0.0 {
+            return Err(PyValueError::new_err("row_height must be positive"));
+        }
+        if header_height < 0.0 {
+            return Err(PyValueError::new_err("header_height must be non-negative"));
+        }
+        let data = coerce_table_data(columns, column_widths)?;
+        Ok(Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            data: Arc::new(Mutex::new(data)),
+            selected: Readback::new(None),
+            row_height,
+            header_height,
+            font_size,
+            flex_grow,
+            width,
+            height,
+            text_color,
+            header_color,
+            background,
+            selection_color,
+            grid_color,
+            on_select,
+            on_activate,
+        })
+    }
+
+    /// Replace columns (clears selection and scrolls to the origin). Works before attaching.
+    #[pyo3(signature = (columns, column_widths=None))]
+    fn set_columns(&self, columns: &Bound<'_, PyAny>, column_widths: Option<Vec<f32>>) -> PyResult<()> {
+        let data = coerce_table_data(columns, column_widths)?;
+        *self.data.lock().unwrap_or_else(|p| p.into_inner()) = data.clone();
+        self.selected.set(None);
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::Table { data: current, selected, scroll, .. } = kind {
+                *current = data;
+                *selected = None;
+                *scroll = (0.0, 0.0);
+            }
+        })
+    }
+
+    /// Select row `index` (clamped) and scroll it into view; `None` clears the selection.
+    #[pyo3(signature = (index))]
+    fn select(&self, index: Option<usize>) -> PyResult<()> {
+        let id = *self.id.lock().unwrap_or_else(|p| p.into_inner());
+        let sender = self.sender.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let (Some(id), Some(sender)) = (id, sender) else {
+            let nrows = self.data.lock().unwrap_or_else(|p| p.into_inner()).nrows;
+            self.selected.set(index.filter(|_| nrows > 0).map(|i| i.min(nrows - 1)));
+            return Ok(());
+        };
+        send_tree_mutation(&sender, move |tree| tree.table_select(id, index))
+    }
+
+    #[getter]
+    fn selected(&self) -> Option<usize> {
+        self.selected.get()
+    }
+
+    fn __len__(&self) -> usize {
+        self.data.lock().unwrap_or_else(|p| p.into_inner()).nrows
+    }
+}
+
+impl Table {
+    fn describe(&self) -> DescribedWidget {
+        let (on_select, on_activate) = Python::attach(|py| {
+            (
+                self.on_select.as_ref().map(|cb| cb.clone_ref(py)),
+                self.on_activate.as_ref().map(|cb| cb.clone_ref(py)),
+            )
+        });
+        let data = self.data.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let selected = self.selected.get().filter(|&i| i < data.nrows);
+        let palette = crate::theme::palette();
+        DescribedWidget {
+            style: StyleParams::leaf(self.flex_grow, self.width, self.height),
+            kind: WidgetKind::Table {
+                data,
+                row_height: self.row_height,
+                header_height: self.header_height,
+                font_size: self.font_size.unwrap_or(FontSize::Small).resolve(),
+                scroll: (0.0, 0.0),
+                selected,
+                text_color: rgba(self.text_color.unwrap_or(palette.text)),
+                header_color: rgba(self.header_color.unwrap_or(palette.text_muted)),
+                background: rgba(self.background.unwrap_or(palette.surface_alt)),
+                selection_color: rgba(self.selection_color.unwrap_or(palette.selection)),
+                grid_color: rgba(self.grid_color.unwrap_or(palette.border)),
+                on_select: on_select.map(wrap_index_callback),
+                on_activate: on_activate.map(wrap_index_callback),
+                mirror: Some(self.selected.clone()),
+            },
+            id_cell: self.id.clone(),
+            sender_cell: self.sender.clone(),
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
+            hover_action: None,
+        }
+    }
+}
+
+/// One node in a [`TreeView`] — label plus optional nested children.
+#[pyclass(skip_from_py_object)]
+#[derive(Clone)]
+pub(crate) struct TreeNode {
+    label: String,
+    children: Vec<TreeNode>,
+}
+
+#[pymethods]
+impl TreeNode {
+    #[new]
+    #[pyo3(signature = (label, children=None))]
+    fn new(label: String, children: Option<Vec<PyRef<'_, TreeNode>>>) -> Self {
+        Self {
+            label,
+            children: children
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| c.clone())
+                .collect(),
+        }
+    }
+
+    #[getter]
+    fn label(&self) -> String {
+        self.label.clone()
+    }
+}
+
+impl TreeNode {
+    fn to_data(&self) -> TreeNodeData {
+        TreeNodeData {
+            label: self.label.clone(),
+            children: self.children.iter().map(TreeNode::to_data).collect(),
+        }
+    }
+}
+
+fn wrap_path_callback(callback: Py<PyAny>) -> PathCallback {
+    Arc::new(move |path: &[u32]| {
+        Python::attach(|py| {
+            let tuple = path.iter().map(|&i| i as usize).collect::<Vec<_>>();
+            if let Err(err) = callback.call1(py, (tuple,)) {
+                err.print(py);
+            }
+        });
+    })
+}
+
+fn coerce_tree_roots(nodes: &Bound<'_, PyAny>) -> PyResult<Arc<TreeData>> {
+    let seq = nodes.cast::<PySequence>().map_err(|_| {
+        PyTypeError::new_err("TreeView roots must be a sequence of TreeNode")
+    })?;
+    let mut roots = Vec::with_capacity(seq.len()?);
+    for i in 0..seq.len()? {
+        let item = seq.get_item(i)?;
+        let node = item.cast::<TreeNode>().map_err(|_| {
+            PyTypeError::new_err("TreeView roots must be TreeNode instances")
+        })?;
+        roots.push(node.borrow().to_data());
+    }
+    Ok(Arc::new(TreeData::from_nested(&roots)))
+}
+
+fn path_from_py(path: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<u32>>> {
+    let Some(path) = path else { return Ok(None) };
+    if path.is_none() {
+        return Ok(None);
+    }
+    let seq = path.cast::<PySequence>().map_err(|_| {
+        PyTypeError::new_err("path must be a sequence of child indices")
+    })?;
+    let mut out = Vec::with_capacity(seq.len()?);
+    for i in 0..seq.len()? {
+        let idx: usize = seq.get_item(i)?.extract()?;
+        out.push(u32::try_from(idx).map_err(|_| PyValueError::new_err("path index too large"))?);
+    }
+    Ok(Some(out))
+}
+
+/// A virtualized tree: only expanded rows in view are drawn.
+#[pyclass]
+pub(crate) struct TreeView {
+    id: IdCell,
+    sender: SenderCell,
+    data: Arc<Mutex<Arc<TreeData>>>,
+    /// Expanded node ids — kept so describe / set_nodes can restore expand state.
+    expanded: Arc<Mutex<HashSet<u32>>>,
+    selected: Readback<Option<Vec<u32>>>,
+    row_height: f32,
+    font_size: Option<FontSize>,
+    flex_grow: f32,
+    width: Option<f32>,
+    height: Option<f32>,
+    text_color: Option<(f32, f32, f32, f32)>,
+    background: Option<(f32, f32, f32, f32)>,
+    selection_color: Option<(f32, f32, f32, f32)>,
+    on_select: Option<Py<PyAny>>,
+    on_activate: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl TreeView {
+    #[new]
+    #[pyo3(signature = (
+        nodes,
+        on_select=None,
+        on_activate=None,
+        row_height=24.0,
+        font_size=None,
+        flex_grow=1.0,
+        width=None,
+        height=None,
+        text_color=None,
+        background=None,
+        selection_color=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        nodes: &Bound<'_, PyAny>,
+        on_select: Option<Py<PyAny>>,
+        on_activate: Option<Py<PyAny>>,
+        row_height: f32,
+        font_size: Option<FontSize>,
+        flex_grow: f32,
+        width: Option<f32>,
+        height: Option<f32>,
+        text_color: Option<(f32, f32, f32, f32)>,
+        background: Option<(f32, f32, f32, f32)>,
+        selection_color: Option<(f32, f32, f32, f32)>,
+    ) -> PyResult<Self> {
+        if row_height <= 0.0 {
+            return Err(PyValueError::new_err("row_height must be positive"));
+        }
+        let data = coerce_tree_roots(nodes)?;
+        Ok(Self {
+            id: Arc::new(Mutex::new(None)),
+            sender: Arc::new(Mutex::new(None)),
+            data: Arc::new(Mutex::new(data)),
+            expanded: Arc::new(Mutex::new(HashSet::new())),
+            selected: Readback::new(None),
+            row_height,
+            font_size,
+            flex_grow,
+            width,
+            height,
+            text_color,
+            background,
+            selection_color,
+            on_select,
+            on_activate,
+        })
+    }
+
+    /// Replace the tree (clears selection, collapse, and scroll). Works before attaching.
+    fn set_nodes(&self, nodes: &Bound<'_, PyAny>) -> PyResult<()> {
+        let data = coerce_tree_roots(nodes)?;
+        *self.data.lock().unwrap_or_else(|p| p.into_inner()) = data.clone();
+        self.expanded.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.selected.set(None);
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::TreeView {
+                data: current,
+                expanded,
+                selected,
+                scroll,
+                ..
+            } = kind
+            {
+                *current = data;
+                expanded.lock().unwrap_or_else(|p| p.into_inner()).clear();
+                *selected = None;
+                *scroll = 0.0;
+            }
+        })
+    }
+
+    /// Select the node at `path` (child-index tuple) or clear with `None`.
+    #[pyo3(signature = (path))]
+    fn select(&self, path: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let path = path_from_py(path)?;
+        let id = *self.id.lock().unwrap_or_else(|p| p.into_inner());
+        let sender = self.sender.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let (Some(id), Some(sender)) = (id, sender) else {
+            let data = self.data.lock().unwrap_or_else(|p| p.into_inner());
+            let node = path.as_ref().and_then(|p| data.id_at_path(p));
+            self.selected.set(node.map(|n| data.path_of(n)));
+            return Ok(());
+        };
+        send_tree_mutation(&sender, move |tree| {
+            let node = match (&path, tree.kind(id)) {
+                (Some(p), Some(WidgetKind::TreeView { data, .. })) => data.id_at_path(p),
+                (None, _) => None,
+                _ => return,
+            };
+            tree.tree_select(id, node);
+        })
+    }
+
+    /// Expand or collapse the node at `path`.
+    fn set_expanded(&self, path: &Bound<'_, PyAny>, expanded: bool) -> PyResult<()> {
+        let path = path_from_py(Some(path))?.ok_or_else(|| PyValueError::new_err("path required"))?;
+        let data = self.data.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(node) = data.id_at_path(&path) else {
+            return Err(PyValueError::new_err("path does not resolve to a node"));
+        };
+        drop(data);
+        if expanded {
+            self.expanded.lock().unwrap_or_else(|p| p.into_inner()).insert(node);
+        } else {
+            self.expanded.lock().unwrap_or_else(|p| p.into_inner()).remove(&node);
+        }
+        let id = *self.id.lock().unwrap_or_else(|p| p.into_inner());
+        let sender = self.sender.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let (Some(id), Some(sender)) = (id, sender) else {
+            // Not shown yet: mirror `tree_set_expanded`'s rule that collapsing an ancestor of the
+            // selection selects the collapsed node.
+            let hides_selection = self.selected.get().is_some_and(|s| s.len() > path.len() && s.starts_with(&path));
+            if !expanded && hides_selection {
+                self.selected.set(Some(path));
+            }
+            return Ok(());
+        };
+        send_tree_mutation(&sender, move |tree| tree.tree_set_expanded(id, node, expanded))
+    }
+
+    /// The label of the node at `path`.
+    fn label(&self, path: &Bound<'_, PyAny>) -> PyResult<String> {
+        let path = path_from_py(Some(path))?.ok_or_else(|| PyValueError::new_err("path required"))?;
+        let data = self.data.lock().unwrap_or_else(|p| p.into_inner());
+        let node = data.id_at_path(&path).ok_or_else(|| PyValueError::new_err("path does not resolve to a node"))?;
+        Ok(data.nodes[node as usize].label.clone())
+    }
+
+    /// Rename the node at `path`, keeping expand state, selection and scroll. Works before
+    /// attaching. Copies the tree once per call while the window shares it, so it's meant for
+    /// edits, not bulk updates (use `set_nodes`).
+    fn set_label(&self, path: &Bound<'_, PyAny>, label: String) -> PyResult<()> {
+        let path = path_from_py(Some(path))?.ok_or_else(|| PyValueError::new_err("path required"))?;
+        let data = {
+            let mut data = self.data.lock().unwrap_or_else(|p| p.into_inner());
+            let node =
+                data.id_at_path(&path).ok_or_else(|| PyValueError::new_err("path does not resolve to a node"))?;
+            Arc::make_mut(&mut data).nodes[node as usize].label = label;
+            data.clone()
+        };
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::TreeView { data: current, .. } = kind {
+                *current = data;
+            }
+        })
+    }
+
+    /// Selected node path as a list of child indices, or `None`.
+    #[getter]
+    fn selected(&self) -> Option<Vec<usize>> {
+        self.selected.get().map(|p| p.into_iter().map(|i| i as usize).collect())
+    }
+}
+
+impl TreeView {
+    fn describe(&self) -> DescribedWidget {
+        let (on_select, on_activate) = Python::attach(|py| {
+            (
+                self.on_select.as_ref().map(|cb| cb.clone_ref(py)),
+                self.on_activate.as_ref().map(|cb| cb.clone_ref(py)),
+            )
+        });
+        let data = self.data.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let selected_path = self.selected.get();
+        let selected = selected_path.as_ref().and_then(|p| data.id_at_path(p));
+        let palette = crate::theme::palette();
+        DescribedWidget {
+            style: StyleParams::leaf(self.flex_grow, self.width, self.height),
+            kind: WidgetKind::TreeView {
+                data,
+                expanded: self.expanded.clone(),
+                row_height: self.row_height,
+                font_size: self.font_size.unwrap_or(FontSize::Small).resolve(),
+                scroll: 0.0,
+                selected,
+                text_color: rgba(self.text_color.unwrap_or(palette.text)),
+                background: rgba(self.background.unwrap_or(palette.surface_alt)),
+                selection_color: rgba(self.selection_color.unwrap_or(palette.selection)),
+                on_select: on_select.map(wrap_path_callback),
+                on_activate: on_activate.map(wrap_path_callback),
                 mirror: Some(self.selected.clone()),
             },
             id_cell: self.id.clone(),
@@ -3480,6 +4077,9 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ScrollArea>()?;
     m.add_class::<Popup>()?;
     m.add_class::<ListView>()?;
+    m.add_class::<Table>()?;
+    m.add_class::<TreeNode>()?;
+    m.add_class::<TreeView>()?;
     m.add_class::<Checkbox>()?;
     m.add_class::<Radio>()?;
     m.add_class::<Toggle>()?;
@@ -3494,4 +4094,22 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Panel>()?;
     m.add_class::<Tabs>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_table_float;
+
+    #[test]
+    fn table_floats_keep_small_and_large_magnitudes() {
+        assert_eq!(format_table_float(1.23456789), "1.234568");
+        assert_eq!(format_table_float(2.5), "2.5");
+        assert_eq!(format_table_float(-0.0), "0");
+        assert_eq!(format_table_float(1e-4), "0.0001");
+        assert_eq!(format_table_float(1e-9), "1e-9");
+        assert_eq!(format_table_float(-2.5e-7), "-2.5e-7");
+        assert_eq!(format_table_float(6.02e23), "6.02e23");
+        assert_eq!(format_table_float(1e303), "1e303");
+        assert_eq!(format_table_float(f64::NAN), "NaN");
+    }
 }
