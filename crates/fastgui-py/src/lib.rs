@@ -1,5 +1,6 @@
 mod backend;
 mod dialogs;
+mod plots;
 mod theme;
 mod widgets;
 
@@ -639,6 +640,7 @@ fn _fastgui(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Viewport>()?;
     m.add_class::<CudaSurface>()?;
     widgets::register(m)?;
+    plots::register(m)?;
     theme::register(m)?;
     dialogs::register(m)?;
     Ok(())

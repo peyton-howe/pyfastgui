@@ -238,7 +238,7 @@ fn wrap_panel_close_callback(callback: Py<PyAny>) -> PanelCloseCallback {
 /// (for `calc()` expressions, which nothing here uses) and so isn't `Send` — it can't be
 /// carried inside the `Command::MutateWidgetTree` closure directly.
 #[derive(Clone, Copy)]
-struct StyleParams {
+pub(crate) struct StyleParams {
     direction: FlexDirection,
     gap: f32,
     padding: f32,
@@ -266,7 +266,7 @@ struct StyleParams {
 }
 
 impl StyleParams {
-    fn leaf(flex_grow: f32, width: Option<f32>, height: Option<f32>) -> Self {
+    pub(crate) fn leaf(flex_grow: f32, width: Option<f32>, height: Option<f32>) -> Self {
         Self {
             direction: FlexDirection::Column,
             gap: 0.0,
@@ -406,6 +406,28 @@ pub(crate) struct DescribedWidget {
 }
 
 impl DescribedWidget {
+    /// Leaf image/plot node (no children, chrome side-tables, or hover action).
+    pub(crate) fn leaf_image(
+        style: StyleParams,
+        kind: WidgetKind,
+        id_cell: IdCell,
+        sender_cell: SenderCell,
+    ) -> Self {
+        Self {
+            style,
+            kind,
+            id_cell,
+            sender_cell,
+            children: Vec::new(),
+            splitter_bar: None,
+            tab_bar: None,
+            tooltip: None,
+            context_menu: None,
+            accelerators: Vec::new(),
+            hover_action: None,
+        }
+    }
+
     /// `Window.set_content(widget)` calls this on the outermost widget so it always fills the
     /// window, regardless of whatever size that widget's own constructor was given — matches
     /// treating "the content root" as the window's content area, not just another box.
@@ -469,6 +491,15 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
     if let Ok(w) = obj.cast::<Image>() {
         return Ok(w.borrow().describe());
     }
+    if let Ok(w) = obj.cast::<crate::plots::PlotLine>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<crate::plots::PlotScatter>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<crate::plots::PlotHeatmap>() {
+        return Ok(w.borrow().describe());
+    }
     if let Ok(w) = obj.cast::<Grid>() {
         return w.borrow().describe();
     }
@@ -495,7 +526,7 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
         return Ok(w.borrow().describe_widget());
     }
     Err(PyTypeError::new_err(
-        "expected a fastgui widget (Box, Grid, Label, Button, Slider, TextInput, TextArea, ScrollArea, ListView, Table, TreeView, Checkbox, Radio, Toggle, SpinBox, NumericScrub, ProgressBar, ComboBox, Image, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
+        "expected a fastgui widget (Box, Grid, Label, Button, Slider, TextInput, TextArea, ScrollArea, ListView, Table, TreeView, Checkbox, Radio, Toggle, SpinBox, NumericScrub, ProgressBar, ComboBox, Image, PlotLine, PlotScatter, PlotHeatmap, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
     ))
 }
 
@@ -508,6 +539,18 @@ pub(crate) fn bind_dispatch(obj: &Bound<'_, PyAny>, dispatch: &CommandDispatch) 
     }
     if let Ok(image) = obj.cast::<Image>() {
         image.borrow().bind_dispatch(dispatch.clone());
+        return;
+    }
+    if let Ok(plot) = obj.cast::<crate::plots::PlotLine>() {
+        plot.borrow().bind_dispatch(dispatch.clone());
+        return;
+    }
+    if let Ok(plot) = obj.cast::<crate::plots::PlotScatter>() {
+        plot.borrow().bind_dispatch(dispatch.clone());
+        return;
+    }
+    if let Ok(plot) = obj.cast::<crate::plots::PlotHeatmap>() {
+        plot.borrow().bind_dispatch(dispatch.clone());
         return;
     }
     if let Ok(box_widget) = obj.cast::<BoxWidget>() {

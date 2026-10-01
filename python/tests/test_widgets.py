@@ -122,6 +122,27 @@ class PropertyInspectorTests(unittest.TestCase):
         self.assertIsNotNone(widget)
 
 
+class PlotTests(unittest.TestCase):
+    def test_line_scatter_heatmap_construct_and_set_data(self):
+        import numpy as np
+
+        x = np.linspace(0.0, 1.0, 50)
+        line = fg.PlotLine(x, np.sin(x), pixel_width=120, pixel_height=80)
+        line.set_data(x, np.cos(x))
+        scatter = fg.PlotScatter([0.0, 1.0], [0.0, 1.0], pixel_width=100, pixel_height=80)
+        scatter.set_data(np.array([0.0, 0.5, 1.0]), np.array([1.0, 0.0, 1.0]))
+        heat = fg.PlotHeatmap(np.arange(16.0).reshape(4, 4), colormap="magma", pixel_width=100, pixel_height=80)
+        heat.set_data([[1.0, 2.0], [3.0, 4.0]])
+
+    def test_rejects_bad_sizes_and_colormap(self):
+        with self.assertRaises(ValueError):
+            fg.PlotLine(pixel_width=0, pixel_height=10)
+        with self.assertRaises(ValueError):
+            fg.PlotHeatmap(colormap="nope")
+        with self.assertRaises(ValueError):
+            fg.PlotLine([1.0], [1.0, 2.0])
+
+
 class PopupTests(unittest.TestCase):
     def test_closed_until_shown_and_close_is_a_no_op(self):
         popup = fg.Popup(fg.Label("hi"))

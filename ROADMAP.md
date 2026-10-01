@@ -1393,7 +1393,11 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 
 - **GPU plot widgets** (line, scatter, heatmap) fed straight from numpy or CUDA buffers —
   pyqtgraph-class functionality built in, at better frame rates. Recommended headline feature
-  once 7A–7C are in.
+  once 7A–7C are in. — **Done (first slice, 2026-10-01):** `PlotLine` / `PlotScatter` /
+  `PlotHeatmap` rasterize into RGBA8 and upload via the existing `Image` GPU layer path;
+  `set_data` is thread-safe (numpy 1-D/2-D or sequences). Colormaps: viridis / magma / gray.
+  Demo `plots_demo.py`. Follow-ups: CUDA buffer ingest, interactive pan/zoom, multi-series,
+  true GPU geometry shaders.
 - **Image/tensor viewer** on `Viewport`: zoom, pan, pixel-value readout, colormaps. Requires the
   still-missing `Viewport` aspect-ratio preservation (see M4 known simplifications).
 - **Node graph editor** — no built-in Qt equivalent.

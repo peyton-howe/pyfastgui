@@ -120,6 +120,7 @@ All under [`python/examples/`](python/examples/), runnable directly once install
 | [`table_demo.py`](python/examples/table_demo.py) | M7 7D: virtualized `Table` of 1,000,000 numpy rows with sticky header and keyboard selection. |
 | [`tree_demo.py`](python/examples/tree_demo.py) | M7 7D: `TreeView` expand/collapse, path selection, Left/Right navigation. |
 | [`inspector_demo.py`](python/examples/inspector_demo.py) | M7 7D: `PropertyInspector` (label + 7B editors) driven by a tree selection. |
+| [`plots_demo.py`](python/examples/plots_demo.py) | M7 7E: numpy-fed `PlotLine` / `PlotScatter` / `PlotHeatmap` (GPU image layers), live line update from a background thread. |
 | [`dock_layout.py`](python/examples/dock_layout.py) | A `DockArea` of resizable, titled `Panel`s with a live `Viewport` in the center. |
 | [`dock_rearrange_demo.py`](python/examples/dock_rearrange_demo.py) | Drag a panel's title bar to split or tab-merge regions, including dropping at the window's outer edge to span the whole dock area. |
 | [`tabs_demo.py`](python/examples/tabs_demo.py) | Multiple `Panel`s sharing one `DockArea` region via `Tabs`, switched by clicking a header segment. |
