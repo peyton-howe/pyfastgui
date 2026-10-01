@@ -1712,6 +1712,7 @@ impl Table {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         }
     }
 }
@@ -1982,6 +1983,7 @@ impl TreeView {
             tooltip: None,
             context_menu: None,
             accelerators: Vec::new(),
+            hover_action: None,
         }
     }
 }
