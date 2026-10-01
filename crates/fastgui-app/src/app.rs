@@ -1,14 +1,19 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fastgui_chrome::ChromeRenderer;
-use fastgui_core::widget::{DropZone, PopupPress, Rect, WidgetId, WidgetKind, WidgetTree, SPLITTER_HIT_SLOP};
+use fastgui_core::theme::chrome_theme;
+use fastgui_core::widget::{
+    Color, DropZone, PopupAnchor, PopupPress, PopupSide, Rect, WidgetId, WidgetKind, WidgetTree,
+    SPLITTER_HIT_SLOP,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{Key, ModifiersState};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::cloak::set_cloaked;
@@ -21,6 +26,15 @@ use crate::keyboard::handle_key;
 use crate::text_input::{self, KeyPress, SystemClipboard};
 use crate::resize_edge::{classify_float_resize_edge, resize_edge_cursor, ResizeEdge};
 use crate::surface::{MainResizePolicy, SurfaceBackend, ViewportDraw};
+
+/// Hover delay before a tooltip popup opens.
+const TOOLTIP_DELAY: Duration = Duration::from_millis(500);
+const TOOLTIP_PAD: f32 = 6.0;
+
+/// How long the cursor rests on a widget before its hover action runs (a menu's submenu row
+/// opening its submenu). Long enough that sweeping diagonally across other rows toward an open
+/// submenu doesn't trigger theirs; short enough to feel immediate.
+const HOVER_ACTION_DELAY: Duration = Duration::from_millis(180);
 
 /// Active edge-resize of a floating window, tracked in physical screen space so size/position
 /// updates stay stable as the window moves under the cursor.
@@ -122,6 +136,11 @@ struct FloatingWindow<B: SurfaceBackend> {
     pressed_button: Option<WidgetId>,
     last_click: Option<(Instant, (f32, f32))>,
     ime_allowed: bool,
+    /// Hovered widget in this floater (flat hover fills, `on_hover` actions such as submenu
+    /// hover-open), when it became hovered, and whether its hover action already ran.
+    hover_id: Option<WidgetId>,
+    hover_since: Instant,
+    hover_action_done: Option<WidgetId>,
 }
 
 /// A scrollbar thumb being dragged: the `ScrollArea`, which bar, and where along the bar the
@@ -214,6 +233,16 @@ struct App<B: SurfaceBackend> {
         f32,
         Box<dyn FnOnce(&mut WidgetTree) + Send>,
     )>,
+    /// Widget under the cursor for tooltip timing (main window).
+    hover_id: Option<WidgetId>,
+    hover_since: Instant,
+    /// Open tooltip popup node, if any.
+    tooltip_popup: Option<WidgetId>,
+    /// The widget whose tooltip the user dismissed (click, scroll, key): it stays closed until
+    /// the cursor moves to another widget, instead of reopening after the hover delay.
+    tooltip_dismissed_for: Option<WidgetId>,
+    /// The hovered widget whose hover action already ran this visit (it runs once per visit).
+    hover_action_done: Option<WidgetId>,
     error: Option<RunError<B::Error>>,
 }
 
@@ -250,6 +279,10 @@ impl<B: SurfaceBackend> App<B> {
                 Command::MutateWidgetTree(mutation) => {
                     mutation(&mut self.widget_tree);
                     self.has_widget_content = true;
+                    // Most mutations (a label's `set_text`, a popup opening) leave the tooltip
+                    // and hover target alone; only drop handles to widgets that are gone (a
+                    // `set_content` rebuild removes every popup, the tooltip included).
+                    self.forget_removed_hover_state();
                 }
                 Command::MutateFloatingTree { region_id, mutation } => {
                     if let Some(&window_id) = self.floating_by_region.get(&region_id) {
@@ -420,6 +453,9 @@ impl<B: SurfaceBackend> App<B> {
             pressed_button: None,
             last_click: None,
             ime_allowed: false,
+            hover_id: None,
+            hover_since: Instant::now(),
+            hover_action_done: None,
         };
         self.floating_by_region.insert(region_id, window_id);
         self.floating.insert(window_id, floater);
@@ -570,7 +606,249 @@ impl<B: SurfaceBackend> App<B> {
         draws
     }
 
+    /// Drop tooltip/hover handles whose widgets no longer exist (after a tree mutation).
+    fn forget_removed_hover_state(&mut self) {
+        let tree = &self.widget_tree;
+        if self.tooltip_popup.is_some_and(|id| !matches!(tree.kind(id), Some(WidgetKind::Popup { .. }))) {
+            self.tooltip_popup = None;
+        }
+        if self.hover_id.is_some_and(|id| tree.kind(id).is_none()) {
+            self.hover_id = None;
+        }
+        if self.widget_tree.hovered().is_some_and(|id| self.widget_tree.kind(id).is_none()) {
+            self.widget_tree.set_hovered(None);
+        }
+    }
+
+    /// Close the tooltip because the user did something (click, scroll, key) and keep the
+    /// hovered widget's tooltip closed until the cursor moves to another widget.
+    fn suppress_tooltip(&mut self) {
+        self.dismiss_tooltip();
+        self.tooltip_dismissed_for = self.hover_id;
+    }
+
+    /// The cursor left the window: nothing is hovered, and no tooltip opens.
+    fn clear_hover(&mut self) {
+        self.dismiss_tooltip();
+        self.hover_id = None;
+        self.tooltip_dismissed_for = None;
+        self.hover_action_done = None;
+        if self.widget_tree.set_hovered(None) {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn dismiss_tooltip(&mut self) {
+        if let Some(id) = self.tooltip_popup.take() {
+            if matches!(self.widget_tree.kind(id), Some(WidgetKind::Popup { .. })) {
+                self.widget_tree.close_popup(id);
+            }
+        }
+    }
+
+    /// True when a non-tooltip popup (menu, combo, dialog) is open and should block tooltips.
+    fn tooltip_blocked(&self) -> bool {
+        match self.widget_tree.topmost_popup() {
+            None => false,
+            Some(id) => Some(id) != self.tooltip_popup,
+        }
+    }
+
+    fn update_hover_for_tooltip(&mut self) {
+        let mut hit = self.widget_tree.hit_test(self.cursor.0, self.cursor.1);
+        // Cursor over the tooltip itself keeps the original hover target.
+        if let (Some(id), Some(tip)) = (hit, self.tooltip_popup) {
+            if id == tip || self.widget_tree.popup_of(id) == Some(tip) {
+                hit = self.hover_id;
+            }
+        }
+        if hit != self.hover_id {
+            self.dismiss_tooltip();
+            self.hover_id = hit;
+            self.hover_since = Instant::now();
+            self.tooltip_dismissed_for = None;
+            self.hover_action_done = None;
+        }
+    }
+
+    /// Drive button/menu hover fills; redraw when the hovered widget changes.
+    fn update_hovered_widget(&mut self) {
+        let hit = self.widget_tree.hit_test(self.cursor.0, self.cursor.1);
+        if self.widget_tree.set_hovered(hit) {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    /// Run the hovered widget's hover action once the cursor has rested on it long enough.
+    fn maybe_run_hover_action(&mut self) {
+        let Some(id) = self.hover_id else { return };
+        if self.hover_action_done == Some(id) || self.hover_since.elapsed() < HOVER_ACTION_DELAY {
+            return;
+        }
+        let Some(callback) = self.widget_tree.hover_action(id).cloned() else { return };
+        self.hover_action_done = Some(id);
+        forms::with_tree(&mut self.widget_tree, |_| callback());
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// When a pending hover action is due, if one is.
+    fn hover_action_deadline(&self) -> Option<Instant> {
+        let id = self.hover_id?;
+        (self.hover_action_done != Some(id) && self.widget_tree.hover_action(id).is_some())
+            .then(|| self.hover_since + HOVER_ACTION_DELAY)
+    }
+
+    fn maybe_open_tooltip(&mut self) {
+        if self.tooltip_popup.is_some() || self.tooltip_blocked() || self.tooltip_dismissed_for == self.hover_id {
+            return;
+        }
+        let Some(id) = self.hover_id else { return };
+        if self.hover_since.elapsed() < TOOLTIP_DELAY {
+            return;
+        }
+        let Some(text) = self.widget_tree.tooltip(id).map(str::to_owned) else { return };
+        if self.widget_tree.kind(id).is_none() {
+            return;
+        }
+        let theme = chrome_theme();
+        // Soft side pick: prefer below, but open above when the target sits in the lower third.
+        let side = match self.widget_tree.absolute_rect(id) {
+            Some(r) if r.y + r.height > self.height as f32 * (2.0 / 3.0) => PopupSide::Above,
+            _ => PopupSide::Below,
+        };
+        let kind = WidgetKind::Popup {
+            anchor: PopupAnchor::WidgetCentered(id, side),
+            modal: false,
+            background: theme.surface_alt,
+            border: theme.border,
+            on_dismiss: None,
+            restore_focus: None,
+            click_through: false,
+            closes_on_anchor_click: true,
+            open: None,
+        };
+        let fg = theme.text;
+        let popup = self.widget_tree.open_popup_no_focus(kind, |tree, popup| {
+            use fastgui_core::taffy::prelude::{FlexDirection, LengthPercentage, Style};
+            let pad = Style {
+                padding: fastgui_core::taffy::prelude::Rect {
+                    left: LengthPercentage::length(TOOLTIP_PAD),
+                    right: LengthPercentage::length(TOOLTIP_PAD),
+                    top: LengthPercentage::length(TOOLTIP_PAD),
+                    bottom: LengthPercentage::length(TOOLTIP_PAD),
+                },
+                flex_direction: FlexDirection::Column,
+                ..Default::default()
+            };
+            let wrap = tree.new_node(
+                pad,
+                WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+            );
+            tree.add_child(popup, wrap);
+            let label = tree.new_node(
+                Default::default(),
+                WidgetKind::Label { text, font_size: 12.0, color: fg },
+            );
+            tree.add_child(wrap, label);
+        });
+        self.tooltip_popup = Some(popup);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Floater counterpart of `update_hover_for_tooltip` + `update_hovered_widget` (no tooltips).
+    fn update_floating_hover(floater: &mut FloatingWindow<B>) {
+        let hit = floater.widget_tree.hit_test(floater.cursor.0, floater.cursor.1);
+        if hit != floater.hover_id {
+            floater.hover_id = hit;
+            floater.hover_since = Instant::now();
+            floater.hover_action_done = None;
+        }
+        if floater.widget_tree.set_hovered(hit) {
+            floater.window.request_redraw();
+        }
+    }
+
+    fn floating_hover_action_deadline(floater: &FloatingWindow<B>) -> Option<Instant> {
+        let id = floater.hover_id?;
+        (floater.hover_action_done != Some(id) && floater.widget_tree.hover_action(id).is_some())
+            .then(|| floater.hover_since + HOVER_ACTION_DELAY)
+    }
+
+    fn maybe_run_floating_hover_actions(&mut self) {
+        let due: Vec<WindowId> = self
+            .floating
+            .iter()
+            .filter(|(_, f)| Self::floating_hover_action_deadline(f).is_some_and(|at| at <= Instant::now()))
+            .map(|(id, _)| *id)
+            .collect();
+        for window_id in due {
+            let Some(floater) = self.floating.get_mut(&window_id) else { continue };
+            let Some(id) = floater.hover_id else { continue };
+            let Some(callback) = floater.widget_tree.hover_action(id).cloned() else { continue };
+            floater.hover_action_done = Some(id);
+            forms::with_tree(&mut floater.widget_tree, |_| callback());
+            floater.window.request_redraw();
+        }
+    }
+
+    /// Floater counterpart of `handle_context_menu_press`.
+    fn handle_floating_context_menu_press(&mut self, window_id: WindowId) {
+        if self.main_modal_open() {
+            return;
+        }
+        let Some(floater) = self.floating.get_mut(&window_id) else { return };
+        let (x, y) = floater.cursor;
+        if forms::with_tree(&mut floater.widget_tree, |tree| tree.popup_press(x, y) == PopupPress::Consumed) {
+            floater.window.request_redraw();
+            return;
+        }
+        let Some(id) = floater.widget_tree.hit_test(x, y) else { return };
+        let mut node = Some(id);
+        while let Some(current) = node {
+            if let Some(callback) = floater.widget_tree.context_menu(current).cloned() {
+                callback(x, y);
+                floater.window.request_redraw();
+                return;
+            }
+            node = floater.widget_tree.parent(current);
+        }
+    }
+
+    fn handle_context_menu_press(&mut self) {
+        self.suppress_tooltip();
+        // Outside click still dismisses a non-modal menu/combo before opening a context menu.
+        if forms::with_tree(&mut self.widget_tree, |tree| {
+            tree.popup_press(self.cursor.0, self.cursor.1) == PopupPress::Consumed
+        }) {
+            return;
+        }
+        let Some(id) = self.widget_tree.hit_test(self.cursor.0, self.cursor.1) else { return };
+        // Walk up so a Label inside a Box with a context menu still finds it.
+        let mut node = Some(id);
+        while let Some(current) = node {
+            if let Some(callback) = self.widget_tree.context_menu(current).cloned() {
+                callback(self.cursor.0, self.cursor.1);
+                if self.widget_tree.is_dirty() {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                return;
+            }
+            node = self.widget_tree.parent(current);
+        }
+    }
+
     fn handle_mouse_press(&mut self) {
+        self.suppress_tooltip();
         // An outside click closes the open popup (or hits a modal one's backdrop) and stops here.
         if forms::with_tree(&mut self.widget_tree, |tree| {
             tree.popup_press(self.cursor.0, self.cursor.1) == PopupPress::Consumed
@@ -589,8 +867,12 @@ impl<B: SurfaceBackend> App<B> {
             return;
         }
         let hit = self.widget_tree.hit_test(self.cursor.0, self.cursor.1);
-        // Clicking a focusable widget focuses it; clicking anything else clears focus.
-        self.widget_tree.set_focus(hit);
+        // Clicking a focusable widget focuses it; clicking anything else clears focus — except
+        // flat buttons (menu titles/rows, toolbar chrome), which leave focus where it was so
+        // e.g. Edit > Copy still acts on the focused text field.
+        if !is_flat_button(&self.widget_tree, hit) {
+            self.widget_tree.set_focus(hit);
+        }
         let Some(id) = hit else { return };
         let Some(kind) = self.widget_tree.kind(id) else { return };
         match kind {
@@ -705,7 +987,17 @@ impl<B: SurfaceBackend> App<B> {
         }
     }
 
+    /// A modal popup (dialog) is open in the main window: it's application-modal, so floating
+    /// panels take no clicks or keys until it closes.
+    fn main_modal_open(&self) -> bool {
+        let tree = &self.widget_tree;
+        tree.topmost_popup().is_some_and(|p| matches!(tree.kind(p), Some(WidgetKind::Popup { modal: true, .. })))
+    }
+
     fn handle_floating_mouse_press(&mut self, window_id: WindowId) {
+        if self.main_modal_open() {
+            return;
+        }
         let Some(floater) = self.floating.get(&window_id) else { return };
         let cursor = floater.cursor;
         let region_id = floater.region_id;
@@ -748,7 +1040,9 @@ impl<B: SurfaceBackend> App<B> {
         }
         let hit = floater.widget_tree.hit_test(cursor.0, cursor.1);
         let Some(floater) = self.floating.get_mut(&window_id) else { return };
-        floater.widget_tree.set_focus(hit);
+        if !is_flat_button(&floater.widget_tree, hit) {
+            floater.widget_tree.set_focus(hit);
+        }
         let floater = &*floater;
         let Some(id) = hit else { return };
         let Some(kind) = floater.widget_tree.kind(id) else { return };
@@ -1671,7 +1965,18 @@ impl<B: SurfaceBackend> App<B> {
                 window.request_redraw();
             }
         }
-        event_loop.set_control_flow(ControlFlow::Wait);
+        // Wake when a hovered tooltip's delay or a hover action's delay elapses.
+        let tooltip_due = (self.tooltip_popup.is_none()
+            && !self.tooltip_blocked()
+            && self.tooltip_dismissed_for != self.hover_id
+            && self.hover_id.is_some_and(|id| self.widget_tree.tooltip(id).is_some()))
+        .then(|| self.hover_since + TOOLTIP_DELAY);
+        let floater_hover = self.floating.values().filter_map(Self::floating_hover_action_deadline);
+        let next = [tooltip_due, self.hover_action_deadline()].into_iter().flatten().chain(floater_hover).min();
+        match next {
+            Some(at) if at > Instant::now() => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            _ => event_loop.set_control_flow(ControlFlow::Wait),
+        }
     }
 }
 
@@ -1814,6 +2119,10 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                     self.update_panel_drag_hover();
                     self.update_tear_ghost(event_loop);
                 }
+                if !dragging {
+                    self.update_hover_for_tooltip();
+                    self.update_hovered_widget();
+                }
                 self.update_cursor_icon();
                 if dragging && self.last_drag_render.elapsed() >= DRAG_RENDER_INTERVAL {
                     self.render_now(event_loop);
@@ -1842,40 +2151,54 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                         || self.dragging_text.is_some()
                         || self.dragging_scrub.is_some()
                         || self.dragging_scrollbar.is_some();
+                    let pressed = self.pressed_button.take();
                     self.dragging_slider = None;
                     self.dragging_splitter = None;
                     self.dragging_text = None;
                     self.dragging_scrub = None;
                     self.dragging_scrollbar = None;
-                    let pressed = self.pressed_button.take();
                     let cursor = self.cursor;
                     forms::with_tree(&mut self.widget_tree, |tree| {
                         release_button(tree, pressed, cursor);
                     });
+                    // Menu item `on_click` queues `Popup.close` on the command channel — drain
+                    // it now so the menu disappears on this click instead of waiting for an
+                    // outside click to force a redraw.
+                    self.drain_commands(event_loop);
                     // Floater OS-window drag is owned by the floater's mouse-up path.
                     if self.dragging_from_floating.is_none() {
                         self.handle_panel_drop();
                     }
                     self.update_cursor_icon();
-                    if was_dragging || self.widget_tree.is_dirty() {
-                        if was_dragging {
-                            self.render_now(event_loop);
-                        } else if let Some(window) = &self.window {
-                            window.request_redraw();
-                        }
+                    if was_dragging || pressed.is_some() || self.widget_tree.is_dirty() {
+                        self.render_now(event_loop);
                     }
                 }
             },
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                self.handle_context_menu_press();
+            }
+            WindowEvent::CursorLeft { .. } => self.clear_hover(),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                let press = key_press(&event, self.modifiers);
-                if handle_key(&mut self.widget_tree, &press, &mut self.chrome, &mut self.clipboard) {
+                let plain = event.key_without_modifiers();
+                let press = key_press(&event, &plain, self.modifiers);
+                // Any key closes the tooltip (so Escape then acts on a menu or focus, not the
+                // tooltip) and keeps it closed until the cursor moves to another widget.
+                let had_tooltip = self.tooltip_popup.is_some();
+                self.suppress_tooltip();
+                if handle_key(&mut self.widget_tree, &press, &mut self.chrome, &mut self.clipboard) || had_tooltip {
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                self.suppress_tooltip();
                 let (dx, dy) = wheel_delta(delta, self.scale_factor);
                 if self.widget_tree.scroll_at(self.cursor.0, self.cursor.1, dx, dy) {
                     self.render_now(event_loop);
@@ -1907,6 +2230,9 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.maybe_run_hover_action();
+        self.maybe_run_floating_hover_actions();
+        self.maybe_open_tooltip();
         self.schedule_control_flow(event_loop);
     }
 }
@@ -2005,6 +2331,11 @@ impl<B: SurfaceBackend> App<B> {
                 } else if dragging_window {
                     self.update_dragged_floating_panel();
                 }
+                if !(dragging_widget || dragging_window || resizing) {
+                    if let Some(floater) = self.floating.get_mut(&window_id) {
+                        Self::update_floating_hover(floater);
+                    }
+                }
                 self.update_floating_cursor_icon(window_id);
                 if (dragging_widget || dragging_window || resizing)
                     && self.last_drag_render.elapsed() >= DRAG_RENDER_INTERVAL
@@ -2036,36 +2367,49 @@ impl<B: SurfaceBackend> App<B> {
                     }) || self.dragging_floating_panel.is_some_and(|(id, _)| id == window_id)
                         || self.dragging_floating_resize.as_ref().is_some_and(|d| d.window_id == window_id)
                         || self.dragging_from_floating.is_some();
+                    let pressed = self.floating.get_mut(&window_id).and_then(|f| f.pressed_button.take());
                     if let Some(floater) = self.floating.get_mut(&window_id) {
                         floater.dragging_slider = None;
                         floater.dragging_splitter = None;
                         floater.dragging_text = None;
                         floater.dragging_scrub = None;
                         floater.dragging_scrollbar = None;
-                        let pressed = floater.pressed_button.take();
                         let cursor = floater.cursor;
                         forms::with_tree(&mut floater.widget_tree, |tree| {
                             release_button(tree, pressed, cursor);
                         });
                     }
+                    self.drain_commands(event_loop);
                     self.dragging_floating_panel = None;
                     self.dragging_floating_resize = None;
                     self.handle_panel_drop();
                     self.update_floating_cursor_icon(window_id);
-                    let floater_dirty =
-                        self.floating.get(&window_id).is_some_and(|f| f.widget_tree.is_dirty());
-                    if was_dragging {
+                    let dirty = self.floating.get(&window_id).is_some_and(|f| f.widget_tree.is_dirty());
+                    if was_dragging || pressed.is_some() || dirty {
                         self.render_now(event_loop);
-                    } else if floater_dirty {
-                        if let Some(floater) = self.floating.get(&window_id) {
-                            floater.window.request_redraw();
-                        }
                     }
                 }
             },
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => self.handle_floating_context_menu_press(window_id),
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(floater) = self.floating.get_mut(&window_id) {
+                    floater.hover_id = None;
+                    if floater.widget_tree.set_hovered(None) {
+                        floater.window.request_redraw();
+                    }
+                }
+            }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                let press = key_press(&event, self.modifiers);
+                if self.main_modal_open() {
+                    return;
+                }
+                let plain = event.key_without_modifiers();
+                let press = key_press(&event, &plain, self.modifiers);
                 if let Some(floater) = self.floating.get_mut(&window_id) {
                     if handle_key(&mut floater.widget_tree, &press, &mut floater.chrome, &mut self.clipboard) {
                         floater.window.request_redraw();
@@ -2140,8 +2484,8 @@ fn is_text_input(tree: &WidgetTree, id: WidgetId) -> bool {
     matches!(tree.kind(id), Some(WidgetKind::TextInput { .. } | WidgetKind::TextArea { .. }))
 }
 
-fn key_press(event: &KeyEvent, modifiers: ModifiersState) -> KeyPress<'_> {
-    KeyPress { key: &event.logical_key, text: event.text.as_deref(), modifiers }
+fn key_press<'a>(event: &'a KeyEvent, plain: &'a Key, modifiers: ModifiersState) -> KeyPress<'a> {
+    KeyPress { key: &event.logical_key, plain: Some(plain), text: event.text.as_deref(), modifiers }
 }
 
 /// Mouse-up after pressing `pressed`: activate it if the cursor is still over it.
@@ -2256,6 +2600,11 @@ pub fn run<B: SurfaceBackend>(
         floating: HashMap::new(),
         floating_by_region: HashMap::new(),
         pending_floaters: Vec::new(),
+        hover_id: None,
+        hover_since: Instant::now(),
+        tooltip_popup: None,
+        tooltip_dismissed_for: None,
+        hover_action_done: None,
         error: None,
     };
     event_loop.run_app(&mut app)?;
@@ -2263,6 +2612,11 @@ pub fn run<B: SurfaceBackend>(
         Some(err) => Err(err),
         None => Ok(()),
     }
+}
+
+/// Whether `hit` is a flat `Button` (menu title/row chrome): pressing one keeps keyboard focus.
+fn is_flat_button(tree: &WidgetTree, hit: Option<WidgetId>) -> bool {
+    matches!(hit.and_then(|id| tree.kind(id)), Some(WidgetKind::Button { flat: true, .. }))
 }
 
 #[cfg(test)]
@@ -2288,6 +2642,7 @@ mod tests {
                 font_size: 14.0,
                 text_color: Color::TRANSPARENT,
                 background: Color::TRANSPARENT,
+                flat: false,
                 on_click: Some(Arc::new(move || {
                     counter.fetch_add(1, Ordering::SeqCst);
                 })),

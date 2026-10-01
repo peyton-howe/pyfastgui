@@ -1349,11 +1349,31 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 
 ### 7C. Tier 2 — application structure
 
-- Menu bar, context menus, keyboard shortcuts / accelerators
-- Toolbar, status bar
-- Tooltips
-- Modal and modeless dialogs; native file/color pickers via the OS (e.g. the `rfd` crate)
-- Group box, collapsible section, stacked widget (one child visible at a time)
+- **Review + Linux-testing follow-ups (2026-09-30):** submenus open on hover (180 ms rest;
+  `Button(on_hover=)`, `Popup(closes_on_anchor_click=)`); long menus are capped to the room
+  beside their anchor and scroll; a shortcut closes open menus before running; a modal dialog in
+  the main window blocks input to floating windows (app-modal); floating windows get hover,
+  submenu hover-open and right-click; shortcut labels read Ctrl/Cmd per platform; Toggle keeps
+  its natural size; `Button.set_background` survives rebuilds. **Still open:** tooltips in
+  floating windows; hovering between menu bar titles while one is open; Alt mnemonics / F10;
+  arrow-key menu navigation also drives non-menu popups that contain flat buttons; a submenu
+  with no room on either side overlaps its parent instead of flipping; without a desktop portal,
+  file dialogs return `None` (same as cancel).
+
+- Menu bar, context menus, keyboard shortcuts / accelerators — **Done (2026-09-29):**
+  hover tooltips (~500ms, no focus steal), Python `Menu`/`MenuBar`/`MenuItem`/`MenuSeparator`,
+  right-click `context_menu=`, `Accel` parse + tree side-table, nested submenus, check/radio/icon
+  rows, arrow-key menu navigation (flat rows via hover), demo `menus_demo.py`.
+- Toolbar, status bar — **Done (2026-09-29):** `Toolbar` / `StatusBar` Python composites;
+  demos `menus_demo.py` and `app_chrome_demo.py`.
+- Tooltips — **Done** with the menus work above: soft placement (`WidgetCentered`, prefer above
+  near the bottom edge) and themed chrome (`ChromeTheme.surface_alt` / `text` / `border`).
+- Modal and modeless dialogs; native file/color pickers — **Done (2026-09-29):** `Dialog` over
+  `Popup`; `open_file_dialog` / `save_file_dialog` via `rfd`; in-app `pick_color` (rfd has no
+  color dialog). Demo: `app_chrome_demo.py`.
+- Group box, collapsible section, stacked widget — **Done (2026-09-29):** `GroupBox`,
+  `CollapsibleSection`, `StackedWidget` via `Box.set_display` / `visible=`; demo
+  `app_chrome_demo.py`.
 
 ### 7D. Tier 3 — data views
 

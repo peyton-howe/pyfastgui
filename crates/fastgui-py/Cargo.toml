@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 fastgui-core = { path = "../fastgui-core" }
 fastgui-interop-cuda = { path = "../fastgui-interop-cuda" }
 pyo3 = { version = "0.29", features = ["extension-module"] }
+rfd = "0.15"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 fastgui-render-mtl = { path = "../fastgui-render-mtl" }

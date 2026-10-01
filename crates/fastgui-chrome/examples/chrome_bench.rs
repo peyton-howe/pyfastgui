@@ -120,6 +120,7 @@ fn build() -> Demo {
                     font_size: 14.0,
                     text_color: text,
                     background: Color([0.25, 0.3, 0.4, 1.0]),
+                    flat: false,
                     on_click: None,
                 },
             );

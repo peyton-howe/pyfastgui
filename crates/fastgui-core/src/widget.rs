@@ -38,6 +38,119 @@ pub type IndexCallback = Arc<dyn Fn(usize) + Send + Sync>;
 pub type TextCallback = Arc<dyn Fn(String) + Send + Sync>;
 /// Fired when the user clicks a panel/tab close control — argument is that panel's region id.
 pub type PanelCloseCallback = Arc<dyn Fn(u64) + Send + Sync>;
+/// Right-click context menu: window coordinates of the press.
+pub type PointCallback = Arc<dyn Fn(f32, f32) + Send + Sync>;
+
+/// A keyboard accelerator (`Ctrl+S`, `Cmd+Shift+N`, …). `primary` is Cmd on macOS and Ctrl
+/// elsewhere; both `Cmd` and `Ctrl` in the shortcut string set it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Accel {
+    pub key: AccelKey,
+    pub primary: bool,
+    pub shift: bool,
+    pub alt: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccelKey {
+    /// Lowercase letter or digit.
+    Char(char),
+    /// Function key 1..=12.
+    F(u8),
+    /// A non-character key commonly used in menu shortcuts (`Del`, `Enter`, `Home`, …).
+    Named(AccelNamed),
+}
+
+/// Named keys an `Accel` can use. Escape is left out: it dismisses popups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccelNamed {
+    Delete,
+    Backspace,
+    Enter,
+    Tab,
+    Space,
+    Insert,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl AccelNamed {
+    fn parse(lower: &str) -> Option<Self> {
+        Some(match lower {
+            "del" | "delete" => Self::Delete,
+            "backspace" => Self::Backspace,
+            "enter" | "return" => Self::Enter,
+            "tab" => Self::Tab,
+            "space" => Self::Space,
+            "ins" | "insert" => Self::Insert,
+            "home" => Self::Home,
+            "end" => Self::End,
+            "pgup" | "pageup" => Self::PageUp,
+            "pgdn" | "pagedown" => Self::PageDown,
+            "up" => Self::Up,
+            "down" => Self::Down,
+            "left" => Self::Left,
+            "right" => Self::Right,
+            _ => return None,
+        })
+    }
+}
+
+impl Accel {
+    /// Parse `"Ctrl+S"`, `"Cmd+Shift+N"`, `"Alt+F4"`, etc. Returns `None` for empty/unknown
+    /// tokens, or for `Alt+F4` (left to the OS).
+    pub fn parse(s: &str) -> Option<Self> {
+        let mut primary = false;
+        let mut shift = false;
+        let mut alt = false;
+        let mut key = None;
+        for raw in s.split('+') {
+            let token = raw.trim();
+            if token.is_empty() {
+                return None;
+            }
+            let lower = token.to_ascii_lowercase();
+            match lower.as_str() {
+                "ctrl" | "control" | "cmd" | "command" | "super" | "meta" => primary = true,
+                "shift" => shift = true,
+                "alt" | "option" => alt = true,
+                _ => {
+                    if key.is_some() {
+                        return None;
+                    }
+                    if let Some(n) = lower.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
+                        if (1..=12).contains(&n) {
+                            key = Some(AccelKey::F(n));
+                            continue;
+                        }
+                    }
+                    if let Some(named) = AccelNamed::parse(&lower) {
+                        key = Some(AccelKey::Named(named));
+                        continue;
+                    }
+                    let mut chars = token.chars();
+                    let c = chars.next()?;
+                    if chars.next().is_some() {
+                        return None;
+                    }
+                    key = Some(AccelKey::Char(c.to_ascii_lowercase()));
+                }
+            }
+        }
+        let key = key?;
+        // Alt+F4 closes windows on common desktops — don't claim it as an app shortcut.
+        if alt && !primary && !shift && key == AccelKey::F(4) {
+            return None;
+        }
+        Some(Self { key, primary, shift, alt })
+    }
+}
 
 /// Width/height of the drawn × square in a title bar or tab segment (layout units).
 pub const CLOSE_BUTTON_SIZE: f32 = 22.0;
@@ -55,10 +168,22 @@ const CLOSE_MAX_WIDTH_FRACTION: f32 = 0.4;
 pub enum PopupAnchor {
     /// Next to a widget, on `side` (flipped to the opposite side when there's no room there).
     Widget(WidgetId, PopupSide),
+    /// Like `Widget`, but centers on the cross-axis (tooltips under/over their target).
+    WidgetCentered(WidgetId, PopupSide),
     /// With its top-left at a window point (flipped up/left near the window's far edges).
     Point(f32, f32),
     /// Centered in the window (dialogs).
     Center,
+}
+
+impl PopupAnchor {
+    /// The widget this popup is attached to, if it's attached to one.
+    pub fn widget(self) -> Option<WidgetId> {
+        match self {
+            PopupAnchor::Widget(id, _) | PopupAnchor::WidgetCentered(id, _) => Some(id),
+            PopupAnchor::Point(..) | PopupAnchor::Center => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,6 +318,9 @@ pub enum WidgetKind {
         font_size: f32,
         text_color: Color,
         background: Color,
+        /// Menu-bar / tool-strip style: compact padding, fill only while hovered (or when the
+        /// caller sets a non-transparent `background` for an open/selected state).
+        flat: bool,
         on_click: Option<ClickCallback>,
     },
     Slider {
@@ -341,6 +469,14 @@ pub enum WidgetKind {
         border: Color,
         on_dismiss: Option<ClickCallback>,
         restore_focus: Option<WidgetId>,
+        /// A click outside that dismisses this popup also reaches what's under it (menu bar
+        /// menus: clicking another title switches menus in one click). Otherwise the click is
+        /// spent dismissing it.
+        click_through: bool,
+        /// A click on the widget this popup is anchored to closes it (a combo box or menu
+        /// title toggles its popup). `false` keeps it open and lets the click reach the anchor
+        /// instead (a submenu's row, which only ever opens it).
+        closes_on_anchor_click: bool,
         open: Option<Readback<bool>>,
     },
     /// A GPU/CPU image rect composited on top of chrome. `frames` is the same latest-wins
@@ -454,10 +590,12 @@ pub enum WidgetKind {
 
 impl WidgetKind {
     /// Whether this widget can take keyboard focus (click or Tab to it).
+    /// Flat buttons (menu titles / rows) stay clickable and hoverable but skip focus so they
+    /// don't draw the accent focus ring — native menu chrome doesn't show that outline.
     pub fn is_focusable(&self) -> bool {
         matches!(
             self,
-            WidgetKind::Button { .. }
+            WidgetKind::Button { flat: false, .. }
                 | WidgetKind::Slider { .. }
                 | WidgetKind::TextInput { .. }
                 | WidgetKind::TextArea { .. }
@@ -625,6 +763,19 @@ pub struct WidgetTree {
     /// The widget keyboard input goes to (see `fastgui-app`'s key handling). Cleared by
     /// `reset`, so a `set_content` rebuild starts unfocused.
     focused: Option<WidgetId>,
+    /// Hover tooltips (`WidgetTree::set_tooltip`), cleared on `reset`.
+    tooltips: HashMap<WidgetId, String>,
+    /// Right-click handlers (`WidgetTree::set_context_menu`), cleared on `reset`.
+    context_menus: HashMap<WidgetId, PointCallback>,
+    /// Hover actions (`set_hover_action`): run once the cursor has rested on the widget for a
+    /// moment — a menu's submenu row opening its submenu. Cleared on `reset`.
+    hover_actions: HashMap<WidgetId, ClickCallback>,
+    /// Menu / MenuBar shortcuts registered at attach, cleared on `reset`.
+    /// Keyboard shortcuts, each with the widget that registered it (if any) so closing a popup
+    /// that contained that widget drops its shortcuts along with its side-table entries.
+    accelerators: Vec<(Option<WidgetId>, Accel, ClickCallback)>,
+    /// Widget under the cursor (for hover fills). Cleared on `reset`.
+    hovered: Option<WidgetId>,
 }
 
 /// Always fills the window: whatever `Window.set_content(widget)` was given becomes this
@@ -652,6 +803,11 @@ impl WidgetTree {
             clip_rects: HashMap::new(),
             scroll_content: HashMap::new(),
             focused: None,
+            tooltips: HashMap::new(),
+            context_menus: HashMap::new(),
+            hover_actions: HashMap::new(),
+            accelerators: Vec::new(),
+            hovered: None,
         }
     }
 
@@ -661,6 +817,10 @@ impl WidgetTree {
 
     pub fn kind(&self, id: WidgetId) -> Option<&WidgetKind> {
         self.kinds.get(&id)
+    }
+
+    pub fn parent(&self, id: WidgetId) -> Option<WidgetId> {
+        self.taffy.parent(id)
     }
 
     pub fn style(&self, id: WidgetId) -> Option<&Style> {
@@ -686,6 +846,11 @@ impl WidgetTree {
         self.absolute_rects.clear();
         self.clip_rects.clear();
         self.scroll_content.clear();
+        self.tooltips.clear();
+        self.context_menus.clear();
+        self.hover_actions.clear();
+        self.accelerators.clear();
+        self.hovered = None;
         self.root = self.taffy.new_leaf(root_style()).expect("creating the root node cannot fail");
         self.kinds.insert(self.root, WidgetKind::Container { background: Color::TRANSPARENT, region_id: None });
         self.focused = None;
@@ -780,6 +945,10 @@ impl WidgetTree {
     pub fn mutate_kind(&mut self, id: WidgetId, f: impl FnOnce(&mut WidgetKind)) {
         if let Some(kind) = self.kinds.get_mut(&id) {
             f(kind);
+            // Dirty the node itself (taffy propagates to the root) so a text change re-measures
+            // it — marking only the root keeps the old cached size, and a shrink-to-fit Label
+            // then clips its new text to the old width.
+            let _ = self.taffy.mark_dirty(id);
             self.mark_dirty();
         }
     }
@@ -813,6 +982,7 @@ impl WidgetTree {
     }
 
     fn layout(&mut self, width: f32, height: f32, mut measure: Option<&mut (dyn TextMeasure + '_)>) {
+        self.cap_popup_heights(height);
         let available = Size { width: AvailableSpace::Definite(width), height: AvailableSpace::Definite(height) };
         let kinds = &self.kinds;
         let _ = self.taffy.compute_layout_with_measure(
@@ -881,6 +1051,23 @@ impl WidgetTree {
             }
         }
         self.place_popups(width, height);
+    }
+
+    /// Limit each popup's height to the room beside its anchor (`popup_max_height`), so a long
+    /// menu scrolls (its content sits in a `ScrollArea`) instead of running off the window.
+    /// Anchor rects come from the previous layout; anchors don't depend on popup sizes.
+    fn cap_popup_heights(&mut self, height: f32) {
+        let popups: Vec<WidgetId> = self.taffy.children(self.root).unwrap_or_default();
+        for popup in popups {
+            let Some(&WidgetKind::Popup { anchor, .. }) = self.kinds.get(&popup) else { continue };
+            let limit = popup_max_height(anchor, |id| self.absolute_rect(id), height);
+            let Some(mut style) = self.taffy.style(popup).ok().cloned() else { continue };
+            let max = Dimension::length(limit);
+            if style.max_size.height != max {
+                style.max_size.height = max;
+                let _ = self.taffy.set_style(popup, style);
+            }
+        }
     }
 
     /// Move each popup (and everything in it) to where its anchor says, now that its size and
@@ -1117,6 +1304,25 @@ impl WidgetTree {
     /// given) and focus its first focusable widget, remembering the current focus to restore on
     /// close. Returns the popup's id.
     pub fn open_popup(&mut self, kind: WidgetKind, build: impl FnOnce(&mut Self, WidgetId)) -> WidgetId {
+        self.open_popup_inner(kind, build, true)
+    }
+
+    /// Like `open_popup`, but leaves keyboard focus alone (tooltips). `restore_focus` stays
+    /// unset so close doesn't move focus either.
+    pub fn open_popup_no_focus(
+        &mut self,
+        kind: WidgetKind,
+        build: impl FnOnce(&mut Self, WidgetId),
+    ) -> WidgetId {
+        self.open_popup_inner(kind, build, false)
+    }
+
+    fn open_popup_inner(
+        &mut self,
+        kind: WidgetKind,
+        build: impl FnOnce(&mut Self, WidgetId),
+        steal_focus: bool,
+    ) -> WidgetId {
         let style = Style {
             position: Position::Absolute,
             flex_direction: FlexDirection::Column,
@@ -1128,7 +1334,7 @@ impl WidgetTree {
             },
             ..Default::default()
         };
-        let restore = self.focused;
+        let restore = steal_focus.then_some(self.focused).flatten();
         let id = self.new_node(style, kind);
         if let Some(WidgetKind::Popup { restore_focus, open, .. }) = self.kinds.get_mut(&id) {
             *restore_focus = restore;
@@ -1139,8 +1345,10 @@ impl WidgetTree {
         let root = self.root;
         self.add_child(root, id);
         build(self, id);
-        let first = self.walk_from(id).find(|&n| self.kind(n).is_some_and(WidgetKind::is_focusable));
-        self.focused = first;
+        if steal_focus {
+            let first = self.walk_from(id).find(|&n| self.kind(n).is_some_and(WidgetKind::is_focusable));
+            self.focused = first;
+        }
         id
     }
 
@@ -1156,14 +1364,97 @@ impl WidgetTree {
         if self.focused.is_none_or(|f| inside.contains(&f)) {
             self.focused = restore;
         }
+        self.accelerators.retain(|(owner, _, _)| owner.is_none_or(|o| !inside.contains(&o)));
         for node in inside {
             self.kinds.remove(&node);
             self.absolute_rects.remove(&node);
             self.clip_rects.remove(&node);
+            self.tooltips.remove(&node);
+            self.context_menus.remove(&node);
+            self.hover_actions.remove(&node);
         }
         let _ = self.taffy.remove_child(self.root, id);
         remove_subtree(&mut self.taffy, id);
         self.mark_dirty();
+    }
+
+    /// Set or clear the hover tooltip text for `id`.
+    pub fn set_tooltip(&mut self, id: WidgetId, text: Option<String>) {
+        match text {
+            Some(text) => {
+                self.tooltips.insert(id, text);
+            }
+            None => {
+                self.tooltips.remove(&id);
+            }
+        }
+        self.mark_dirty();
+    }
+
+    pub fn tooltip(&self, id: WidgetId) -> Option<&str> {
+        self.tooltips.get(&id).map(String::as_str)
+    }
+
+    /// Set or clear `id`'s hover action (see `hover_actions`).
+    pub fn set_hover_action(&mut self, id: WidgetId, callback: Option<ClickCallback>) {
+        match callback {
+            Some(callback) => {
+                self.hover_actions.insert(id, callback);
+            }
+            None => {
+                self.hover_actions.remove(&id);
+            }
+        }
+    }
+
+    pub fn hover_action(&self, id: WidgetId) -> Option<&ClickCallback> {
+        self.hover_actions.get(&id)
+    }
+
+    /// Widget under the cursor, if any — chrome uses this for hover fills on buttons/menus.
+    pub fn hovered(&self) -> Option<WidgetId> {
+        self.hovered
+    }
+
+    /// Update the hovered widget. Returns whether it changed (caller should redraw).
+    pub fn set_hovered(&mut self, id: Option<WidgetId>) -> bool {
+        if self.hovered == id {
+            return false;
+        }
+        self.hovered = id;
+        self.mark_dirty();
+        true
+    }
+
+    /// Set or clear the right-click handler for `id` (window coordinates).
+    pub fn set_context_menu(&mut self, id: WidgetId, callback: Option<PointCallback>) {
+        match callback {
+            Some(callback) => {
+                self.context_menus.insert(id, callback);
+            }
+            None => {
+                self.context_menus.remove(&id);
+            }
+        }
+    }
+
+    pub fn context_menu(&self, id: WidgetId) -> Option<&PointCallback> {
+        self.context_menus.get(&id)
+    }
+
+    /// Register a keyboard shortcut. Cleared by `reset` (e.g. `set_content`).
+    pub fn register_accelerator(&mut self, accel: Accel, callback: ClickCallback) {
+        self.accelerators.push((None, accel, callback));
+    }
+
+    /// Like `register_accelerator`, owned by `owner`: dropped when `owner` is removed with a
+    /// closed popup (e.g. a `Dialog` containing a `MenuBar`).
+    pub fn register_accelerator_for(&mut self, owner: WidgetId, accel: Accel, callback: ClickCallback) {
+        self.accelerators.push((Some(owner), accel, callback));
+    }
+
+    pub fn accelerators(&self) -> impl Iterator<Item = (&Accel, &ClickCallback)> {
+        self.accelerators.iter().map(|(_, accel, callback)| (accel, callback))
     }
 
     /// Close the topmost popup as the user did (outside click, Escape): fires its `on_dismiss`.
@@ -1191,6 +1482,25 @@ impl WidgetTree {
             .find(|id| matches!(self.kind(*id), Some(WidgetKind::Popup { .. })))
     }
 
+    /// How many popup nodes are currently open (menus, dialogs, tooltips).
+    pub fn open_popup_count(&self) -> usize {
+        self.taffy
+            .children(self.root)
+            .ok()
+            .map(|children| {
+                children
+                    .into_iter()
+                    .filter(|id| matches!(self.kind(*id), Some(WidgetKind::Popup { .. })))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Depth-first ids in `id`'s subtree (including `id`).
+    pub fn subtree_ids(&self, id: WidgetId) -> Vec<WidgetId> {
+        self.walk_from(id).collect()
+    }
+
     /// The popup `id` is inside (or is), if any.
     pub fn popup_of(&self, id: WidgetId) -> Option<WidgetId> {
         let mut node = id;
@@ -1205,18 +1515,42 @@ impl WidgetTree {
     /// What a press at `(x, y)` does with popups open: `Pass` lets it through to whatever's
     /// under it; `Consumed` means it dismissed a popup (outside click) or hit a modal popup's
     /// dimmed backdrop, and nothing else should see it.
+    ///
+    /// Outside a nested non-modal stack (submenu over menu), every popup that does not contain
+    /// the click is dismissed so one outside click closes the whole menu hierarchy. A click
+    /// that lands in a lower popup (parent menu while a submenu is open) only closes the
+    /// layers above it and then `Pass`es through.
+    ///
+    /// Popups above the one the click lands in close (a click back in a parent menu closes its
+    /// submenu). A click on a dismissed popup's own anchor — the combo box, menu title or
+    /// submenu row that opened it — only closes it: letting it through would reopen it on
+    /// release. Once every open popup is dismissed, the click goes through only if they all
+    /// have `click_through`.
     pub fn popup_press(&mut self, x: f32, y: f32) -> PopupPress {
-        let Some(top) = self.topmost_popup() else { return PopupPress::Pass };
-        if self.absolute_rect(top).is_some_and(|r| r.contains(x, y)) {
-            return PopupPress::Pass;
-        }
-        match self.kind(top) {
-            Some(WidgetKind::Popup { modal: true, .. }) => PopupPress::Consumed,
-            _ => {
-                self.dismiss_popup();
-                PopupPress::Consumed
+        let mut click_through = true;
+        while let Some(id) = self.topmost_popup() {
+            if self.absolute_rect(id).is_some_and(|r| r.contains(x, y)) {
+                return PopupPress::Pass;
+            }
+            let Some(&WidgetKind::Popup { modal, anchor, click_through: through, closes_on_anchor_click, .. }) =
+                self.kind(id)
+            else {
+                break;
+            };
+            if modal {
+                return PopupPress::Consumed;
+            }
+            let on_anchor = anchor.widget().and_then(|a| self.absolute_rect(a)).is_some_and(|r| r.contains(x, y));
+            if on_anchor && !closes_on_anchor_click {
+                return PopupPress::Pass;
+            }
+            click_through &= through;
+            self.dismiss_popup();
+            if on_anchor {
+                return PopupPress::Consumed;
             }
         }
+        if click_through { PopupPress::Pass } else { PopupPress::Consumed }
     }
 
     /// Depth-first walk of `id`'s subtree (including `id`).
@@ -1428,6 +1762,38 @@ fn place_popup(
     let (w, h) = (size.width, size.height);
     let fits_x = |x: f32| x >= POPUP_GAP && x + w <= width - POPUP_GAP;
     let fits_y = |y: f32| y >= POPUP_GAP && y + h <= height - POPUP_GAP;
+    let place_widget = |id: WidgetId, side: PopupSide, center: bool| {
+        let a = rect_of(id).unwrap_or_default();
+        let below = a.y + a.height + POPUP_GAP;
+        let above = a.y - POPUP_GAP - h;
+        // Neither side fits (a long menu): the roomier one — `popup_max_height` has already
+        // capped the popup to that side's room, so it never slides over its anchor.
+        let roomier_below = height - below >= a.y - POPUP_GAP;
+        let right = a.x + a.width + POPUP_GAP;
+        let left = a.x - POPUP_GAP - w;
+        let start_x = a.x;
+        let start_y = a.y;
+        let mid_x = a.x + (a.width - w) * 0.5;
+        let mid_y = a.y + (a.height - h) * 0.5;
+        match side {
+            PopupSide::Below => (
+                if center { mid_x } else { start_x },
+                if fits_y(below) || (!fits_y(above) && roomier_below) { below } else { above },
+            ),
+            PopupSide::Above => (
+                if center { mid_x } else { start_x },
+                if fits_y(above) || (!fits_y(below) && !roomier_below) { above } else { below },
+            ),
+            PopupSide::Right => (
+                if fits_x(right) || !fits_x(left) { right } else { left },
+                if center { mid_y } else { start_y },
+            ),
+            PopupSide::Left => (
+                if fits_x(left) || !fits_x(right) { left } else { right },
+                if center { mid_y } else { start_y },
+            ),
+        }
+    };
     let (x, y) = match anchor {
         PopupAnchor::Center => ((width - w) / 2.0, (height - h) / 2.0),
         PopupAnchor::Point(px, py) => {
@@ -1435,22 +1801,27 @@ fn place_popup(
             let y = if py + h > height - POPUP_GAP && py - h >= POPUP_GAP { py - h } else { py };
             (x, y)
         }
-        PopupAnchor::Widget(id, side) => {
-            let a = rect_of(id).unwrap_or_default();
-            let below = a.y + a.height + POPUP_GAP;
-            let above = a.y - POPUP_GAP - h;
-            let right = a.x + a.width + POPUP_GAP;
-            let left = a.x - POPUP_GAP - w;
-            match side {
-                PopupSide::Below => (a.x, if fits_y(below) || !fits_y(above) { below } else { above }),
-                PopupSide::Above => (a.x, if fits_y(above) || !fits_y(below) { above } else { below }),
-                PopupSide::Right => (if fits_x(right) || !fits_x(left) { right } else { left }, a.y),
-                PopupSide::Left => (if fits_x(left) || !fits_x(right) { left } else { right }, a.y),
-            }
-        }
+        PopupAnchor::Widget(id, side) => place_widget(id, side, false),
+        PopupAnchor::WidgetCentered(id, side) => place_widget(id, side, true),
     };
     let clamp = |v: f32, extent: f32, limit: f32| v.min(limit - POPUP_GAP - extent).max(POPUP_GAP);
     (clamp(x, w, width), clamp(y, h, height))
+}
+
+/// The tallest a popup anchored at `anchor` can be in a `height`-tall window: the room on the
+/// roomier side of a widget it opens above/below, otherwise the window less its margins.
+fn popup_max_height(anchor: PopupAnchor, rect_of: impl Fn(WidgetId) -> Option<Rect>, height: f32) -> f32 {
+    let full = (height - 2.0 * POPUP_GAP).max(0.0);
+    match anchor {
+        PopupAnchor::Widget(id, PopupSide::Below | PopupSide::Above)
+        | PopupAnchor::WidgetCentered(id, PopupSide::Below | PopupSide::Above) => {
+            let Some(a) = rect_of(id) else { return full };
+            let below = height - POPUP_GAP - (a.y + a.height + POPUP_GAP);
+            let above = a.y - 2.0 * POPUP_GAP;
+            below.max(above).clamp(0.0, full)
+        }
+        _ => full,
+    }
 }
 
 /// Free `id` and its descendants from `taffy` (it's already detached from its parent).
@@ -1511,12 +1882,13 @@ fn measure_leaf<'m>(
     };
     let content_size = match kinds.get(&node_id) {
         Some(WidgetKind::Label { text, font_size, .. }) => text_size(text, *font_size),
-        Some(WidgetKind::Button { text, font_size, .. }) => {
+        Some(WidgetKind::Button { text, font_size, flat, .. }) => {
             let text_size = text_size(text, *font_size);
             // Room for the button's own padding beyond the text itself; real padding is
             // applied via the node's taffy `Style`, this is just the intrinsic minimum.
-            const BUTTON_PADDING: f32 = 16.0;
-            Size { width: text_size.width + BUTTON_PADDING, height: text_size.height + BUTTON_PADDING }
+            // Flat (menu titles / rows): compact so the strip reads as text, not chunky controls.
+            let (pad_x, pad_y) = if *flat { (16.0, 6.0) } else { (16.0, 16.0) };
+            Size { width: text_size.width + pad_x, height: text_size.height + pad_y }
         }
         Some(WidgetKind::TextInput { font_size, .. }) => Size {
             // Wide enough to type into when nothing stretches it; the height fits one line.
@@ -1800,6 +2172,7 @@ mod tests {
                 font_size: 14.0,
                 text_color: Color::TRANSPARENT,
                 background: Color::TRANSPARENT,
+                flat: false,
                 on_click: None,
             },
         );
@@ -1872,6 +2245,7 @@ mod tests {
                     font_size: 12.0,
                     text_color: Color::TRANSPARENT,
                     background: Color::TRANSPARENT,
+                    flat: false,
                     on_click: None,
                 },
             )
@@ -1953,6 +2327,7 @@ mod tests {
                     font_size: 12.0,
                     text_color: Color::TRANSPARENT,
                     background: Color::TRANSPARENT,
+                    flat: false,
                     on_click: None,
                 },
             )
@@ -2077,6 +2452,8 @@ mod tests {
                 }) as ClickCallback
             }),
             restore_focus: None,
+            click_through: false,
+            closes_on_anchor_click: true,
             open: Some(Readback::new(false)),
         }
     }
@@ -2089,6 +2466,7 @@ mod tests {
                 font_size: 12.0,
                 text_color: Color::TRANSPARENT,
                 background: Color::TRANSPARENT,
+                flat: false,
                 on_click: None,
             },
         )
@@ -2145,6 +2523,53 @@ mod tests {
     }
 
     #[test]
+    fn popup_widget_centered_aligns_on_the_cross_axis() {
+        // Anchor at x=10 width=60; popup width 50 → centered x = 10 + 5 = 15.
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        let (popup, _) = open_menu(&mut tree, PopupAnchor::WidgetCentered(anchor, PopupSide::Below), false, 2);
+        let r = tree.absolute_rect(popup).unwrap();
+        let a = tree.absolute_rect(anchor).unwrap();
+        assert_eq!(r.y, a.y + a.height + POPUP_GAP);
+        assert!((r.x - (a.x + (a.width - r.width) * 0.5)).abs() < 0.01, "centered under anchor");
+    }
+
+    #[test]
+    fn closing_a_popup_drops_accelerators_registered_inside_it() {
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        tree.register_accelerator(Accel::parse("Ctrl+S").unwrap(), Arc::new(|| {}));
+        let mut inner = None;
+        let popup = tree.open_popup(popup_kind(PopupAnchor::Widget(anchor, PopupSide::Below), false, None), |tree, popup| {
+            let b = sized_button(tree, 40.0, 20.0);
+            tree.add_child(popup, b);
+            inner = Some(b);
+        });
+        tree.register_accelerator_for(inner.unwrap(), Accel::parse("Ctrl+K").unwrap(), Arc::new(|| {}));
+        assert_eq!(tree.accelerators().count(), 2);
+        tree.close_popup(popup);
+        let left: Vec<_> = tree.accelerators().map(|(a, _)| a.clone()).collect();
+        assert_eq!(left, vec![Accel::parse("Ctrl+S").unwrap()], "only the popup's shortcut is dropped");
+    }
+
+    #[test]
+    fn outside_press_dismisses_nested_non_modal_stack() {
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        let (parent, items) = open_menu(&mut tree, PopupAnchor::Widget(anchor, PopupSide::Below), false, 2);
+        let child = tree.open_popup(
+            popup_kind(PopupAnchor::Widget(items[0], PopupSide::Right), false, None),
+            |tree, popup| {
+                let b = sized_button(tree, 40.0, 20.0);
+                tree.add_child(popup, b);
+            },
+        );
+        tree.compute_layout(200.0, 200.0);
+        assert_eq!(tree.open_popup_count(), 2);
+        assert_eq!(tree.topmost_popup(), Some(child));
+        assert_eq!(tree.popup_press(190.0, 190.0), PopupPress::Consumed);
+        assert!(tree.kind(child).is_none() && tree.kind(parent).is_none());
+        assert_eq!(tree.open_popup_count(), 0);
+    }
+
+    #[test]
     fn outside_press_dismisses_non_modal_but_not_modal() {
         let dismissed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (mut tree, anchor) = popup_tree(10.0, 20.0);
@@ -2174,6 +2599,118 @@ mod tests {
         tree.close_popup(modal);
         tree.compute_layout(200.0, 200.0);
         assert_eq!(tree.hit_test(20.0, 25.0), Some(anchor), "gone from hit testing");
+    }
+
+    #[test]
+    fn clicking_a_popups_own_anchor_only_closes_it() {
+        // A combo box / menu title / submenu row pressed while its popup is open: the press
+        // closes the popup and stops there, so the release can't reopen it.
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        open_menu(&mut tree, PopupAnchor::Widget(anchor, PopupSide::Below), false, 1);
+        assert_eq!(tree.popup_press(20.0, 25.0), PopupPress::Consumed, "on the anchor");
+        assert!(tree.topmost_popup().is_none());
+    }
+
+    #[test]
+    fn click_through_popups_let_the_dismissing_click_reach_the_widget_under_it() {
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        let other = sized_button(&mut tree, 60.0, 20.0);
+        tree.add_child(tree.root(), other);
+        tree.compute_layout(200.0, 200.0);
+        let other_rect = tree.absolute_rect(other).unwrap();
+        let (x, y) = (other_rect.x + 5.0, other_rect.y + 5.0);
+        let kind = |through| {
+            let mut kind = popup_kind(PopupAnchor::Widget(anchor, PopupSide::Right), false, None);
+            if let WidgetKind::Popup { click_through, .. } = &mut kind {
+                *click_through = through;
+            }
+            kind
+        };
+        tree.open_popup(kind(true), |_, _| {});
+        tree.compute_layout(200.0, 200.0);
+        assert_eq!(tree.popup_press(x, y), PopupPress::Pass, "menu bar menu: the next title gets the click");
+        tree.open_popup(kind(false), |_, _| {});
+        tree.compute_layout(200.0, 200.0);
+        assert_eq!(tree.popup_press(x, y), PopupPress::Consumed, "ordinary popup: the click only dismisses");
+    }
+
+    #[test]
+    fn clicking_back_in_a_parent_menu_closes_the_submenu_and_passes() {
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        let (parent, rows) = open_menu(&mut tree, PopupAnchor::Widget(anchor, PopupSide::Below), false, 2);
+        let (child, _) = open_menu(&mut tree, PopupAnchor::Widget(rows[0], PopupSide::Right), false, 1);
+        let second = tree.absolute_rect(rows[1]).unwrap();
+        assert_eq!(tree.popup_press(second.x + 5.0, second.y + 5.0), PopupPress::Pass, "the other row gets the click");
+        assert_eq!(tree.topmost_popup(), Some(parent));
+        assert!(tree.kind(child).is_none());
+        let (_, _) = open_menu(&mut tree, PopupAnchor::Widget(rows[0], PopupSide::Right), false, 1);
+        let first = tree.absolute_rect(rows[0]).unwrap();
+        assert_eq!(tree.popup_press(first.x + 5.0, first.y + 5.0), PopupPress::Consumed, "its own row just closes it");
+        assert_eq!(tree.topmost_popup(), Some(parent));
+    }
+
+    #[test]
+    fn a_submenu_row_click_keeps_its_submenu_open() {
+        // Submenus opened on hover set `closes_on_anchor_click: false`: clicking the row again
+        // reaches the row (which only opens) instead of closing the submenu.
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        let (parent, rows) = open_menu(&mut tree, PopupAnchor::Widget(anchor, PopupSide::Below), false, 2);
+        let mut kind = popup_kind(PopupAnchor::Widget(rows[0], PopupSide::Right), false, None);
+        if let WidgetKind::Popup { closes_on_anchor_click, .. } = &mut kind {
+            *closes_on_anchor_click = false;
+        }
+        let child = tree.open_popup(kind, |_, _| {});
+        tree.compute_layout(200.0, 200.0);
+        let row = tree.absolute_rect(rows[0]).unwrap();
+        assert_eq!(tree.popup_press(row.x + 5.0, row.y + 5.0), PopupPress::Pass);
+        assert_eq!(tree.topmost_popup(), Some(child), "still open");
+        let _ = parent;
+    }
+
+    #[test]
+    fn hover_actions_are_a_side_table_cleared_with_their_widgets() {
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        tree.set_hover_action(anchor, Some(Arc::new(|| {})));
+        assert!(tree.hover_action(anchor).is_some());
+        tree.set_hover_action(anchor, None);
+        assert!(tree.hover_action(anchor).is_none());
+        let (popup, rows) = open_menu(&mut tree, PopupAnchor::Center, false, 1);
+        tree.set_hover_action(rows[0], Some(Arc::new(|| {})));
+        tree.close_popup(popup);
+        assert!(tree.hover_action(rows[0]).is_none(), "gone with the popup's content");
+    }
+
+    #[test]
+    fn a_long_menu_is_capped_to_the_room_below_its_anchor_and_scrolls() {
+        // A 40-row menu under a widget near the top of a 200-tall window: it must stay below
+        // the anchor (not slide up over it), end inside the window, keep its width, and scroll.
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        let mut area = None;
+        let popup = tree.open_popup(popup_kind(PopupAnchor::Widget(anchor, PopupSide::Below), false, None), |tree, popup| {
+            let scroll = tree.new_node(
+                Style { flex_direction: FlexDirection::Column, flex_grow: 1.0, ..Default::default() },
+                WidgetKind::ScrollArea { offset: (0.0, 0.0), background: Color::TRANSPARENT, bar_color: Color::TRANSPARENT },
+            );
+            let column = tree.new_node(
+                Style { flex_direction: FlexDirection::Column, flex_shrink: 0.0, ..Default::default() },
+                WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+            );
+            tree.add_child(popup, scroll);
+            tree.add_child(scroll, column);
+            for _ in 0..40 {
+                let row = sized_button(tree, 90.0, 20.0);
+                tree.add_child(column, row);
+            }
+            tree.set_scroll_container(scroll);
+            area = Some(scroll);
+        });
+        tree.compute_layout(200.0, 200.0);
+        let r = tree.absolute_rect(popup).unwrap();
+        let a = tree.absolute_rect(anchor).unwrap();
+        assert!(r.y >= a.y + a.height, "below its anchor, not over it: {r:?}");
+        assert!(r.y + r.height <= 200.0 - POPUP_GAP + 0.5, "ends inside the window: {r:?}");
+        assert!(r.width >= 90.0, "keeps its content's width: {r:?}");
+        assert!(tree.scroll_extent(area.unwrap()).unwrap().1 > 0.0, "the rows scroll");
     }
 
     #[test]
@@ -2442,6 +2979,41 @@ mod tests {
     }
 
     #[test]
+    fn changing_a_label_text_remeasures_it() {
+        struct Wide;
+        impl TextMeasure for Wide {
+            fn caret_x(&mut self, text: &str, _: f32, index: usize) -> f32 {
+                text[..index].chars().count() as f32 * 20.0
+            }
+            fn index_at(&mut self, _: &str, _: f32, _: f32) -> usize {
+                0
+            }
+        }
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let row = tree.new_node(
+            Style { flex_direction: FlexDirection::Row, align_items: Some(AlignItems::FLEX_START), ..Default::default() },
+            WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+        );
+        tree.add_child(root, row);
+        let label = tree.new_node(
+            Style::default(),
+            WidgetKind::Label { text: "Ready".into(), font_size: 14.0, color: Color::TRANSPARENT },
+        );
+        tree.add_child(row, label);
+        tree.compute_layout_measured(600.0, 200.0, &mut Wide);
+        let before = tree.absolute_rect(label).unwrap().width;
+        tree.mutate_kind(label, |kind| {
+            if let WidgetKind::Label { text, .. } = kind {
+                *text = "Ready and much longer".into();
+            }
+        });
+        tree.compute_layout_measured(600.0, 200.0, &mut Wide);
+        let after = tree.absolute_rect(label).unwrap().width;
+        assert!(after > before + 100.0, "set_text must re-measure a shrink-to-fit label ({before} -> {after})");
+    }
+
+    #[test]
     fn measured_layout_sizes_labels_by_real_text_width() {
         /// "Shaping" where every character is 20 wide — far wider than the 0.55 × 14 = 7.7
         /// the estimate assumes — so the result shows which one layout used.
@@ -2643,5 +3215,72 @@ mod tests {
         assert!((y - 40.0).abs() < 0.5, "wheel moved scroll_y to {y}");
         assert!(tree.set_scroll_offset(id, 0.0, 1e6));
         assert_eq!(tree.scroll_offset(id), Some((0.0, max)));
+    }
+
+    #[test]
+    fn tooltip_side_table_set_get_and_reset() {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let id = sized_button(&mut tree, 40.0, 20.0);
+        tree.add_child(root, id);
+        assert_eq!(tree.tooltip(id), None);
+        tree.set_tooltip(id, Some("Save".into()));
+        assert_eq!(tree.tooltip(id), Some("Save"));
+        tree.set_tooltip(id, None);
+        assert_eq!(tree.tooltip(id), None);
+        tree.set_tooltip(id, Some("Again".into()));
+        tree.reset();
+        assert!(tree.tooltip(id).is_none());
+    }
+
+    #[test]
+    fn open_popup_no_focus_preserves_focus() {
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        tree.set_focus(Some(anchor));
+        let popup = tree.open_popup_no_focus(
+            popup_kind(PopupAnchor::Widget(anchor, PopupSide::Below), false, None),
+            |tree, popup| {
+                let label = tree.new_node(
+                    Style {
+                        size: Size { width: Dimension::length(40.0), height: Dimension::length(16.0) },
+                        ..Default::default()
+                    },
+                    WidgetKind::Label {
+                        text: "tip".into(),
+                        font_size: 12.0,
+                        color: Color::TRANSPARENT,
+                    },
+                );
+                tree.add_child(popup, label);
+            },
+        );
+        tree.compute_layout(200.0, 200.0);
+        assert_eq!(tree.focused(), Some(anchor), "tooltip must not steal focus");
+        if let Some(WidgetKind::Popup { restore_focus, .. }) = tree.kind(popup) {
+            assert_eq!(*restore_focus, None);
+        } else {
+            panic!("expected popup");
+        }
+        tree.close_popup(popup);
+        assert_eq!(tree.focused(), Some(anchor), "focus unchanged after tooltip close");
+    }
+
+    #[test]
+    fn accel_parse_primary_shift_and_skips_alt_f4() {
+        let s = Accel::parse("Ctrl+S").unwrap();
+        assert!(s.primary && !s.shift && !s.alt && s.key == AccelKey::Char('s'));
+        let s = Accel::parse("Cmd+S").unwrap();
+        assert!(s.primary && s.key == AccelKey::Char('s'));
+        let s = Accel::parse("Shift+Ctrl+N").unwrap();
+        assert!(s.primary && s.shift && s.key == AccelKey::Char('n'));
+        let s = Accel::parse("Alt+F1").unwrap();
+        assert!(s.alt && !s.primary && s.key == AccelKey::F(1));
+        assert!(Accel::parse("Alt+F4").is_none());
+        assert!(Accel::parse("").is_none());
+        assert!(Accel::parse("Ctrl+").is_none());
+        assert_eq!(Accel::parse("Del").unwrap().key, AccelKey::Named(AccelNamed::Delete));
+        let s = Accel::parse("Ctrl+Shift+Enter").unwrap();
+        assert!(s.primary && s.shift && s.key == AccelKey::Named(AccelNamed::Enter));
+        assert!(Accel::parse("Ctrl+Bogus").is_none());
     }
 }

@@ -148,6 +148,7 @@ fn test_tree() -> TestTree {
             font_size: 14.0,
             text_color: text,
             background: Color([0.25, 0.3, 0.4, 1.0]),
+            flat: false,
             on_click: None,
         },
     );
@@ -441,6 +442,7 @@ fn focus_ring_adds_four_quads_and_rebuilds() {
             font_size: 14.0,
             text_color: Color([1.0; 4]),
             background: Color([0.2, 0.2, 0.2, 1.0]),
+            flat: false,
             on_click: None,
         },
     );
@@ -610,6 +612,7 @@ fn scroll_scene() -> (WidgetTree, WidgetId) {
             font_size: 14.0,
             text_color: Color([1.0; 4]),
             background: Color([0.3, 0.4, 0.7, 1.0]),
+            flat: false,
             on_click: None,
         },
     );
@@ -689,6 +692,8 @@ fn popup_quads_form_the_overlay_range() {
         border: Color([0.3, 0.3, 0.4, 1.0]),
         on_dismiss: None,
         restore_focus: None,
+        click_through: false,
+        closes_on_anchor_click: true,
         open: None,
     };
     let popup = tree.open_popup(popup_kind(true), |tree, popup| {

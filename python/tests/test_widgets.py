@@ -189,5 +189,202 @@ class GridTests(unittest.TestCase):
             fg.Grid([fg.Label("a")], columns=0)
 
 
+class AppChromeTests(unittest.TestCase):
+    def test_stacked_widget_index_and_empty_rejected(self):
+        stack = fg.StackedWidget([fg.Label("a"), fg.Label("b"), fg.Label("c")], index=1)
+        self.assertEqual(stack.index, 1)
+        stack.set_index(2)
+        self.assertEqual(stack.index, 2)
+        stack.set_index(99)
+        self.assertEqual(stack.index, 2)
+        with self.assertRaises(ValueError):
+            fg.StackedWidget([])
+
+    def test_collapsible_tracks_expanded(self):
+        section = fg.CollapsibleSection("More", fg.Label("body"), expanded=False)
+        self.assertFalse(section.expanded)
+        section.set_expanded(True)
+        self.assertTrue(section.expanded)
+
+    def test_dialog_and_status_bar_api(self):
+        bar = fg.StatusBar("hi")
+        bar.set_text("there")
+        dialog = fg.Dialog("Title", fg.Label("body"), buttons=[("OK", None)], modal=False)
+        self.assertFalse(dialog.is_open)
+        dialog.close()
+        self.assertFalse(dialog.is_open)
+
+    def test_box_set_display_before_attach(self):
+        box = fg.Box(children=[fg.Label("x")], visible=False)
+        box.set_display(True)
+
+
+class MenuTests(unittest.TestCase):
+    def test_item_labels_for_check_radio_icon_submenu(self):
+        nested = fg.Menu([fg.MenuItem("Child")])
+        menu = fg.Menu(
+            [
+                fg.MenuItem("Save", checked=True),
+                fg.MenuItem("Plain", checked=False),
+                fg.MenuItem("Dark", radio_group="t", checked=True),
+                fg.MenuItem("Light", radio_group="t", checked=False),
+                fg.MenuItem("Doc", icon="📄"),
+                fg.MenuItem("Recent", submenu=nested),
+            ]
+        )
+        self.assertEqual(menu._item_label(menu.items[0]), "✓  Save")
+        self.assertEqual(menu._item_label(menu.items[1]), "   Plain")
+        self.assertEqual(menu._item_label(menu.items[2]), "●  Dark")
+        self.assertEqual(menu._item_label(menu.items[3]), "○  Light")
+        self.assertEqual(menu._item_label(menu.items[4]), "📄  Doc")
+        self.assertEqual(menu._item_label(menu.items[5]), "Recent    ▶")
+
+    def test_close_runs_on_dismiss_once(self):
+        hits = []
+        menu = fg.Menu([fg.MenuItem("Open", on_click=lambda: hits.append("click"))])
+        menu.as_popup(on_dismiss=lambda: hits.append("dismiss"))
+        menu.close()
+        self.assertEqual(hits, ["dismiss"])
+        menu.close()
+        self.assertEqual(hits, ["dismiss"], "second close must not re-fire dismiss")
+
+    def test_rejects_shortcut_with_submenu(self):
+        nested = fg.Menu([fg.MenuItem("Child")])
+        with self.assertRaises(ValueError):
+            fg.MenuItem("Recent", shortcut="Cmd+R", submenu=nested)
+
+    def test_menubar_collects_nested_accelerators(self):
+        nested = fg.Menu([fg.MenuItem("Deep", shortcut="Cmd+D", on_click=lambda: None)])
+        menu = fg.Menu(
+            [
+                fg.MenuItem("Top", shortcut="Cmd+T", on_click=lambda: None),
+                fg.MenuItem("More", submenu=nested),
+            ]
+        )
+        accels = fg._menu_accelerators(menu)
+        self.assertEqual([s for s, _ in accels], ["Cmd+T", "Cmd+D"])
+
+
+
+class MenuChainTests(unittest.TestCase):
+    """Menu composite logic, with `Button` / `Popup` captured instead of shown."""
+
+    def setUp(self):
+        self._saved = (fg.Button, fg.Popup)
+        self.buttons = {}
+        self.hovers = {}
+        self.popups = []
+        test = self
+
+        class FakeButton:
+            def __init__(self, text, on_click=None, on_hover=None, **kwargs):
+                label = text.split("    ")[0].strip()
+                test.buttons[label] = on_click
+                test.hovers[label] = on_hover
+
+            def set_background(self, color=None):
+                pass
+
+        class FakePopup:
+            def __init__(self, content, **kwargs):
+                self.kwargs = kwargs
+                self.is_open = False
+                test.popups.append(self)
+
+            def show(self, anchor, side="below"):
+                self.is_open = True
+
+            def close(self):
+                self.is_open = False
+
+        fg.Button, fg.Popup = FakeButton, FakePopup
+
+    def tearDown(self):
+        fg.Button, fg.Popup = self._saved
+
+    def test_picking_in_a_submenu_closes_the_whole_chain(self):
+        picked, dismissed = [], []
+        sub = fg.Menu([fg.MenuItem("Doc", on_click=lambda: picked.append("doc"))])
+        root = fg.Menu([fg.MenuItem("Recent", submenu=sub)])
+        root.show(object(), on_dismiss=lambda: dismissed.append("root"))
+        self.buttons["Recent"]()  # open the submenu
+        self.assertTrue(sub.is_open and root.is_open)
+        self.buttons["Doc"]()  # pick in it
+        self.assertEqual(picked, ["doc"])
+        self.assertFalse(sub.is_open, "the submenu closes")
+        self.assertFalse(root.is_open, "and so does its parent")
+        self.assertEqual(dismissed, ["root"], "the top menu's on_dismiss runs (menu bar highlight)")
+
+    def test_menu_bar_menus_let_the_dismissing_click_through(self):
+        menu = fg.Menu([fg.MenuItem("Open")])
+        menu.show(object(), click_through=True)
+        self.assertTrue(self.popups[-1].kwargs["click_through"])
+        menu.show(object())
+        self.assertFalse(self.popups[-1].kwargs["click_through"], "other menus keep the default")
+
+
+class BoxTests(unittest.TestCase):
+    def test_set_background_before_showing(self):
+        box = fg.Box(children=[])
+        box.set_background((1.0, 0.0, 0.0, 1.0))
+        box.set_background(None)
+
+
+class SubmenuHoverTests(MenuChainTests):
+    """Submenus open on hover (the app runs `on_hover` after a short rest), no click needed."""
+
+    def test_hovering_a_submenu_row_opens_it_and_another_row_closes_it(self):
+        sub = fg.Menu([fg.MenuItem("Doc")])
+        root = fg.Menu([fg.MenuItem("Recent", submenu=sub), fg.MenuItem("Save")])
+        root.show(object())
+        self.hovers["Recent"]()
+        self.assertTrue(sub.is_open, "resting on the row opens its submenu")
+        self.assertFalse(self.popups[-1].kwargs["closes_on_anchor_click"], "clicking the row keeps it open")
+        self.buttons["Recent"]()
+        self.hovers["Recent"]()
+        self.assertTrue(sub.is_open, "clicking / hovering it again doesn't toggle it shut")
+        self.hovers["Save"]()
+        self.assertFalse(sub.is_open, "resting on another row closes it")
+        self.assertTrue(root.is_open)
+
+    def test_disabled_submenu_rows_do_not_open_on_hover(self):
+        sub = fg.Menu([fg.MenuItem("Doc")])
+        root = fg.Menu([fg.MenuItem("Recent", submenu=sub, enabled=False)])
+        root.show(object())
+        self.hovers["Recent"]()
+        self.assertFalse(sub.is_open)
+
+
+class ShortcutAndTextPersistenceTests(unittest.TestCase):
+    def test_menu_item_rejects_shortcuts_that_can_never_fire(self):
+        for bad in ("Ctrl++", "Ctrl+Bogus", "Alt+F4", ""):
+            if bad:
+                with self.assertRaises(ValueError, msg=bad):
+                    fg.MenuItem("x", shortcut=bad)
+        for good in ("Ctrl+S", "Cmd+Shift+N", "F5", "Del", "Ctrl+Enter", "Alt+Left"):
+            fg.MenuItem("x", shortcut=good)
+
+    def test_label_and_button_set_text_before_showing(self):
+        label = fg.Label("a")
+        label.set_text("b")
+        button = fg.Button("a")
+        button.set_text("b")
+
+
+class ShortcutLabelTests(unittest.TestCase):
+    def test_primary_modifier_reads_as_this_platforms_key(self):
+        from unittest import mock
+
+        from fastgui import _shortcut_label
+
+        with mock.patch("sys.platform", "linux"):
+            self.assertEqual(_shortcut_label("Cmd+Shift+N"), "Ctrl+Shift+N")
+            self.assertEqual(_shortcut_label("Ctrl+S"), "Ctrl+S")
+        with mock.patch("sys.platform", "darwin"):
+            self.assertEqual(_shortcut_label("Ctrl+S"), "Cmd+S")
+            self.assertEqual(_shortcut_label("Alt+F4"), "Alt+F4")
+        self.assertEqual(_shortcut_label("F5"), "F5")
+
+
 if __name__ == "__main__":
     unittest.main()

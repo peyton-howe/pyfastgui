@@ -17,6 +17,9 @@ const CARET_SLACK: f32 = 2.0;
 /// One key press, as far as widgets care.
 pub struct KeyPress<'a> {
     pub key: &'a Key,
+    /// The same key with no modifiers applied (`Shift+1` is `1` here, `!` in `key`; macOS
+    /// `Option+letter` is the letter). Shortcuts match against it. `None`: same as `key`.
+    pub plain: Option<&'a Key>,
     /// The text the press types, if any (winit's `KeyEvent::text`).
     pub text: Option<&'a str>,
     pub modifiers: ModifiersState,
@@ -581,7 +584,7 @@ mod tests {
 
     impl Field {
         fn key(&mut self, key: Key, text: Option<&str>, modifiers: ModifiersState) -> bool {
-            let press = KeyPress { key: &key, text, modifiers };
+            let press = KeyPress { key: &key, plain: None, text, modifiers };
             handle_key(&mut self.tree, self.id, &press, &mut Mono, &mut self.clipboard)
         }
 

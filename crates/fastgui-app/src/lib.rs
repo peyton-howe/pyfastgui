@@ -3,6 +3,7 @@
 //! Backends implement [`surface::SurfaceBackend`] and call [`run`]; dock/float/ghost input and
 //! the command queue live here once so the two `app.rs` files cannot drift.
 
+mod accel;
 mod app;
 mod cloak;
 mod command;

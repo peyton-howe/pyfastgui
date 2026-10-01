@@ -1,4 +1,5 @@
 mod backend;
+mod dialogs;
 mod theme;
 mod widgets;
 
@@ -435,16 +436,26 @@ impl Window {
         }
     }
 
-    /// Open `popup` in this window with its top-left at `(x, y)` (window coordinates, flipped
-    /// near the far edges), or centered when `x`/`y` are omitted (dialogs).
+    /// Open `popup` (a `Popup` or object with `as_popup()`, e.g. `Dialog`) in this window with
+    /// its top-left at `(x, y)` (window coordinates, flipped near the far edges), or centered
+    /// when `x`/`y` are omitted (dialogs).
     #[pyo3(signature = (popup, x=None, y=None))]
-    fn show_popup(&self, popup: &Bound<'_, widgets::Popup>, x: Option<f32>, y: Option<f32>) -> PyResult<()> {
+    fn show_popup(&self, popup: &Bound<'_, PyAny>, x: Option<f32>, y: Option<f32>) -> PyResult<()> {
         let anchor = match (x, y) {
             (Some(x), Some(y)) => fastgui_core::widget::PopupAnchor::Point(x, y),
             (None, None) => fastgui_core::widget::PopupAnchor::Center,
             _ => return Err(pyo3::exceptions::PyValueError::new_err("pass both x and y, or neither")),
         };
-        popup.borrow().open_in(&self.dispatch, anchor)
+        if let Ok(p) = popup.cast::<widgets::Popup>() {
+            return p.borrow().open_in(&self.dispatch, anchor);
+        }
+        let as_popup = popup
+            .call_method0("as_popup")
+            .map_err(|_| PyValueError::new_err("show_popup expects a Popup or an object with as_popup()"))?;
+        let p = as_popup
+            .cast::<widgets::Popup>()
+            .map_err(|_| PyValueError::new_err("as_popup() must return a Popup"))?;
+        p.borrow().open_in(&self.dispatch, anchor)
     }
 
     /// Add `panel` as a real OS window (separate from this window's surface), initially placed
@@ -629,5 +640,6 @@ fn _fastgui(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CudaSurface>()?;
     widgets::register(m)?;
     theme::register(m)?;
+    dialogs::register(m)?;
     Ok(())
 }

@@ -17,6 +17,14 @@ pub struct ChromeTheme {
     pub scrim: Color,
     pub drop_indicator: Color,
     pub scrollbar: Color,
+    /// Hovered control fill (menu rows, flat buttons) — from Python `Theme.surface_active`.
+    pub hover: Color,
+    /// Raised chrome (tooltips, popup chrome) — from Python `Theme.surface_alt`.
+    pub surface_alt: Color,
+    /// Primary chrome text — from Python `Theme.text`.
+    pub text: Color,
+    /// Chrome outlines — from Python `Theme.border`.
+    pub border: Color,
     /// Font family name for all text (`None`: the system's default sans-serif). A name the
     /// system doesn't have falls back to that default.
     pub font_family: Option<Arc<str>>,
@@ -29,6 +37,10 @@ impl ChromeTheme {
         scrim: Color([0.0, 0.0, 0.0, 0.45]),
         drop_indicator: Color([0.40, 0.65, 1.0, 0.35]),
         scrollbar: Color([1.0, 1.0, 1.0, 0.35]),
+        hover: Color([0.22, 0.24, 0.28, 1.0]),
+        surface_alt: Color([0.16, 0.17, 0.20, 1.0]),
+        text: Color([0.92, 0.93, 0.95, 1.0]),
+        border: Color([0.32, 0.35, 0.42, 1.0]),
         font_family: None,
     };
 }

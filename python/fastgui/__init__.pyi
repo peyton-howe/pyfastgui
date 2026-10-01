@@ -33,7 +33,14 @@ class Viewport:
         ...
 
 class Label:
-    def __init__(self, text: str, font_size: FontSize | None = None, color: RGBA | None = None) -> None: ...
+    def __init__(
+        self,
+        text: str,
+        font_size: FontSize | None = None,
+        color: RGBA | None = None,
+        tooltip: str | None = None,
+        context_menu: Any = None,
+    ) -> None: ...
     def set_text(self, text: str) -> None: ...
 
 class Button:
@@ -44,8 +51,15 @@ class Button:
         font_size: FontSize | None = None,
         text_color: RGBA | None = None,
         background: RGBA | None = None,
+        flat: bool = False,
+        tooltip: str | None = None,
+        context_menu: Any = None,
+        on_hover: Callable[[], None] | None = None,
     ) -> None: ...
     def set_text(self, text: str) -> None: ...
+    def set_background(self, color: RGBA | None = None) -> None:
+        """Update fill; `None` clears to transparent (menu-title open highlight)."""
+        ...
 
 class Slider:
     def __init__(
@@ -56,6 +70,7 @@ class Slider:
         on_change: Callable[[float], None] | None = None,
         track_color: RGBA | None = None,
         thumb_color: RGBA | None = None,
+        tooltip: str | None = None,
     ) -> None: ...
     def set_value(self, value: float) -> None: ...
 
@@ -204,10 +219,14 @@ class Popup:
         padding: Spacing = 6.0,
         background: RGBA | None = None,
         border: RGBA | None = None,
+        click_through: bool = False,
+        closes_on_anchor_click: bool = True,
     ) -> None: ...
     def show(self, anchor: Widget, side: str = "below") -> None:
         """Open next to `anchor` (already shown in a window): "below", "above", "right" or "left",
         flipped when there's no room. Reopening moves it."""
+    def show_at(self, near: Widget, x: float, y: float) -> None:
+        """Open at window point `(x, y)` in the same window as attached widget `near`."""
     def close(self) -> None:
         """Close without calling `on_dismiss`."""
     @property
@@ -224,6 +243,7 @@ class Checkbox:
         text_color: RGBA | None = None,
         box_color: RGBA | None = None,
         check_color: RGBA | None = None,
+        tooltip: str | None = None,
     ) -> None: ...
     @property
     def checked(self) -> bool: ...
@@ -258,10 +278,133 @@ class Toggle:
         track_off: RGBA | None = None,
         track_on: RGBA | None = None,
         thumb_color: RGBA | None = None,
+        tooltip: str | None = None,
     ) -> None: ...
     @property
     def checked(self) -> bool: ...
     def set_checked(self, checked: bool) -> None: ...
+
+class MenuItem:
+    """One row of a `Menu`. `shortcut` ("Cmd+S", "Ctrl+Shift+N", "F5", "Del", ...; Cmd and Ctrl
+    both mean the platform's primary modifier) is shown and registered on the `MenuBar`; an
+    unsupported one raises ValueError. `checked` (bool) makes it a check item, `radio_group` +
+    `checked` a radio item; `submenu` opens a nested `Menu` (on hover or click)."""
+    def __init__(
+        self,
+        label: str,
+        shortcut: str | None = None,
+        on_click: Callable[[], None] | None = None,
+        enabled: bool = True,
+        checked: bool | None = None,
+        radio_group: Any = None,
+        icon: str | None = None,
+        submenu: "Menu | None" = None,
+    ) -> None: ...
+    label: str
+    shortcut: str | None
+    on_click: Callable[[], None] | None
+    enabled: bool
+    checked: bool | None
+    radio_group: Any
+    icon: str | None
+    submenu: "Menu | None"
+
+class MenuSeparator:
+    def __init__(self) -> None: ...
+
+class Menu:
+    """Popup menu of `MenuItem` / `MenuSeparator` rows."""
+    def __init__(self, items: Sequence[MenuItem | MenuSeparator]) -> None: ...
+    def as_popup(
+        self,
+        on_dismiss: Callable[[], None] | None = None,
+        click_through: bool = False,
+        closes_on_anchor_click: bool = True,
+    ) -> Popup: ...
+    def show(
+        self,
+        anchor: Widget,
+        side: str = "below",
+        on_dismiss: Callable[[], None] | None = None,
+        click_through: bool = False,
+        closes_on_anchor_click: bool = True,
+    ) -> None: ...
+    def show_at(self, near: Widget, x: float, y: float, on_dismiss: Callable[[], None] | None = None) -> None: ...
+    def close(self) -> None: ...
+    @property
+    def is_open(self) -> bool: ...
+
+class MenuBar:
+    """Traditional menu strip: flat titles, hover/open highlight, thin bottom edge.
+
+    `menus` is a sequence of `(title, Menu)`.
+    """
+    def __init__(self, menus: Sequence[tuple[str, Menu]]) -> None: ...
+
+class Toolbar:
+    """Horizontal strip for Buttons/Labels/spacers."""
+    def __init__(self, children: Sequence["Widget"]) -> None: ...
+
+class StatusBar:
+    """Bottom status strip; `set_text` updates the muted label."""
+    def __init__(self, text: str = "") -> None: ...
+    def set_text(self, text: str) -> None: ...
+
+class Dialog:
+    """Modal/modeless wrapper around `Popup`. `buttons` is `(label, on_click)` pairs."""
+    def __init__(
+        self,
+        title: str,
+        content: "Widget",
+        buttons: Sequence[tuple[str, Callable[[], None] | None]] | None = None,
+        modal: bool = True,
+        on_dismiss: Callable[[], None] | None = None,
+    ) -> None: ...
+    def as_popup(self) -> Popup: ...
+    def show(self, window: "Window") -> None: ...
+    def close(self) -> None: ...
+    @property
+    def is_open(self) -> bool: ...
+
+def open_file_dialog(
+    title: str | None = None,
+    filter: Sequence[tuple[str, Sequence[str]]] | None = None,
+) -> str | None:
+    """Native open-file dialog (rfd). Returns a path or `None` if cancelled."""
+    ...
+
+def save_file_dialog(
+    title: str | None = None,
+    filter: Sequence[tuple[str, Sequence[str]]] | None = None,
+) -> str | None:
+    """Native save-file dialog (rfd). Returns a path or `None` if cancelled."""
+    ...
+
+def pick_color(
+    window: "Window",
+    initial: RGBA | None = None,
+    on_pick: Callable[[RGBA | None], None] | None = None,
+) -> Dialog:
+    """In-app RGB picker (rfd has no color dialog). Calls `on_pick` on OK/Cancel."""
+    ...
+
+class GroupBox:
+    """Titled bordered frame around `content`."""
+    def __init__(self, title: str, content: "Widget", padding: Spacing = "medium") -> None: ...
+
+class CollapsibleSection:
+    """Header toggles body visibility."""
+    def __init__(self, title: str, content: "Widget", expanded: bool = True) -> None: ...
+    def set_expanded(self, expanded: bool) -> None: ...
+    @property
+    def expanded(self) -> bool: ...
+
+class StackedWidget:
+    """Only one child visible; `set_index` toggles the rest off."""
+    def __init__(self, children: Sequence["Widget"], index: int = 0) -> None: ...
+    @property
+    def index(self) -> int: ...
+    def set_index(self, index: int) -> None: ...
 
 class SpinBox:
     def __init__(
@@ -389,6 +532,13 @@ Widget = Union[
     "Panel",
     "Tabs",
     "DockArea",
+    "Toolbar",
+    "StatusBar",
+    "Dialog",
+    "GroupBox",
+    "CollapsibleSection",
+    "StackedWidget",
+    "MenuBar",
     Viewport,
 ]
 
@@ -404,7 +554,16 @@ class Box:
         height: float | None = None,
         background: RGBA = (0.0, 0.0, 0.0, 0.0),
         wrap: bool = False,
+        visible: bool = True,
+        context_menu: Any = None,
+        accelerators: Sequence[tuple[str, Callable[[], None]]] | None = None,
     ) -> None: ...
+    def set_display(self, visible: bool) -> None:
+        """Show or hide this box (`Display::None` when hidden)."""
+        ...
+    def set_background(self, color: RGBA | None = None) -> None:
+        """Change the fill color (`None`: transparent). Works before showing; survives rebuilds."""
+
 
 class Splitter:
     """A draggable divider between `first` and `second`. `ratio` is `first`'s initial share
@@ -495,8 +654,8 @@ class Window:
     def set_content(self, widget: Widget) -> None: ...
     def set_theme(self, theme: Theme) -> None:
         """Make `theme` current and rebuild this window's content so it shows at once."""
-    def show_popup(self, popup: Popup, x: float | None = None, y: float | None = None) -> None:
-        """Open `popup` with its top-left at `(x, y)`, or centered when both are omitted."""
+    def show_popup(self, popup: Popup | Dialog | Any, x: float | None = None, y: float | None = None) -> None:
+        """Open a `Popup`/`Dialog` (or `as_popup()` object) at `(x, y)`, or centered when omitted."""
     def add_floating_panel(self, panel: Panel, x: float, y: float, width: float, height: float) -> None:
         """Open `panel` as a real OS window at `(x, y)` relative to this window's inner origin,
         sized `(width, height)`. Draggable anywhere on screen; resize via edge/corner drag; if
