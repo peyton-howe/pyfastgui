@@ -422,10 +422,13 @@ impl ChromeRenderer {
                     ..
                 } => {
                     push_fill(&mut ops, rect, *background);
+                    // Before taking `expanded`: `tree_visible_rows` locks it too, and std's
+                    // Mutex isn't reentrant.
+                    let rows = tree.tree_visible_rows(id);
                     let expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
                     let visible = data.visible_ids(&expanded);
                     let line = font_size * LINE_HEIGHT_RATIO;
-                    for flat in tree.tree_visible_rows(id) {
+                    for flat in rows {
                         let Some(&node_id) = visible.get(flat) else { continue };
                         let Some(node) = data.nodes.get(node_id as usize) else { continue };
                         let row = WidgetRect {

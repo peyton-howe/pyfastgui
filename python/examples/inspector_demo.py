@@ -6,7 +6,7 @@ import fastgui as fg
 def main() -> None:
     window = fg.Window(title="fastgui — M7 property inspector", width=640, height=420)
     name = fg.TextInput("Camera A", on_change=lambda t: status.set_text(f"name → {t!r}"))
-    gain = fg.SpinBox(value=1.0, minimum=0.0, maximum=10.0, step=0.1, decimals=1)
+    gain = fg.SpinBox(value=1.0, min=0.0, max=10.0, step=0.1, decimals=1)
     enabled = fg.Toggle(checked=True)
     mode = fg.ComboBox(["Raw", "Calibrated", "Preview"], selected=0)
     status = fg.Label("Edit properties on the right", font_size=14.0, color=(0.7, 0.75, 0.85, 1.0))

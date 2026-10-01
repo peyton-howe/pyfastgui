@@ -771,6 +771,43 @@ fn list_view_shapes_only_visible_rows_and_matches_cpu_painter() {
 }
 
 #[test]
+fn tree_view_renders_expanded_rows() {
+    let data = fastgui_core::widget::TreeData::from_nested(&[fastgui_core::widget::TreeNodeData {
+        label: "Sensors".into(),
+        children: vec![
+            fastgui_core::widget::TreeNodeData { label: "Camera".into(), children: vec![] },
+            fastgui_core::widget::TreeNodeData { label: "IMU".into(), children: vec![] },
+        ],
+    }]);
+    let expanded = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::from([0])));
+    let mut tree = WidgetTree::new();
+    let root = tree.root();
+    let view = tree.new_node(
+        Style { size: Size { width: Dimension::length(180.0), height: Dimension::length(100.0) }, ..Default::default() },
+        WidgetKind::TreeView {
+            data: std::sync::Arc::new(data),
+            expanded,
+            row_height: 22.0,
+            font_size: 14.0,
+            scroll: 0.0,
+            selected: Some(1),
+            text_color: Color([0.9, 0.9, 0.95, 1.0]),
+            background: Color([0.13, 0.14, 0.17, 1.0]),
+            selection_color: Color([0.25, 0.45, 0.8, 0.6]),
+            on_select: None,
+            on_activate: None,
+            mirror: None,
+        },
+    );
+    tree.add_child(root, view);
+    tree.compute_layout(200.0, 120.0);
+    let mut chrome = ChromeRenderer::new();
+    let built = chrome.build_quads(&tree, 200, 120, None, 1.0).expect("tree view draws");
+    let sprites = built.quads.iter().filter(|q| q.kind == fastgui_core::QUAD_SPRITE).count();
+    assert!(sprites >= 3, "three labels plus a disclosure glyph: {sprites}");
+}
+
+#[test]
 fn font_family_is_part_of_text_cache_keys_and_falls_back() {
     let mut chrome = ChromeRenderer::new();
     let rect = WidgetRect { x: 0.0, y: 0.0, width: 200.0, height: 24.0 };
