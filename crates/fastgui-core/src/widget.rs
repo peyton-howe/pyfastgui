@@ -377,6 +377,18 @@ impl TreeData {
         }
     }
 
+    /// Whether `ancestor` is a strict ancestor of `node`.
+    pub fn is_ancestor(&self, ancestor: u32, node: u32) -> bool {
+        let mut cur = self.nodes.get(node as usize).and_then(|n| n.parent);
+        while let Some(p) = cur {
+            if p == ancestor {
+                return true;
+            }
+            cur = self.nodes.get(p as usize).and_then(|n| n.parent);
+        }
+        false
+    }
+
     /// Resolve a child-index path to a node id.
     pub fn id_at_path(&self, path: &[u32]) -> Option<u32> {
         let (&first, rest) = path.split_first()?;
@@ -1631,30 +1643,22 @@ impl WidgetTree {
 
     /// Toggle expand/collapse for `node` in `TreeView` `id` (no-op on leaves).
     pub fn tree_toggle(&mut self, id: WidgetId, node: u32) {
-        let Some(WidgetKind::TreeView { data, expanded, .. }) = self.kinds.get_mut(&id) else {
-            return;
-        };
-        let Some(tree_node) = data.nodes.get(node as usize) else { return };
-        if tree_node.children.is_empty() {
-            return;
-        }
-        let mut expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
-        if !expanded.remove(&node) {
-            expanded.insert(node);
-        }
-        drop(expanded);
-        self.mark_dirty();
+        let Some(WidgetKind::TreeView { expanded, .. }) = self.kind(id) else { return };
+        let open = !expanded.lock().unwrap_or_else(|p| p.into_inner()).contains(&node);
+        self.tree_set_expanded(id, node, open);
     }
 
-    /// Expand or collapse `node` explicitly.
+    /// Expand or collapse `node` explicitly. Collapsing an ancestor of the selection moves the
+    /// selection up to `node` (as Qt / Explorer do) so it never sits on a hidden row.
     pub fn tree_set_expanded(&mut self, id: WidgetId, node: u32, open: bool) {
-        let Some(WidgetKind::TreeView { data, expanded, .. }) = self.kinds.get_mut(&id) else {
+        let Some(WidgetKind::TreeView { data, expanded, selected, .. }) = self.kinds.get_mut(&id) else {
             return;
         };
         let Some(tree_node) = data.nodes.get(node as usize) else { return };
         if tree_node.children.is_empty() {
             return;
         }
+        let hides_selection = !open && selected.is_some_and(|s| data.is_ancestor(node, s));
         let mut expanded = expanded.lock().unwrap_or_else(|p| p.into_inner());
         if open {
             expanded.insert(node);
@@ -1662,6 +1666,9 @@ impl WidgetTree {
             expanded.remove(&node);
         }
         drop(expanded);
+        if hides_selection {
+            self.tree_select(id, Some(node));
+        }
         self.mark_dirty();
     }
 
@@ -3449,6 +3456,17 @@ mod tests {
         assert!(expanded.lock().unwrap().contains(&2));
         assert_eq!(mirror.get(), Some(vec![0, 1, 1]));
         assert_eq!(tree.tree_visible_ids(view), vec![0, 1, 2, 3, 4, 5]);
+
+        // Collapsing an ancestor of the selection moves it to the collapsed node.
+        tree.tree_set_expanded(view, 0, false);
+        assert_eq!(mirror.get(), Some(vec![0]));
+        tree.tree_select(view, Some(3)); // accel
+        tree.tree_toggle(view, 2); // IMU via the gutter
+        assert_eq!(mirror.get(), Some(vec![0, 1]));
+        tree.tree_toggle(view, 0);
+        assert_eq!(mirror.get(), Some(vec![0]), "IMU is under Sensors too");
+        tree.tree_set_expanded(view, 5, false); // a leaf: no-op
+        assert_eq!(mirror.get(), Some(vec![0]));
     }
 
     #[test]

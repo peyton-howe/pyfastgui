@@ -1955,6 +1955,12 @@ impl TreeView {
         let id = *self.id.lock().unwrap_or_else(|p| p.into_inner());
         let sender = self.sender.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let (Some(id), Some(sender)) = (id, sender) else {
+            // Not shown yet: mirror `tree_set_expanded`'s rule that collapsing an ancestor of the
+            // selection selects the collapsed node.
+            let hides_selection = self.selected.get().is_some_and(|s| s.len() > path.len() && s.starts_with(&path));
+            if !expanded && hides_selection {
+                self.selected.set(Some(path));
+            }
             return Ok(());
         };
         send_tree_mutation(&sender, move |tree| tree.tree_set_expanded(id, node, expanded))

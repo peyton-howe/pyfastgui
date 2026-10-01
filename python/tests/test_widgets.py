@@ -85,6 +85,8 @@ class TreeViewTests(unittest.TestCase):
         tree.select((0, 1))
         self.assertEqual(tree.selected, [0, 1])
         tree.set_expanded((0,), True)
+        tree.set_expanded((0,), False)
+        self.assertEqual(tree.selected, [0], "collapsing hides the selection, so it moves up")
         tree.select(None)
         self.assertIsNone(tree.selected)
         tree.set_nodes([fg.TreeNode("only")])
