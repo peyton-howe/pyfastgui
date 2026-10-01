@@ -285,17 +285,29 @@ class Toggle:
     def set_checked(self, checked: bool) -> None: ...
 
 class MenuItem:
+    """One row of a `Menu`. `shortcut` ("Cmd+S", "Ctrl+Shift+N", "F5", "Del", ...; Cmd and Ctrl
+    both mean the platform's primary modifier) is shown and registered on the `MenuBar`; an
+    unsupported one raises ValueError. `checked` (bool) makes it a check item, `radio_group` +
+    `checked` a radio item; `submenu` opens a nested `Menu` (on hover or click)."""
     def __init__(
         self,
         label: str,
         shortcut: str | None = None,
         on_click: Callable[[], None] | None = None,
         enabled: bool = True,
+        checked: bool | None = None,
+        radio_group: Any = None,
+        icon: str | None = None,
+        submenu: "Menu | None" = None,
     ) -> None: ...
     label: str
     shortcut: str | None
     on_click: Callable[[], None] | None
     enabled: bool
+    checked: bool | None
+    radio_group: Any
+    icon: str | None
+    submenu: "Menu | None"
 
 class MenuSeparator:
     def __init__(self) -> None: ...
@@ -317,7 +329,7 @@ class Menu:
         click_through: bool = False,
         closes_on_anchor_click: bool = True,
     ) -> None: ...
-    def show_at(self, near: Widget, x: float, y: float) -> None: ...
+    def show_at(self, near: Widget, x: float, y: float, on_dismiss: Callable[[], None] | None = None) -> None: ...
     def close(self) -> None: ...
     @property
     def is_open(self) -> bool: ...

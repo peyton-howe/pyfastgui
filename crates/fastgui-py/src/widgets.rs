@@ -821,7 +821,8 @@ pub(crate) struct Button {
     text: Mutex<String>,
     font_size: Option<FontSize>,
     text_color: Option<(f32, f32, f32, f32)>,
-    background: Option<(f32, f32, f32, f32)>,
+    /// Behind a mutex so `set_background` survives rebuilds.
+    background: Mutex<Option<(f32, f32, f32, f32)>>,
     /// Menu-bar title style: compact, no fill until hover / `set_background`.
     flat: bool,
     on_click: Option<Py<PyAny>>,
@@ -862,7 +863,7 @@ impl Button {
             text: Mutex::new(text),
             font_size,
             text_color,
-            background,
+            background: Mutex::new(background),
             flat,
             on_click,
             tooltip,
@@ -886,6 +887,10 @@ impl Button {
     /// Update the fill (e.g. menu-title open highlight). `None` clears to transparent.
     #[pyo3(signature = (color=None))]
     fn set_background(&self, color: Option<(f32, f32, f32, f32)>) -> PyResult<()> {
+        *self.background.lock().unwrap_or_else(|p| p.into_inner()) = color;
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
         let fill = rgba(color.unwrap_or((0.0, 0.0, 0.0, 0.0)));
         mutate(&self.id, &self.sender, move |kind| {
             if let WidgetKind::Button { background, .. } = kind {
@@ -918,7 +923,7 @@ impl Button {
                 text: self.text.lock().unwrap_or_else(|p| p.into_inner()).clone(),
                 font_size: self.font_size.unwrap_or(FontSize::Body).resolve(),
                 text_color: rgba(self.text_color.unwrap_or(default_fg)),
-                background: rgba(self.background.unwrap_or(default_bg)),
+                background: rgba(self.background.lock().unwrap_or_else(|p| p.into_inner()).unwrap_or(default_bg)),
                 flat: self.flat,
                 on_click: on_click.map(wrap_callback0),
             },
@@ -2057,7 +2062,8 @@ impl Toggle {
             }
         });
         DescribedWidget {
-            style: StyleParams::leaf(0.0, None, None),
+            // Its natural size: a switch shouldn't stretch across a column.
+            style: StyleParams::leaf(0.0, Some(fastgui_core::widget::TOGGLE_WIDTH), Some(fastgui_core::widget::TOGGLE_HEIGHT)),
             kind: WidgetKind::Toggle {
                 checked: self.checked.get(),
                 track_off: rgba(self.track_off.unwrap_or(crate::theme::palette().track)),

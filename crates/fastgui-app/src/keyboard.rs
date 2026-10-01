@@ -52,7 +52,15 @@ fn handle_key_inner(
     // keep A/C/V/X/Z; see `accel::try_fire`). Not behind a modal dialog: its window's menus
     // are unreachable until it closes.
     let modal_open = tree.topmost_popup().is_some_and(|p| matches!(tree.kind(p), Some(WidgetKind::Popup { modal: true, .. })));
-    if !modal_open && crate::accel::try_fire(tree, press) {
+    if let Some(callback) = (!modal_open).then(|| crate::accel::find(tree, press)).flatten() {
+        // Like a native menu bar: a shortcut closes any open menus before it runs.
+        while tree
+            .topmost_popup()
+            .is_some_and(|p| matches!(tree.kind(p), Some(WidgetKind::Popup { modal: false, .. })))
+        {
+            tree.dismiss_popup();
+        }
+        callback();
         return true;
     }
     // Flat menu rows aren't focusable (no accent ring); drive them via hover + arrows.
@@ -278,12 +286,16 @@ fn handle_menu_popup_keys(tree: &mut WidgetTree, press: &KeyPress<'_>) -> bool {
         Key::Named(NamedKey::ArrowDown) => {
             let next = current.map_or(0, |i| (i + 1) % buttons.len());
             tree.set_hovered(Some(buttons[next]));
+            // A long menu scrolls: keep the highlighted row in view.
+            tree.scroll_into_view(buttons[next]);
             true
         }
         Key::Named(NamedKey::ArrowUp) => {
             let next =
                 current.map_or(buttons.len() - 1, |i| if i == 0 { buttons.len() - 1 } else { i - 1 });
             tree.set_hovered(Some(buttons[next]));
+            // A long menu scrolls: keep the highlighted row in view.
+            tree.scroll_into_view(buttons[next]);
             true
         }
         Key::Named(NamedKey::ArrowLeft) => {
@@ -446,6 +458,24 @@ mod tests {
         tree.set_hovered(Some(rows[0]));
         assert!(press(&mut tree, Key::Named(NamedKey::Enter), false));
         assert_eq!(clicks[0].load(Ordering::SeqCst), 1, "Enter still runs it");
+    }
+
+    #[test]
+    fn a_shortcut_closes_open_menus_before_it_runs() {
+        let fired = Arc::new(AtomicUsize::new(0));
+        let counter = fired.clone();
+        let (mut tree, _, _) = menu_with_rows(&["Save"], false);
+        tree.register_accelerator(
+            fastgui_core::widget::Accel::parse("Ctrl+S").unwrap(),
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let primary = if cfg!(target_os = "macos") { ModifiersState::SUPER } else { ModifiersState::CONTROL };
+        let key = Key::Character("s".into());
+        assert!(handle_key(&mut tree, &KeyPress { key: &key, plain: None, text: None, modifiers: primary }, &mut NoMeasure, &mut NoClipboard));
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert!(tree.topmost_popup().is_none(), "the open menu closed");
     }
 
     #[test]

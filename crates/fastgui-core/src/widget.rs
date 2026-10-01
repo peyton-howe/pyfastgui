@@ -982,6 +982,7 @@ impl WidgetTree {
     }
 
     fn layout(&mut self, width: f32, height: f32, mut measure: Option<&mut (dyn TextMeasure + '_)>) {
+        self.cap_popup_heights(height);
         let available = Size { width: AvailableSpace::Definite(width), height: AvailableSpace::Definite(height) };
         let kinds = &self.kinds;
         let _ = self.taffy.compute_layout_with_measure(
@@ -1050,6 +1051,23 @@ impl WidgetTree {
             }
         }
         self.place_popups(width, height);
+    }
+
+    /// Limit each popup's height to the room beside its anchor (`popup_max_height`), so a long
+    /// menu scrolls (its content sits in a `ScrollArea`) instead of running off the window.
+    /// Anchor rects come from the previous layout; anchors don't depend on popup sizes.
+    fn cap_popup_heights(&mut self, height: f32) {
+        let popups: Vec<WidgetId> = self.taffy.children(self.root).unwrap_or_default();
+        for popup in popups {
+            let Some(&WidgetKind::Popup { anchor, .. }) = self.kinds.get(&popup) else { continue };
+            let limit = popup_max_height(anchor, |id| self.absolute_rect(id), height);
+            let Some(mut style) = self.taffy.style(popup).ok().cloned() else { continue };
+            let max = Dimension::length(limit);
+            if style.max_size.height != max {
+                style.max_size.height = max;
+                let _ = self.taffy.set_style(popup, style);
+            }
+        }
     }
 
     /// Move each popup (and everything in it) to where its anchor says, now that its size and
@@ -1748,6 +1766,9 @@ fn place_popup(
         let a = rect_of(id).unwrap_or_default();
         let below = a.y + a.height + POPUP_GAP;
         let above = a.y - POPUP_GAP - h;
+        // Neither side fits (a long menu): the roomier one — `popup_max_height` has already
+        // capped the popup to that side's room, so it never slides over its anchor.
+        let roomier_below = height - below >= a.y - POPUP_GAP;
         let right = a.x + a.width + POPUP_GAP;
         let left = a.x - POPUP_GAP - w;
         let start_x = a.x;
@@ -1757,11 +1778,11 @@ fn place_popup(
         match side {
             PopupSide::Below => (
                 if center { mid_x } else { start_x },
-                if fits_y(below) || !fits_y(above) { below } else { above },
+                if fits_y(below) || (!fits_y(above) && roomier_below) { below } else { above },
             ),
             PopupSide::Above => (
                 if center { mid_x } else { start_x },
-                if fits_y(above) || !fits_y(below) { above } else { below },
+                if fits_y(above) || (!fits_y(below) && !roomier_below) { above } else { below },
             ),
             PopupSide::Right => (
                 if fits_x(right) || !fits_x(left) { right } else { left },
@@ -1785,6 +1806,22 @@ fn place_popup(
     };
     let clamp = |v: f32, extent: f32, limit: f32| v.min(limit - POPUP_GAP - extent).max(POPUP_GAP);
     (clamp(x, w, width), clamp(y, h, height))
+}
+
+/// The tallest a popup anchored at `anchor` can be in a `height`-tall window: the room on the
+/// roomier side of a widget it opens above/below, otherwise the window less its margins.
+fn popup_max_height(anchor: PopupAnchor, rect_of: impl Fn(WidgetId) -> Option<Rect>, height: f32) -> f32 {
+    let full = (height - 2.0 * POPUP_GAP).max(0.0);
+    match anchor {
+        PopupAnchor::Widget(id, PopupSide::Below | PopupSide::Above)
+        | PopupAnchor::WidgetCentered(id, PopupSide::Below | PopupSide::Above) => {
+            let Some(a) = rect_of(id) else { return full };
+            let below = height - POPUP_GAP - (a.y + a.height + POPUP_GAP);
+            let above = a.y - 2.0 * POPUP_GAP;
+            below.max(above).clamp(0.0, full)
+        }
+        _ => full,
+    }
 }
 
 /// Free `id` and its descendants from `taffy` (it's already detached from its parent).
@@ -2641,6 +2678,39 @@ mod tests {
         tree.set_hover_action(rows[0], Some(Arc::new(|| {})));
         tree.close_popup(popup);
         assert!(tree.hover_action(rows[0]).is_none(), "gone with the popup's content");
+    }
+
+    #[test]
+    fn a_long_menu_is_capped_to_the_room_below_its_anchor_and_scrolls() {
+        // A 40-row menu under a widget near the top of a 200-tall window: it must stay below
+        // the anchor (not slide up over it), end inside the window, keep its width, and scroll.
+        let (mut tree, anchor) = popup_tree(10.0, 20.0);
+        let mut area = None;
+        let popup = tree.open_popup(popup_kind(PopupAnchor::Widget(anchor, PopupSide::Below), false, None), |tree, popup| {
+            let scroll = tree.new_node(
+                Style { flex_direction: FlexDirection::Column, flex_grow: 1.0, ..Default::default() },
+                WidgetKind::ScrollArea { offset: (0.0, 0.0), background: Color::TRANSPARENT, bar_color: Color::TRANSPARENT },
+            );
+            let column = tree.new_node(
+                Style { flex_direction: FlexDirection::Column, flex_shrink: 0.0, ..Default::default() },
+                WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+            );
+            tree.add_child(popup, scroll);
+            tree.add_child(scroll, column);
+            for _ in 0..40 {
+                let row = sized_button(tree, 90.0, 20.0);
+                tree.add_child(column, row);
+            }
+            tree.set_scroll_container(scroll);
+            area = Some(scroll);
+        });
+        tree.compute_layout(200.0, 200.0);
+        let r = tree.absolute_rect(popup).unwrap();
+        let a = tree.absolute_rect(anchor).unwrap();
+        assert!(r.y >= a.y + a.height, "below its anchor, not over it: {r:?}");
+        assert!(r.y + r.height <= 200.0 - POPUP_GAP + 0.5, "ends inside the window: {r:?}");
+        assert!(r.width >= 90.0, "keeps its content's width: {r:?}");
+        assert!(tree.scroll_extent(area.unwrap()).unwrap().1 > 0.0, "the rows scroll");
     }
 
     #[test]

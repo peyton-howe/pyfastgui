@@ -43,6 +43,16 @@ def _noop():
     pass
 
 
+def _shortcut_label(shortcut):
+    """How a shortcut reads in a menu on this platform. `Cmd` and `Ctrl` both mean the primary
+    modifier (Cmd on macOS, Ctrl elsewhere — see `fastgui-app::accel`), so show the real key."""
+    import sys
+
+    primary = "Cmd" if sys.platform == "darwin" else "Ctrl"
+    parts = [primary if part.strip().lower() in ("cmd", "ctrl", "command", "control") else part.strip() for part in shortcut.split("+")]
+    return "+".join(parts)
+
+
 class MenuItem:
     """One actionable row in a `Menu`.
 
@@ -111,7 +121,7 @@ class Menu:
         if item.submenu is not None:
             return f"{text}    ▶"
         if item.shortcut:
-            return f"{text}    {item.shortcut}"
+            return f"{text}    {_shortcut_label(item.shortcut)}"
         return text
 
     def _close_submenu(self):
@@ -218,7 +228,9 @@ class Menu:
 
         self._on_dismiss = on_dismiss
         self._popup = Popup(
-            Box(direction="column", gap=0.0, children=rows),
+            # In a ScrollArea so a menu taller than the room beside its anchor scrolls (the popup
+            # is capped to that room) instead of running off the window.
+            ScrollArea(Box(direction="column", gap=0.0, children=rows)),
             padding=4.0,
             on_dismiss=wrapped_dismiss if on_dismiss is not None else None,
             click_through=click_through,

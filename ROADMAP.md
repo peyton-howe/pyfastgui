@@ -1349,6 +1349,17 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 
 ### 7C. Tier 2 — application structure
 
+- **Review + Linux-testing follow-ups (2026-09-30):** submenus open on hover (180 ms rest;
+  `Button(on_hover=)`, `Popup(closes_on_anchor_click=)`); long menus are capped to the room
+  beside their anchor and scroll; a shortcut closes open menus before running; a modal dialog in
+  the main window blocks input to floating windows (app-modal); floating windows get hover,
+  submenu hover-open and right-click; shortcut labels read Ctrl/Cmd per platform; Toggle keeps
+  its natural size; `Button.set_background` survives rebuilds. **Still open:** tooltips in
+  floating windows; hovering between menu bar titles while one is open; Alt mnemonics / F10;
+  arrow-key menu navigation also drives non-menu popups that contain flat buttons; a submenu
+  with no room on either side overlaps its parent instead of flipping; without a desktop portal,
+  file dialogs return `None` (same as cancel).
+
 - Menu bar, context menus, keyboard shortcuts / accelerators — **Done (2026-09-29):**
   hover tooltips (~500ms, no focus steal), Python `Menu`/`MenuBar`/`MenuItem`/`MenuSeparator`,
   right-click `context_menu=`, `Accel` parse + tree side-table, nested submenus, check/radio/icon

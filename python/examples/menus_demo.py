@@ -50,6 +50,7 @@ def main() -> None:
     def set_theme(name: str):
         dark_item.checked = name == "dark"
         light_item.checked = name == "light"
+        window.set_theme(fg.Theme.dark() if name == "dark" else fg.Theme.light())
         set_status(f"Theme: {name}")
 
     dark_item.on_click = lambda: set_theme("dark")

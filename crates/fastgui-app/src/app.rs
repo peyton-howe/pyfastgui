@@ -801,6 +801,9 @@ impl<B: SurfaceBackend> App<B> {
 
     /// Floater counterpart of `handle_context_menu_press`.
     fn handle_floating_context_menu_press(&mut self, window_id: WindowId) {
+        if self.main_modal_open() {
+            return;
+        }
         let Some(floater) = self.floating.get_mut(&window_id) else { return };
         let (x, y) = floater.cursor;
         if forms::with_tree(&mut floater.widget_tree, |tree| tree.popup_press(x, y) == PopupPress::Consumed) {
@@ -984,7 +987,17 @@ impl<B: SurfaceBackend> App<B> {
         }
     }
 
+    /// A modal popup (dialog) is open in the main window: it's application-modal, so floating
+    /// panels take no clicks or keys until it closes.
+    fn main_modal_open(&self) -> bool {
+        let tree = &self.widget_tree;
+        tree.topmost_popup().is_some_and(|p| matches!(tree.kind(p), Some(WidgetKind::Popup { modal: true, .. })))
+    }
+
     fn handle_floating_mouse_press(&mut self, window_id: WindowId) {
+        if self.main_modal_open() {
+            return;
+        }
         let Some(floater) = self.floating.get(&window_id) else { return };
         let cursor = floater.cursor;
         let region_id = floater.region_id;
@@ -2392,6 +2405,9 @@ impl<B: SurfaceBackend> App<B> {
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if self.main_modal_open() {
+                    return;
+                }
                 let plain = event.key_without_modifiers();
                 let press = key_press(&event, &plain, self.modifiers);
                 if let Some(floater) = self.floating.get_mut(&window_id) {
@@ -2598,6 +2614,11 @@ pub fn run<B: SurfaceBackend>(
     }
 }
 
+/// Whether `hit` is a flat `Button` (menu title/row chrome): pressing one keeps keyboard focus.
+fn is_flat_button(tree: &WidgetTree, hit: Option<WidgetId>) -> bool {
+    matches!(hit.and_then(|id| tree.kind(id)), Some(WidgetKind::Button { flat: true, .. }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2636,9 +2657,4 @@ mod tests {
         release_button(&mut tree, None, (40.0, 15.0));
         assert_eq!(clicks.load(Ordering::SeqCst), 1, "nothing was pressed");
     }
-}
-
-/// Whether `hit` is a flat `Button` (menu title/row chrome): pressing one keeps keyboard focus.
-fn is_flat_button(tree: &WidgetTree, hit: Option<WidgetId>) -> bool {
-    matches!(hit.and_then(|id| tree.kind(id)), Some(WidgetKind::Button { flat: true, .. }))
 }

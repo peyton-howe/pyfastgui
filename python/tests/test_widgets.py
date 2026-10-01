@@ -371,5 +371,20 @@ class ShortcutAndTextPersistenceTests(unittest.TestCase):
         button.set_text("b")
 
 
+class ShortcutLabelTests(unittest.TestCase):
+    def test_primary_modifier_reads_as_this_platforms_key(self):
+        from unittest import mock
+
+        from fastgui import _shortcut_label
+
+        with mock.patch("sys.platform", "linux"):
+            self.assertEqual(_shortcut_label("Cmd+Shift+N"), "Ctrl+Shift+N")
+            self.assertEqual(_shortcut_label("Ctrl+S"), "Ctrl+S")
+        with mock.patch("sys.platform", "darwin"):
+            self.assertEqual(_shortcut_label("Ctrl+S"), "Cmd+S")
+            self.assertEqual(_shortcut_label("Alt+F4"), "Alt+F4")
+        self.assertEqual(_shortcut_label("F5"), "F5")
+
+
 if __name__ == "__main__":
     unittest.main()

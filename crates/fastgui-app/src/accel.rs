@@ -98,7 +98,22 @@ fn is_text_edit_chord(accel: &Accel) -> bool {
 
 /// Fire the first matching accelerator. When a text field is focused, still allow primary
 /// shortcuts (e.g. Cmd+S) but leave unmodified typing and A/C/V/X/Z edit chords alone.
+/// Run the first accelerator `press` triggers (tests; the app uses `find` so it can close open
+/// menus first).
+#[cfg(test)]
 pub fn try_fire(tree: &WidgetTree, press: &KeyPress<'_>) -> bool {
+    match find(tree, press) {
+        Some(callback) => {
+            callback();
+            true
+        }
+        None => false,
+    }
+}
+
+/// The callback of the first accelerator `press` triggers, without running it (so the caller
+/// can close open menus first). Same rules as `try_fire`.
+pub fn find(tree: &WidgetTree, press: &KeyPress<'_>) -> Option<fastgui_core::widget::ClickCallback> {
     let text_focused = tree.focused().is_some_and(|id| {
         matches!(tree.kind(id), Some(WidgetKind::TextInput { .. } | WidgetKind::TextArea { .. }))
     });
@@ -114,10 +129,9 @@ pub fn try_fire(tree: &WidgetTree, press: &KeyPress<'_>) -> bool {
         if text_focused && !accel.primary && !accel.alt && !matches!(accel.key, AccelKey::F(_)) {
             continue;
         }
-        callback();
-        return true;
+        return Some(callback.clone());
     }
-    false
+    None
 }
 
 #[cfg(test)]
