@@ -1464,17 +1464,37 @@ fn format_table_cell(value: &Bound<'_, PyAny>) -> PyResult<String> {
         return Ok(v.to_string());
     }
     if let Ok(v) = value.extract::<f64>() {
-        if !v.is_finite() {
-            return Ok(v.to_string());
-        }
-        let rounded = (v * 1_000_000.0).round() / 1_000_000.0;
-        let s = format!("{rounded}");
-        return Ok(s);
+        return Ok(format_table_float(v));
     }
     if value.is_none() {
         return Ok(String::new());
     }
     value.str()?.extract()
+}
+
+/// Six decimals with trailing zeros trimmed; scientific notation outside `[1e-4, 1e15)` so tiny
+/// values don't collapse to `0` and huge ones don't print as long digit runs.
+fn format_table_float(v: f64) -> String {
+    if !v.is_finite() {
+        return v.to_string();
+    }
+    if v == 0.0 {
+        return "0".into();
+    }
+    fn trim(s: &str) -> &str {
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.')
+        } else {
+            s
+        }
+    }
+    if (1e-4..1e15).contains(&v.abs()) {
+        trim(&format!("{v:.6}")).to_string()
+    } else {
+        let s = format!("{v:.5e}");
+        let (mantissa, exp) = s.split_once('e').unwrap_or((&s, "0"));
+        format!("{}e{exp}", trim(mantissa))
+    }
 }
 
 /// Turn one column sequence (list, numpy 1-D, pyarrow-ish iterable) into string cells.
@@ -1488,7 +1508,7 @@ fn column_to_strings(col: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
     let seq = col.cast::<PySequence>().map_err(|_| {
         PyTypeError::new_err("each table column must be a sequence (list, numpy array, …)")
     })?;
-    let mut out = Vec::with_capacity(seq.len().unwrap_or(0) as usize);
+    let mut out = Vec::with_capacity(seq.len().unwrap_or(0));
     for i in 0..seq.len()? {
         out.push(format_table_cell(&seq.get_item(i)?)?);
     }
@@ -1770,7 +1790,7 @@ fn coerce_tree_roots(nodes: &Bound<'_, PyAny>) -> PyResult<Arc<TreeData>> {
     let seq = nodes.cast::<PySequence>().map_err(|_| {
         PyTypeError::new_err("TreeView roots must be a sequence of TreeNode")
     })?;
-    let mut roots = Vec::with_capacity(seq.len()? as usize);
+    let mut roots = Vec::with_capacity(seq.len()?);
     for i in 0..seq.len()? {
         let item = seq.get_item(i)?;
         let node = item.cast::<TreeNode>().map_err(|_| {
@@ -1789,7 +1809,7 @@ fn path_from_py(path: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<u16>>> {
     let seq = path.cast::<PySequence>().map_err(|_| {
         PyTypeError::new_err("path must be a sequence of child indices")
     })?;
-    let mut out = Vec::with_capacity(seq.len()? as usize);
+    let mut out = Vec::with_capacity(seq.len()?);
     for i in 0..seq.len()? {
         let idx: usize = seq.get_item(i)?.extract()?;
         out.push(u16::try_from(idx).map_err(|_| PyValueError::new_err("path index too large"))?);
@@ -4038,4 +4058,22 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Panel>()?;
     m.add_class::<Tabs>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_table_float;
+
+    #[test]
+    fn table_floats_keep_small_and_large_magnitudes() {
+        assert_eq!(format_table_float(3.14159265), "3.141593");
+        assert_eq!(format_table_float(2.5), "2.5");
+        assert_eq!(format_table_float(-0.0), "0");
+        assert_eq!(format_table_float(1e-4), "0.0001");
+        assert_eq!(format_table_float(1e-9), "1e-9");
+        assert_eq!(format_table_float(-2.5e-7), "-2.5e-7");
+        assert_eq!(format_table_float(6.02e23), "6.02e23");
+        assert_eq!(format_table_float(1e303), "1e303");
+        assert_eq!(format_table_float(f64::NAN), "NaN");
+    }
 }
