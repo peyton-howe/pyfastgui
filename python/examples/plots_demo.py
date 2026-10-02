@@ -13,7 +13,7 @@ import fastgui as fg
 
 
 def main() -> None:
-    window = fg.Window(title="fastgui — M7 GPU plots", width=960, height=720)
+    window = fg.Window(title="fastgui — M7 GPU plots", width=1100, height=860)
     status = fg.Label("Streaming sine into PlotLine…", font_size=14.0, color=(0.7, 0.75, 0.85, 1.0))
 
     x = np.linspace(0.0, 4.0 * np.pi, 400)
@@ -33,12 +33,38 @@ def main() -> None:
         pixel_height=220,
     )
     yy, xx = np.mgrid[0:64, 0:96]
-    heat = fg.PlotHeatmap(
-        np.sin(xx / 8.0) * np.cos(yy / 6.0),
-        colormap="viridis",
+    field = np.sin(xx / 8.0) * np.cos(yy / 6.0)
+    heat = fg.PlotHeatmap(field, colormap="viridis", pixel_width=640, pixel_height=220)
+    hist = fg.PlotHistogram(np.random.default_rng(0).normal(size=800), bins=28, pixel_width=640, pixel_height=220, height=200, flex_grow=0)
+    bar = fg.PlotBar([3, 5, 2, 7, 4, 6], color=(0.95, 0.55, 0.35, 1.0), pixel_width=640, pixel_height=220, height=200, flex_grow=0)
+    contour = fg.PlotContour(field, levels=8, filled=True, pixel_width=640, pixel_height=220, height=200, flex_grow=0)
+    z = field[::2, ::2]
+    surface = fg.PlotSurface(
+        z,
+        x=xx[0, ::2],
+        y=yy[::2, 0],
         pixel_width=640,
-        pixel_height=220,
+        pixel_height=280,
+        height=240,
+        flex_grow=0,
     )
+    scatter3d = fg.PlotScatter3D(
+        xx[::4, ::4].ravel(),
+        yy[::4, ::4].ravel(),
+        field[::4, ::4].ravel(),
+        point_radius=4.0,
+        pixel_width=640,
+        pixel_height=280,
+        height=240,
+        flex_grow=0,
+    )
+    # A small pyramid so the mesh path is obvious next to the height field.
+    mesh_v = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.5, 0.5, 1.2]],
+        dtype=np.float64,
+    )
+    mesh_f = [(0, 1, 4), (1, 2, 4), (2, 3, 4), (3, 0, 4), (0, 2, 1), (0, 3, 2)]
+    mesh = fg.PlotMesh(mesh_v, mesh_f, colormap="magma", pixel_width=640, pixel_height=280, height=240, flex_grow=0)
 
     stop = threading.Event()
 
@@ -59,7 +85,7 @@ def main() -> None:
     thread.start()
 
     window.set_content(
-        fg.Box(
+        fg.ScrollArea(fg.Box(
             direction="column",
             gap=10.0,
             padding=16.0,
@@ -71,9 +97,15 @@ def main() -> None:
                 scatter,
                 fg.Label("PlotHeatmap (viridis)", font_size="small"),
                 heat,
+                fg.Label("PlotHistogram / PlotBar", font_size="small"),
+                fg.Box(direction="row", gap=10.0, flex_grow=0.0, children=[hist, bar]),
+                fg.Label("PlotContour (filled) — same grid as the heatmap", font_size="small"),
+                contour,
+                fg.Label("PlotSurface / PlotScatter3D / PlotMesh — drag to orbit", font_size="small"),
+                fg.Box(direction="row", gap=10.0, flex_grow=0.0, children=[surface, scatter3d, mesh]),
                 status,
             ],
-        )
+        ))
     )
     try:
         window.run()

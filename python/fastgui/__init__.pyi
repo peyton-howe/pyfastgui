@@ -752,6 +752,147 @@ class PlotHeatmap:
     def reset_view(self) -> None: ...
     def window(self) -> tuple[float, float, float, float]: ...
 
+class PlotHistogram:
+    """Histogram of a 1-D sample. `bin_range` drops values outside that domain. Wheel/drag/double-click."""
+    def __init__(
+        self,
+        values: Any = None,
+        *,
+        bins: int = 20,
+        bin_range: tuple[float, float] | None = None,
+        color: RGBA | None = None,
+        background: RGBA | None = None,
+        pixel_width: int = 640,
+        pixel_height: int = 360,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+        interactive: bool = True,
+    ) -> None: ...
+    def set_data(self, values: Any) -> None: ...
+    def set_bins(self, bins: int) -> None: ...
+    def counts(self) -> list[float]: ...
+    def edges(self) -> list[float]: ...
+    def zoom(self, factor: float, fx: float, fy: float) -> None: ...
+    def pan(self, dx: float, dy: float) -> None: ...
+    def reset_view(self) -> None: ...
+    def view_range(self) -> tuple[tuple[float, float], tuple[float, float]]: ...
+
+class PlotBar:
+    """Vertical bars from a baseline of 0. `heights[i]` is category `i`."""
+    def __init__(
+        self,
+        heights: Any = None,
+        *,
+        color: RGBA | None = None,
+        background: RGBA | None = None,
+        pixel_width: int = 640,
+        pixel_height: int = 360,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+        interactive: bool = True,
+    ) -> None: ...
+    def set_data(self, heights: Any) -> None: ...
+    def zoom(self, factor: float, fx: float, fy: float) -> None: ...
+    def pan(self, dx: float, dy: float) -> None: ...
+    def reset_view(self) -> None: ...
+    def view_range(self) -> tuple[tuple[float, float], tuple[float, float]]: ...
+
+class PlotContour:
+    """Isolines of a 2-D grid. `levels` is a count or a sequence of values. `filled` paints bands."""
+    def __init__(
+        self,
+        values: Any = None,
+        *,
+        levels: int | Sequence[float] | None = None,
+        filled: bool = False,
+        colormap: str = "viridis",
+        background: RGBA | None = None,
+        v_range: tuple[float, float] | None = None,
+        pixel_width: int = 640,
+        pixel_height: int = 360,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+        interactive: bool = True,
+    ) -> None: ...
+    def set_data(self, values: Any) -> None: ...
+    def set_levels(self, levels: int | Sequence[float]) -> None: ...
+    def zoom(self, factor: float, fx: float, fy: float) -> None: ...
+    def pan(self, dx: float, dy: float) -> None: ...
+    def reset_view(self) -> None: ...
+    def window(self) -> tuple[float, float, float, float]: ...
+
+class PlotSurface:
+    """3-D surface. `z` is a height grid. Optional `x` and `y` are axes or grids of the same shape. Drag orbits."""
+    def __init__(
+        self,
+        z: Any = None,
+        *,
+        x: Any = None,
+        y: Any = None,
+        colormap: str = "viridis",
+        background: RGBA | None = None,
+        pixel_width: int = 640,
+        pixel_height: int = 360,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+        interactive: bool = True,
+    ) -> None: ...
+    def set_data(self, z: Any, x: Any = None, y: Any = None) -> None: ...
+    def zoom(self, factor: float, fx: float, fy: float) -> None: ...
+    def pan(self, dx: float, dy: float) -> None: ...
+    def reset_view(self) -> None: ...
+    def view(self) -> tuple[float, float, float]: ...
+
+class PlotScatter3D:
+    """3-D scatter. Pass `x, y, z` or one `(N, 3)` array. Drag orbits, wheel zooms. Colored by z."""
+    def __init__(
+        self,
+        x: Any = None,
+        y: Any = None,
+        z: Any = None,
+        *,
+        point_radius: float = 3.5,
+        colormap: str = "viridis",
+        background: RGBA | None = None,
+        pixel_width: int = 640,
+        pixel_height: int = 360,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+        interactive: bool = True,
+    ) -> None: ...
+    def set_data(self, x: Any, y: Any = None, z: Any = None) -> None: ...
+    def zoom(self, factor: float, fx: float, fy: float) -> None: ...
+    def pan(self, dx: float, dy: float) -> None: ...
+    def reset_view(self) -> None: ...
+    def view(self) -> tuple[float, float, float]: ...
+
+class PlotMesh:
+    """Triangle mesh. `vertices` is `(N, 3)`, `faces` is `(M, 3)` indexes. Drag orbits."""
+    def __init__(
+        self,
+        vertices: Any = None,
+        faces: Sequence[tuple[int, int, int]] | None = None,
+        *,
+        colormap: str = "viridis",
+        background: RGBA | None = None,
+        pixel_width: int = 640,
+        pixel_height: int = 360,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+        interactive: bool = True,
+    ) -> None: ...
+    def set_data(self, vertices: Any, faces: Sequence[tuple[int, int, int]]) -> None: ...
+    def zoom(self, factor: float, fx: float, fy: float) -> None: ...
+    def pan(self, dx: float, dy: float) -> None: ...
+    def reset_view(self) -> None: ...
+    def view(self) -> tuple[float, float, float]: ...
+
 class Gauge:
     def __init__(
         self,

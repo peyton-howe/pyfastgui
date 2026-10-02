@@ -1404,7 +1404,12 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
   CUDA ingest reads `__cuda_array_interface__` (`<f4`/`<f8`, C-contiguous) through
   `cuMemcpyDtoH` on the existing unverified driver — unsupported dtype/strides error before
   any copy; macOS raises `RuntimeError`. Same verification caveat as M3 (no NVIDIA GPU here).
-  Demo `plots_demo.py`.
+  Demo `plots_demo.py`. Histogram, bar, contour, height-field surface, and triangle mesh
+  use the same raster (`PlotHistogram`, `PlotBar`, `PlotContour`, `PlotSurface`, `PlotMesh`).
+  Contour is isolines on a heatmap grid (`filled=True` paints the bands). `PlotSurface` takes a
+  height grid plus optional x/y axes, `PlotScatter3D` takes `(x, y, z)` or an `(N, 3)` array, and
+  `PlotMesh` takes triangles. All three are projected on the CPU (drag orbits). Surface grids above
+  96² and scatters above 8,000 points are strided. No geometry shaders.
 - **Image/tensor viewer** — **Done:** `ImageViewer` resamples a numpy image or 2-D tensor
   (gray / viridis / magma), letterboxes inside the upload buffer, and reports the pixel under
   the cursor. Wheel / drag / double-click. `Viewport` and `Image` also take `fit="contain"`

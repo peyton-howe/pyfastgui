@@ -1,4 +1,5 @@
 mod backend;
+mod charts;
 mod dialogs;
 mod plots;
 mod tier4;
@@ -651,6 +652,7 @@ fn _fastgui(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CudaSurface>()?;
     widgets::register(m)?;
     plots::register(m)?;
+    charts::register(m)?;
     tier4::register(m)?;
     theme::register(m)?;
     dialogs::register(m)?;

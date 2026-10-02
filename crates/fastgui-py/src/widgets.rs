@@ -504,6 +504,24 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
     if let Ok(w) = obj.cast::<crate::plots::PlotHeatmap>() {
         return Ok(w.borrow().describe());
     }
+    if let Ok(w) = obj.cast::<crate::charts::PlotHistogram>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<crate::charts::PlotBar>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<crate::charts::PlotContour>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<crate::charts::PlotSurface>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<crate::charts::PlotScatter3D>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<crate::charts::PlotMesh>() {
+        return Ok(w.borrow().describe());
+    }
     if let Ok(w) = obj.cast::<crate::tier4::Gauge>() {
         return Ok(w.borrow().describe());
     }
@@ -539,7 +557,7 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
         return Ok(w.borrow().describe_widget());
     }
     Err(PyTypeError::new_err(
-        "expected a fastgui widget (Box, Grid, Label, Button, Slider, TextInput, TextArea, ScrollArea, ListView, Table, TreeView, Checkbox, Radio, Toggle, SpinBox, NumericScrub, ProgressBar, ComboBox, Image, PlotLine, PlotScatter, PlotHeatmap, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
+        "expected a fastgui widget (Box, Grid, Label, Button, Slider, TextInput, TextArea, ScrollArea, ListView, Table, TreeView, Checkbox, Radio, Toggle, SpinBox, NumericScrub, ProgressBar, ComboBox, Image, PlotLine, PlotScatter, PlotHeatmap, PlotHistogram, PlotBar, PlotContour, PlotSurface, PlotScatter3D, PlotMesh, Splitter, Panel, Tabs, Viewport, DockArea, ...)",
     ))
 }
 
@@ -563,6 +581,30 @@ pub(crate) fn bind_dispatch(obj: &Bound<'_, PyAny>, dispatch: &CommandDispatch) 
         return;
     }
     if let Ok(plot) = obj.cast::<crate::plots::PlotHeatmap>() {
+        plot.borrow().bind_dispatch(dispatch.clone());
+        return;
+    }
+    if let Ok(plot) = obj.cast::<crate::charts::PlotHistogram>() {
+        plot.borrow().bind_dispatch(dispatch.clone());
+        return;
+    }
+    if let Ok(plot) = obj.cast::<crate::charts::PlotBar>() {
+        plot.borrow().bind_dispatch(dispatch.clone());
+        return;
+    }
+    if let Ok(plot) = obj.cast::<crate::charts::PlotContour>() {
+        plot.borrow().bind_dispatch(dispatch.clone());
+        return;
+    }
+    if let Ok(plot) = obj.cast::<crate::charts::PlotSurface>() {
+        plot.borrow().bind_dispatch(dispatch.clone());
+        return;
+    }
+    if let Ok(plot) = obj.cast::<crate::charts::PlotScatter3D>() {
+        plot.borrow().bind_dispatch(dispatch.clone());
+        return;
+    }
+    if let Ok(plot) = obj.cast::<crate::charts::PlotMesh>() {
         plot.borrow().bind_dispatch(dispatch.clone());
         return;
     }

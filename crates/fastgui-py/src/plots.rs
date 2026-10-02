@@ -119,7 +119,7 @@ fn cuda_array(obj: &Bound<'_, PyAny>) -> PyResult<Option<(Vec<f64>, Vec<usize>)>
 }
 
 /// Accept a 1-D float buffer (numpy), a CUDA array, or any sequence of numbers.
-fn float_series(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
+pub(crate) fn float_series(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
     if let Some((values, shape)) = cuda_array(obj)? {
         if shape.len() != 1 {
             return Err(PyValueError::new_err("expected a 1-D CUDA float array"));
@@ -151,7 +151,7 @@ fn float_series(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
 }
 
 /// Accept a 2-D float buffer (numpy), a CUDA array, or nested sequences → (values row-major, rows, cols).
-fn float_grid(obj: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, usize, usize)> {
+pub(crate) fn float_grid(obj: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, usize, usize)> {
     if let Some((values, shape)) = cuda_array(obj)? {
         if shape.len() != 2 {
             return Err(PyValueError::new_err("expected a 2-D CUDA float array"));
@@ -223,7 +223,7 @@ pub(crate) fn contained_pointer(lx: f32, ly: f32, dx: f32, dy: f32, w: f32, h: f
     (fx, fy, ddx, ddy)
 }
 
-fn submit_frame(frames: &FrameSlot<CpuFrame>, dispatch: &Mutex<Option<CommandDispatch>>, frame: CpuFrame) {
+pub(crate) fn submit_frame(frames: &FrameSlot<CpuFrame>, dispatch: &Mutex<Option<CommandDispatch>>, frame: CpuFrame) {
     frames.submit(frame);
     if let Some(dispatch) = dispatch.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
         dispatch.waker.wake();
@@ -268,7 +268,7 @@ fn parse_series(series: &Bound<'_, PyAny>, fallback: [u8; 4]) -> PyResult<Vec<(V
     Ok(out)
 }
 
-fn style_from(
+pub(crate) fn style_from(
     background: Option<(f32, f32, f32, f32)>,
     series: Option<(f32, f32, f32, f32)>,
 ) -> PlotStyle {

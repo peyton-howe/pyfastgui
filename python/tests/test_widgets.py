@@ -169,6 +169,66 @@ class PlotTests(unittest.TestCase):
         heat.reset_view()
         self.assertEqual(heat.window(), (0.0, 1.0, 0.0, 1.0))
 
+    def test_histogram_bar_contour_surface_mesh(self):
+        hist = fg.PlotHistogram([0.0, 0.0, 0.0, 1.0, 1.0], bins=2, bin_range=(0.0, 1.0), pixel_width=80, pixel_height=60)
+        self.assertEqual(hist.counts(), [3.0, 2.0])
+        self.assertEqual(len(hist.edges()), 3)
+        zoomed = hist.view_range()
+        hist.zoom(2.0, 0.5, 0.5)
+        self.assertLess(hist.view_range()[0][1] - hist.view_range()[0][0], zoomed[0][1] - zoomed[0][0])
+        hist.set_data([0.0, 1.0])
+        self.assertEqual(hist.counts(), [1.0, 1.0])
+        hist.reset_view()
+
+        bar = fg.PlotBar([1.0, 4.0, 2.0], pixel_width=80, pixel_height=60)
+        (x0, x1), (y0, y1) = bar.view_range()
+        self.assertLess(x0, 0.0)
+        self.assertGreater(x1, 2.0)
+        self.assertLessEqual(y0, 0.0)
+        self.assertGreater(y1, 3.0)
+        bar.pan(0.1, 0.0)
+        self.assertNotEqual(bar.view_range()[0], (x0, x1))
+
+        grid = [[0.0, 1.0, 2.0], [0.0, 1.0, 2.0], [0.0, 1.0, 2.0]]
+        contour = fg.PlotContour(grid, levels=3, filled=True, pixel_width=80, pixel_height=60)
+        contour.zoom(2.0, 0.5, 0.5)
+        c0, c1, _, _ = contour.window()
+        self.assertLess(c1 - c0, 0.9)
+        contour.set_levels([0.5, 1.5])
+        contour.set_data(grid)
+        self.assertEqual(contour.window()[:2], (c0, c1))
+        contour.reset_view()
+        self.assertEqual(contour.window(), (0.0, 1.0, 0.0, 1.0))
+
+        surface = fg.PlotSurface(grid, x=[0.0, 1.0, 3.0], y=[0.0, 2.0, 4.0], pixel_width=64, pixel_height=48)
+        yaw, pitch, zoom = surface.view()
+        surface.pan(0.2, 0.0)
+        self.assertNotEqual(surface.view()[0], yaw)
+        surface.zoom(1.5, 0.5, 0.5)
+        self.assertGreater(surface.view()[2], zoom)
+        surface.reset_view()
+        self.assertEqual(surface.view(), (yaw, pitch, zoom))
+
+        mesh = fg.PlotMesh(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.2], [0.0, 1.0, 0.4]],
+            [(0, 1, 2)],
+            pixel_width=64,
+            pixel_height=48,
+        )
+        cloud = fg.PlotScatter3D([0.0, 1.0, 0.2], [0.0, 0.4, 1.0], [0.0, 0.5, 1.0], pixel_width=64, pixel_height=48)
+        cloud.pan(0.15, 0.0)
+        self.assertNotEqual(cloud.view()[0], yaw)
+        cloud.set_data([[0.0, 0.0, 0.0], [1.0, 0.2, 0.4], [0.2, 1.0, 0.8]])
+        cloud.reset_view()
+        self.assertEqual(cloud.view()[0], yaw)
+        with self.assertRaises(ValueError):
+            fg.PlotScatter3D([0.0, 1.0], [0.0], [0.0, 1.0])
+
+        mesh.pan(0.0, 0.1)
+        self.assertNotEqual(mesh.view()[1], pitch)
+        with self.assertRaises(ValueError):
+            fg.PlotMesh([[0.0, 0.0]], [(0, 0, 0)])
+
     def test_cuda_interface_rejects_dtype_before_any_copy(self):
         class FakeCuda:
             @property
