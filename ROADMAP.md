@@ -1173,6 +1173,29 @@ Concrete and fully achievable/verifiable on this machine (at least the Windows l
   (a root `.gitignore` already exists in the git tree — extend it if wheel/build artifacts
   grow).
 
+**Done (2026-10-01, M8 packaging, branch `m8-release`)** except the CI run and the publish:
+- **PyPI name:** `fastgui` is taken (an unrelated project by userElaina). The distribution is
+  **`pyfastgui`**; the import name stays `fastgui`. `pyfastgui` was free on 2026-10-01.
+- **abi3 floor is 3.11, not 3.10:** `PyBuffer` (`Viewport.submit_frame`, `Image`) is only in
+  the limited API from 3.11, and 3.10 reaches EOL this month. `fastgui-py` has an opt-in
+  `abi3` cargo feature (`pyo3/abi3-py311`). It's off by default so `maturin develop` and the
+  3.14t build stay version-specific; CI passes `--features abi3` for the GIL wheel only.
+- `pyproject.toml`: readme, PEP 639 license expression + `LICENSE-MIT` / `LICENSE-APACHE`,
+  classifiers, URLs, `examples`/`test` extras. `python/fastgui/py.typed` added.
+- `.github/workflows/wheels.yml`: {windows-x64, macos-arm64, manylinux_2_28 x86_64} ×
+  {abi3, cp314t}, plus an sdist, a smoke job (install from `dist/` with `--no-index`, import,
+  pytest on 3.11 / 3.14 / 3.14t per OS, run on a copy of the tests so `import fastgui` can't
+  hit the source tree), and trusted publishing on `v*` tags (`rc` → TestPyPI, else PyPI).
+  **Not yet run on GitHub.** It still needs the `testpypi`/`pypi` environments and trusted
+  publishers set up.
+- **Verified locally (Windows, Vulkan):** both wheels plus the sdist build. Fresh scratch venvs
+  installed from the wheels, run outside the repo, pass 76/76 tests on 3.14 and 3.14t (GIL
+  stays disabled on 3.14t). `widgets_demo` and `menus_demo` open, render correctly
+  (PrintWindow screenshots), and exit cleanly on WM_CLOSE with empty stderr, for both wheels.
+- **Remaining M8 gate:** green CI run; the plot demo from the wheel once 7E merges; one real-GPU
+  window from the wheel on macOS and Linux; TestPyPI `0.0.1rc1`; PyPI only after a three-OS
+  wheel install produces a window.
+
 ### 6C. Docs — done
 
 - `README.md` at the project root: what fastgui is and why (GPU-native, free-threaded-safe

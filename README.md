@@ -66,7 +66,19 @@ python your_script.py
 
 ## Install
 
-fastgui isn't published yet — build it from source with [maturin](https://www.maturin.rs/):
+fastgui isn't on PyPI yet. Release wheels are built in CI
+([`.github/workflows/wheels.yml`](.github/workflows/wheels.yml)) for Windows x64, macOS arm64
+and manylinux x86_64. Each platform gets a `cp311-abi3` wheel for every GIL CPython 3.11+ and a
+`cp314t` wheel for free-threaded 3.14. Once 0.0.1 is published:
+
+```
+pip install pyfastgui
+```
+
+The distribution is named `pyfastgui` because `fastgui` on PyPI is an unrelated project. You
+still `import fastgui`.
+
+Until then, build it from source with [maturin](https://www.maturin.rs/):
 
 ```
 git clone <this repo>
@@ -77,7 +89,8 @@ pip install maturin numpy
 maturin develop --release
 ```
 
-Requires CPython 3.10+. For the **free-threaded** build you need **CPython 3.14t**: the pinned
+Requires CPython 3.11+ (3.11 is where the buffer protocol joined the stable ABI, which
+`Viewport.submit_frame` and `Image` need). For the **free-threaded** build you need **CPython 3.14t**: the pinned
 PyO3 (0.29) refuses to build against a 3.13t interpreter, so a `python3.13t` venv fails at
 `maturin develop`. Regular (GIL) 3.13 is fine.
 
@@ -97,6 +110,16 @@ and a free-threaded CPython build (as this project's own development does), keep
 venvs and rebuild into each; see the note in ROADMAP.md about `maturin develop` resolving its
 target venv by naming convention (a folder literally named `.venv`), not by which venv's
 `maturin` binary you invoke — set `VIRTUAL_ENV` explicitly when targeting a differently-named venv.
+
+To build the same release wheels locally (into `dist/`):
+
+```
+maturin build --release --features abi3 --out dist      # cp311-abi3, any GIL CPython 3.11+
+maturin build --release -i python3.14t --out dist       # cp314t, free-threaded
+```
+
+The `abi3` cargo feature is off by default, so `maturin develop` and the free-threaded build
+stay version-specific.
 
 ## Examples
 
@@ -185,18 +208,27 @@ CPU pixmap with `FASTGUI_CHROME=cpu`); `fastgui-py` is the PyO3 layer and picks 
   build, all with zero validation errors. It hasn't been tested on Wayland or with a hardware
   GPU driver, and CUDA interop isn't implemented on Linux yet (`create_cuda_surface` raises
   `RuntimeError`).
+- **Wayland is untested.** winit picks Wayland when `WAYLAND_DISPLAY` is set; for 0.0.1 treat
+  that as unsupported and run under X11 or XWayland (unset `WAYLAND_DISPLAY`).
+- **Prebuilt wheels cover Windows x64, macOS arm64 and manylinux x86_64 only.** Intel Macs,
+  Linux aarch64 and Windows ARM build from source.
 - **Free-threaded Python means 3.14t.** PyO3 0.29 doesn't build for 3.13t (see
-  [Install](#install)).
-- **No text wrapping, scrolling, or keyboard input/focus handling** for any widget yet.
-- **`DockArea` / floating**: floating panels are real OS windows (move, resize, tear out by
-  dragging a docked panel outside the main window, re-dock by dropping onto the dock).
+  [Install](#install)). GIL builds need CPython 3.11+.
+- **No hover or disabled states** on controls yet (menu rows are the exception). Planned as one
+  theme-token pass across all widgets.
+- **Text editing gaps:** `TextArea` has no soft wrap, the caret doesn't blink, and clicking a
+  scrollbar track doesn't page. No bidi/RTL caret movement.
+- **No drag-and-drop** between widgets or from the OS (file drops), other than rearranging
+  docked panels.
+- **No accessibility support.** Screen readers can't see fastgui widgets yet.
+- **`Viewport` stretches its frame** to the layout rect instead of preserving aspect ratio.
+- **`Table`** has no column resize or sort, and **`DockArea`** layouts aren't saved or restored.
 - **`Viewport.submit_frame` always copies** the numpy/buffer into an owned `Vec<u8>` before
   upload. Expected for the CPU path; a packed-RGBA camera feed will want a fewer-copy path later.
-- **Automated tests are still thin.** `cargo test --workspace` (works on every platform; the
-  Metal crate compiles to empty off macOS) covers `FrameSlot`, `DropZone` classification and
-  preview rects, splitter ratio layout and hit slop, the × hit rect, and `WidgetTree`
-  layout/hit-test; `python -m unittest tests.test_dock_area` (from `python/`)
-  covers `DockArea` tree surgery. There is no GPU/window integration suite yet.
+- **No GPU/window integration suite.** `cargo test --workspace` (works on every platform; the
+  Metal crate compiles to empty off macOS) covers the core primitives, layout and hit-testing,
+  and `python -m pytest python/tests` covers the Python API headlessly. Window rendering is
+  verified by running the examples.
 - **`.venv`/`env` are local, machine-specific dev environments**, not checked in — a fresh
   clone needs its own `python -m venv` plus the Rust and platform GPU toolchain described in
   [Install](#install) before anything builds.
