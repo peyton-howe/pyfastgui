@@ -157,6 +157,8 @@ pub type PFN_cuDeviceGet =
 pub type PFN_cuDevicePrimaryCtxRetain =
     unsafe extern "system" fn(pctx: *mut CUcontext, dev: CUdevice) -> CUresult;
 pub type PFN_cuCtxSetCurrent = unsafe extern "system" fn(ctx: CUcontext) -> CUresult;
+pub type PFN_cuMemcpyDtoH =
+    unsafe extern "system" fn(dst_host: *mut c_void, src_device: CUdeviceptr, byte_count: usize) -> CUresult;
 pub type PFN_cuStreamCreate =
     unsafe extern "system" fn(phStream: *mut CUstream, flags: c_uint) -> CUresult;
 pub type PFN_cuStreamSynchronize = unsafe extern "system" fn(hStream: CUstream) -> CUresult;

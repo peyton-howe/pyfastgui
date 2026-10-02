@@ -536,6 +536,7 @@ mod tests {
                 on_change: Some(Arc::new(move |t| c.lock().unwrap().push(t))),
                 on_submit: Some(Arc::new(move |t| s.lock().unwrap().push(t))),
                 mirror: Some(mirror.clone()),
+                highlights: Vec::new(),
             },
         );
         tree.add_child(root, id);
@@ -574,6 +575,7 @@ mod tests {
                 on_change: Some(Arc::new(move |t| c.lock().unwrap().push(t))),
                 on_submit: Some(Arc::new(move |t| s.lock().unwrap().push(t))),
                 mirror: Some(mirror.clone()),
+                highlights: Vec::new(),
             },
         );
         tree.add_child(root, id);

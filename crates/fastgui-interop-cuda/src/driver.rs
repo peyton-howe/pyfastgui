@@ -17,6 +17,7 @@ pub(crate) struct CudaDriver {
     pub device_get: PFN_cuDeviceGet,
     pub device_primary_ctx_retain: PFN_cuDevicePrimaryCtxRetain,
     pub ctx_set_current: PFN_cuCtxSetCurrent,
+    pub memcpy_dtoh: PFN_cuMemcpyDtoH,
     pub stream_create: PFN_cuStreamCreate,
     pub stream_synchronize: PFN_cuStreamSynchronize,
     pub stream_destroy: PFN_cuStreamDestroy,
@@ -50,6 +51,7 @@ impl CudaDriver {
                 PFN_cuDevicePrimaryCtxRetain
             ),
             ctx_set_current: resolve!(lib, "cuCtxSetCurrent", PFN_cuCtxSetCurrent),
+            memcpy_dtoh: resolve!(lib, "cuMemcpyDtoH", PFN_cuMemcpyDtoH),
             stream_create: resolve!(lib, "cuStreamCreate", PFN_cuStreamCreate),
             stream_synchronize: resolve!(lib, "cuStreamSynchronize", PFN_cuStreamSynchronize),
             stream_destroy: resolve!(lib, "cuStreamDestroy", PFN_cuStreamDestroy),

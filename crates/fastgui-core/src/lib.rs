@@ -8,6 +8,7 @@
 //! `Viewport` frame. See ROADMAP.md for the milestone breakdown.
 
 mod frame;
+pub mod plot;
 mod queue;
 mod readback;
 pub mod text_edit;
@@ -17,6 +18,13 @@ pub mod widget;
 pub use frame::{
     AtlasUpload, ChromeFrame, ChromeQuad, ChromeQuads, CpuFrame, FrameSlot, PixelFormat, PixelRect,
     MAX_CPU_FRAME_EXTENT, QUAD_CIRCLE, QUAD_CIRCLE_CLIPPED, QUAD_SOLID, QUAD_SPRITE,
+};
+pub use plot::{
+    axis_fraction, bin_counts, pan_range, pan_window, raster_bars, raster_contour, raster_gauge, raster_graph,
+    raster_heatmap, raster_line, raster_lines, raster_mesh, raster_scatter, raster_scatter3d, raster_scatters,
+    raster_surface,
+    raster_timeline, zoom_range, zoom_window, AxisRange, Colormap, GraphNode, MeshView, PlotSeries, PlotStyle,
+    TimelineClip,
 };
 pub use queue::{command_channel, oneshot_channel, CommandReceiver, CommandSender, OneshotReceiver, OneshotSender};
 pub use readback::Readback;

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use fastgui_core::widget::Rect;
+use fastgui_core::widget::{LayerFit, Rect};
 use fastgui_core::{ChromeFrame, ChromeQuads, CpuFrame};
 use winit::window::Window;
 
@@ -33,6 +33,28 @@ pub struct ViewportDraw {
     pub viewport_id: u64,
     pub rect: Rect,
     pub visible: Rect,
+    pub fit: LayerFit,
+}
+
+impl ViewportDraw {
+    /// Shrink `rect` so a `content_w`×`content_h` texture keeps its aspect ratio inside it.
+    /// Stretch (and an unknown content size) leaves the rect alone.
+    pub fn letterboxed(mut self, content_w: u32, content_h: u32) -> Self {
+        if self.fit != LayerFit::Contain || content_w == 0 || content_h == 0 {
+            return self;
+        }
+        let (cw, ch) = (content_w as f32, content_h as f32);
+        let scale = (self.rect.width / cw).min(self.rect.height / ch);
+        if !scale.is_finite() || scale <= 0.0 {
+            return self;
+        }
+        let (w, h) = (cw * scale, ch * scale);
+        self.rect.x += (self.rect.width - w) * 0.5;
+        self.rect.y += (self.rect.height - h) * 0.5;
+        self.rect.width = w;
+        self.rect.height = h;
+        self
+    }
 }
 
 impl ViewportDraw {
@@ -106,7 +128,19 @@ mod tests {
     fn scrolled_viewport_is_cut_not_squashed() {
         let rect = Rect { x: 10.0, y: -40.0, width: 200.0, height: 100.0 };
         let visible = Rect { x: 0.0, y: 0.0, width: 150.0, height: 500.0 };
-        let draw = ViewportDraw { viewport_id: 1, rect, visible };
+        let draw = ViewportDraw { viewport_id: 1, rect, visible, fit: LayerFit::Stretch };
+        let contained = ViewportDraw { fit: LayerFit::Contain, ..draw }.letterboxed(100, 50);
+        assert!((contained.rect.height - 100.0).abs() < 0.1, "100x50 in a 200x100 rect fills it");
+        let wide = ViewportDraw {
+            rect: Rect { x: 0.0, y: 0.0, width: 200.0, height: 200.0 },
+            visible: Rect { x: 0.0, y: 0.0, width: 200.0, height: 200.0 },
+            fit: LayerFit::Contain,
+            ..draw
+        }
+        .letterboxed(100, 50);
+        assert!((wide.rect.width - 200.0).abs() < 0.1);
+        assert!((wide.rect.height - 100.0).abs() < 0.1);
+        assert!((wide.rect.y - 50.0).abs() < 0.1);
         let (viewport, scissor) = draw.viewport_and_scissor(800, 600).unwrap();
         assert_eq!(viewport, [10.0, -40.0, 200.0, 100.0], "full size, partly above the window");
         assert_eq!(scissor, [10, 0, 140, 60], "only the part inside the clip and the target");

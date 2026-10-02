@@ -28,7 +28,7 @@ use cosmic_text::{Attrs, Buffer, Color as CosmicColor, Family, FontSystem, Metri
 use fastgui_core::text_edit::{TextEdit, TextMeasure};
 use fastgui_core::theme::chrome_theme;
 use fastgui_core::widget::{
-    Color, DropZone, WidgetKind, WidgetTree, LINE_HEIGHT_RATIO as LAYOUT_LINE_HEIGHT_RATIO,
+    Color, DropZone, LayerFit, WidgetKind, WidgetTree, LINE_HEIGHT_RATIO as LAYOUT_LINE_HEIGHT_RATIO,
     TEXT_INPUT_PADDING, TEXT_INPUT_VERTICAL_PADDING,
 };
 use fastgui_core::{ChromeFrame, PixelRect};
@@ -559,6 +559,7 @@ impl ChromeRenderer {
                     scroll_x,
                     scroll_y,
                     preedit,
+                    highlights,
                     ..
                 } => {
                     push_fill(&mut ops, rect, *background);
@@ -574,12 +575,17 @@ impl ChromeRenderer {
                         caret_color: theme.accent,
                         scroll_x: *scroll_x,
                         scroll_y: *scroll_y,
+                        highlights,
                     };
                     self.push_text_area(&mut ops, logical_rect, scale, &field);
                 }
-                WidgetKind::Viewport { .. } | WidgetKind::Image { .. } => {
+                WidgetKind::Viewport { fit, .. } | WidgetKind::Image { fit, .. } => {
                     // Placeholder only — the GPU draws the real frame in this rect after chrome.
-                    push_fill(&mut ops, rect, Color([0.05, 0.06, 0.08, 1.0]));
+                    // Contain leaves the bars unpainted so the parent background shows around
+                    // the letterboxed texture instead of a stretched fill.
+                    if *fit != LayerFit::Contain {
+                        push_fill(&mut ops, rect, Color([0.05, 0.06, 0.08, 1.0]));
+                    }
                 }
                 WidgetKind::Checkbox {
                     checked,
@@ -817,7 +823,17 @@ impl ChromeRenderer {
                         }
                     }
                     if !line.is_empty() {
-                        self.push_line_text(&mut content, line_rect, line, font_size, scroll_x, field.text_color);
+                        self.push_highlighted_line(
+                            &mut content,
+                            line,
+                            line_start,
+                            line_rect,
+                            inner,
+                            font_size,
+                            scroll_x,
+                            field.text_color,
+                            field.highlights,
+                        );
                     }
                     if let Some(range) = &composing {
                         let c0 = range.start.max(line_start);
@@ -907,6 +923,71 @@ impl ChromeRenderer {
             let width = (CARET_WIDTH * scale).max(1.0);
             let x = x_at(caret).round().clamp(inner.x, inner.x + inner.width - width);
             push_fill(ops, WidgetRect { x, width, ..inner }, field.caret_color);
+        }
+    }
+
+    /// Draw `line` in `default` color, or split it into colored runs when `highlights` overlap.
+    /// Caret placement stays on the full line's stops (computed by the caller); each run is
+    /// positioned with those same stops so a token's x matches the uncolored line.
+    #[allow(clippy::too_many_arguments)]
+    fn push_highlighted_line(
+        &mut self,
+        ops: &mut Vec<Op>,
+        line: &str,
+        line_start: usize,
+        line_rect: WidgetRect,
+        inner: WidgetRect,
+        font_size: f32,
+        scroll_x: f32,
+        default: Color,
+        highlights: &[(usize, usize, Color)],
+    ) {
+        let line_end = line_start + line.len();
+        let overlaps = highlights.iter().any(|&(start, end, _)| end > line_start && start < line_end);
+        if !overlaps {
+            self.push_line_text(ops, line_rect, line, font_size, scroll_x, default);
+            return;
+        }
+        let stops = self.line_stops(line, font_size);
+        let mut cuts = vec![0usize, line.len()];
+        let mut spans: Vec<(usize, usize, Color)> = Vec::new();
+        for &(start, end, color) in highlights {
+            if end <= line_start || start >= line_end {
+                continue;
+            }
+            let a = start.max(line_start) - line_start;
+            let b = end.min(line_end) - line_start;
+            if a < b && line.is_char_boundary(a) && line.is_char_boundary(b) {
+                cuts.push(a);
+                cuts.push(b);
+                spans.push((a, b, color));
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut drew = false;
+        for pair in cuts.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if a >= b || !line.is_char_boundary(a) || !line.is_char_boundary(b) {
+                continue;
+            }
+            let piece = &line[a..b];
+            if piece.is_empty() {
+                continue;
+            }
+            let color = spans.iter().rev().find(|(s, e, _)| *s <= a && b <= *e).map(|s| s.2).unwrap_or(default);
+            let x = inner.x + stop_x(&stops, a) - scroll_x;
+            let seg = WidgetRect {
+                x,
+                y: line_rect.y,
+                width: (inner.x + inner.width - x).max(font_size),
+                height: line_rect.height,
+            };
+            self.push_line_text(ops, seg, piece, font_size, 0.0, color);
+            drew = true;
+        }
+        if !drew {
+            self.push_line_text(ops, line_rect, line, font_size, scroll_x, default);
         }
     }
 
@@ -1203,6 +1284,7 @@ struct TextAreaField<'a> {
     caret_color: Color,
     scroll_x: f32,
     scroll_y: f32,
+    highlights: &'a [(usize, usize, Color)],
 }
 
 /// X of the caret before byte `index`: the last stop at or before it (inside a multi-glyph

@@ -60,6 +60,19 @@ impl CudaContext {
     fn make_current(&self) -> Result<(), CudaError> {
         unsafe { self.driver.check((self.driver.ctx_set_current)(self.context)) }
     }
+
+    /// Copy `src` device memory into `dst`. Unverified against a real CUDA driver — same caveat
+    /// as the rest of this crate.
+    pub fn copy_device_to_host(&self, src: u64, dst: &mut [u8]) -> Result<(), CudaError> {
+        self.make_current()?;
+        unsafe {
+            self.driver.check((self.driver.memcpy_dtoh)(
+                dst.as_mut_ptr().cast::<std::ffi::c_void>(),
+                src,
+                dst.len(),
+            ))
+        }
+    }
 }
 
 /// A CUDA stream, used to order the semaphore signal issued by `ExternalSemaphore::signal`.

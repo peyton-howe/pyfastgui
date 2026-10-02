@@ -769,6 +769,11 @@ impl VulkanRenderer {
             }
             for draw in viewports {
                 let Some(layer) = self.layers.get(&draw.viewport_id) else { continue };
+                let (cw, ch) = match &layer.image {
+                    GpuImage::Cpu(texture) => (texture.width, texture.height),
+                    GpuImage::Cuda(_) => (0, 0),
+                };
+                let draw = draw.letterboxed(cw, ch);
                 let Some(([x, y, width, height], [sx, sy, sw, sh])) =
                     draw.viewport_and_scissor(self.extent.width, self.extent.height)
                 else {
