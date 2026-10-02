@@ -19,7 +19,11 @@ pub use frame::{
     AtlasUpload, ChromeFrame, ChromeQuad, ChromeQuads, CpuFrame, FrameSlot, PixelFormat, PixelRect,
     MAX_CPU_FRAME_EXTENT, QUAD_CIRCLE, QUAD_CIRCLE_CLIPPED, QUAD_SOLID, QUAD_SPRITE,
 };
-pub use plot::{raster_heatmap, raster_line, raster_scatter, AxisRange, Colormap, PlotStyle};
+pub use plot::{
+    axis_fraction, pan_range, pan_window, raster_gauge, raster_graph, raster_heatmap, raster_line, raster_lines,
+    raster_scatter, raster_scatters, raster_timeline, zoom_range, zoom_window, AxisRange, Colormap,
+    GraphNode, PlotSeries, PlotStyle, TimelineClip,
+};
 pub use queue::{command_channel, oneshot_channel, CommandReceiver, CommandSender, OneshotReceiver, OneshotSender};
 pub use readback::Readback;
 

@@ -142,6 +142,109 @@ class PlotTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fg.PlotLine([1.0], [1.0, 2.0])
 
+    def test_zoom_pan_and_series_keep_the_view(self):
+        line = fg.PlotLine([0.0, 1.0], [0.0, 1.0], x_range=(0.0, 10.0), y_range=(0.0, 10.0), pixel_width=100, pixel_height=80)
+        line.zoom(2.0, 0.5, 0.5)
+        (x0, x1), _y = line.view_range()
+        self.assertLess(x1 - x0, 9.0)
+        zoomed = line.view_range()
+        line.set_data([0.0, 1.0, 2.0], [0.0, 1.0, 0.0])
+        self.assertEqual(line.view_range(), zoomed)
+        line.set_series([([0.0, 1.0], [0.0, 1.0], (1.0, 0.0, 0.0, 1.0)), ([0.0, 1.0], [1.0, 0.0])])
+        line.reset_view()
+        self.assertEqual(line.view_range()[0], (0.0, 10.0))
+        scatter = fg.PlotScatter([0.0, 1.0], [0.0, 1.0], x_range=(0.0, 4.0), y_range=(0.0, 4.0), pixel_width=80, pixel_height=60)
+        scatter.pan(0.25, 0.0)
+        (sx0, sx1), _sy = scatter.view_range()
+        # Positive pan is a drag to the right, which shifts the window toward smaller x.
+        self.assertLess(sx0, -0.5)
+        self.assertLess(sx1, 4.0)
+        heat = fg.PlotHeatmap([[1.0, 2.0], [3.0, 4.0]], pixel_width=80, pixel_height=60)
+        heat.zoom(2.0, 0.5, 0.5)
+        c0, c1, r0, r1 = heat.window()
+        self.assertLess(c1 - c0, 0.9)
+        self.assertLess(r1 - r0, 0.9)
+        heat.set_data([[5.0, 6.0, 7.0], [8.0, 9.0, 10.0]])
+        self.assertEqual(heat.window(), (c0, c1, r0, r1))
+        heat.reset_view()
+        self.assertEqual(heat.window(), (0.0, 1.0, 0.0, 1.0))
+
+    def test_cuda_interface_rejects_dtype_before_any_copy(self):
+        class FakeCuda:
+            @property
+            def __cuda_array_interface__(self):
+                return {"shape": (4,), "typestr": "<i4", "data": (1, False), "strides": None, "version": 3}
+
+        with self.assertRaises(ValueError):
+            fg.PlotLine(FakeCuda(), [0.0, 1.0, 2.0, 3.0])
+
+        class Strided:
+            @property
+            def __cuda_array_interface__(self):
+                return {"shape": (4,), "typestr": "<f4", "data": (1, False), "strides": (8,), "version": 3}
+
+        with self.assertRaises(ValueError):
+            fg.PlotLine(Strided(), [0.0, 1.0, 2.0, 3.0])
+
+
+class Tier4Tests(unittest.TestCase):
+    def test_gauge_timeline_nodegraph(self):
+        gauge = fg.Gauge(value=0.25, min=0.0, max=1.0, pixel_width=40, pixel_height=30)
+        gauge.set_value(0.5)
+        self.assertEqual(gauge.value, 0.5)
+        timeline = fg.Timeline(tracks=[[(0.0, 1.0)]], duration=4.0, time=0.5, pixel_width=40, pixel_height=24)
+        timeline.set_time(1.25)
+        self.assertEqual(timeline.time, 1.25)
+        graph = fg.NodeGraph(nodes=[(1.0, 2.0, "A"), (10.0, 4.0, 30.0, 16.0, "B")], edges=[(0, 1)], pixel_width=80, pixel_height=40)
+        nodes = graph.nodes()
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(nodes[0][4], "A")
+        self.assertEqual(nodes[1][2], 30.0)
+
+    def test_viewer_log_editor_palette_observable(self):
+        import numpy as np
+
+        seen = []
+        viewer = fg.ImageViewer(np.arange(12, dtype=np.float32).reshape(3, 4), colormap="gray", on_readout=seen.append, pixel_width=32, pixel_height=24)
+        self.assertIsNotNone(viewer._fastgui_widget)
+        viewer._pointer(3, 0.0, 0.0, 16.0, 12.0, 32.0, 24.0)
+        self.assertTrue(seen)
+        viewer._pointer(0, 0.0, -1.0, 16.0, 12.0, 32.0, 24.0)
+        viewer.reset_view()
+
+        log = fg.LogView(max_lines=2)
+        log.append("one")
+        log.append("two\nthree")
+        self.assertEqual(len(log), 2)
+        log.clear()
+        self.assertEqual(len(log), 0)
+
+        editor = fg.CodeEditor("def f():\n    return 1\n")
+        self.assertIn("def", editor.text)
+        editor.set_text("# hi\n")
+        self.assertTrue(editor.text.startswith("#"))
+
+        ran = []
+        palette = fg.CommandPalette([("Go", lambda: ran.append(1))])
+        self.assertEqual(palette.accelerators()[0][0], "Ctrl+K")
+        palette._apply("go")
+        palette._run(0)
+        self.assertEqual(ran, [1])
+
+        obs = fg.Observable(0.2)
+        label = obs.bind_label(fmt=lambda v: str(v))
+        field = obs.text_input()
+        slider = obs.slider(min=0.0, max=1.0)
+        obs.set(0.6)
+        self.assertAlmostEqual(slider.value, 0.6)
+        self.assertEqual(field.text, "0.6")
+        field.set_text("later")
+        # set_text does not fire on_change, so the observable stays put.
+        self.assertEqual(obs.get(), 0.6)
+        obs.set("hi")
+        self.assertEqual(field.text, "hi")
+        self.assertIsNotNone(label)
+
 
 class PopupTests(unittest.TestCase):
     def test_closed_until_shown_and_close_is_a_no_op(self):

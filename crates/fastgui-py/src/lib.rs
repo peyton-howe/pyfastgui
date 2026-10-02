@@ -1,6 +1,7 @@
 mod backend;
 mod dialogs;
 mod plots;
+mod tier4;
 mod theme;
 mod widgets;
 
@@ -45,17 +46,26 @@ pub(crate) struct Viewport {
     // window, so `submit_frame` can wake the idle event loop and `create_cuda_surface` can
     // reach the right render thread.
     dispatch: Mutex<Option<CommandDispatch>>,
+    fit: fastgui_core::widget::LayerFit,
 }
 
 #[pymethods]
 impl Viewport {
+    /// `fit` is `"stretch"` (fill the widget, historical) or `"contain"` (letterbox).
     #[new]
-    fn new() -> Self {
-        Self {
+    #[pyo3(signature = (fit="stretch"))]
+    fn new(fit: &str) -> PyResult<Self> {
+        let fit = match fit.trim().to_ascii_lowercase().as_str() {
+            "stretch" | "" => fastgui_core::widget::LayerFit::Stretch,
+            "contain" | "fit" => fastgui_core::widget::LayerFit::Contain,
+            _ => return Err(PyValueError::new_err("fit must be 'stretch' or 'contain'")),
+        };
+        Ok(Self {
             viewport_id: next_viewport_id(),
             frame_slot: FrameSlot::new(),
             dispatch: Mutex::new(None),
-        }
+            fit,
+        })
     }
 
     /// Submit a `(height, width, 3-or-4)` uint8 array (or any other object implementing the
@@ -231,7 +241,7 @@ impl Viewport {
     }
 
     pub(crate) fn describe_widget(&self) -> widgets::DescribedWidget {
-        widgets::described_viewport(self.viewport_id, self.frame_slot.clone())
+        widgets::described_viewport(self.viewport_id, self.frame_slot.clone(), self.fit)
     }
 }
 
@@ -641,6 +651,7 @@ fn _fastgui(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CudaSurface>()?;
     widgets::register(m)?;
     plots::register(m)?;
+    tier4::register(m)?;
     theme::register(m)?;
     dialogs::register(m)?;
     Ok(())

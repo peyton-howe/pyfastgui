@@ -374,10 +374,14 @@ struct TabBarSpec {
     on_close: Vec<Option<PanelCloseCallback>>,
 }
 
-pub(crate) fn described_viewport(viewport_id: u64, frames: fastgui_core::FrameSlot<fastgui_core::CpuFrame>) -> DescribedWidget {
+pub(crate) fn described_viewport(
+    viewport_id: u64,
+    frames: fastgui_core::FrameSlot<fastgui_core::CpuFrame>,
+    fit: fastgui_core::widget::LayerFit,
+) -> DescribedWidget {
     DescribedWidget {
         style: StyleParams::leaf(1.0, None, None),
-        kind: WidgetKind::Viewport { viewport_id, frames },
+        kind: WidgetKind::Viewport { viewport_id, frames, fit },
         id_cell: Arc::new(Mutex::new(None)),
         sender_cell: Arc::new(Mutex::new(None)),
         children: Vec::new(),
@@ -500,6 +504,15 @@ pub(crate) fn describe(obj: &Bound<'_, PyAny>) -> PyResult<DescribedWidget> {
     if let Ok(w) = obj.cast::<crate::plots::PlotHeatmap>() {
         return Ok(w.borrow().describe());
     }
+    if let Ok(w) = obj.cast::<crate::tier4::Gauge>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<crate::tier4::Timeline>() {
+        return Ok(w.borrow().describe());
+    }
+    if let Ok(w) = obj.cast::<crate::tier4::NodeGraph>() {
+        return Ok(w.borrow().describe());
+    }
     if let Ok(w) = obj.cast::<Grid>() {
         return w.borrow().describe();
     }
@@ -551,6 +564,18 @@ pub(crate) fn bind_dispatch(obj: &Bound<'_, PyAny>, dispatch: &CommandDispatch) 
     }
     if let Ok(plot) = obj.cast::<crate::plots::PlotHeatmap>() {
         plot.borrow().bind_dispatch(dispatch.clone());
+        return;
+    }
+    if let Ok(gauge) = obj.cast::<crate::tier4::Gauge>() {
+        gauge.borrow().bind_dispatch(dispatch.clone());
+        return;
+    }
+    if let Ok(timeline) = obj.cast::<crate::tier4::Timeline>() {
+        timeline.borrow().bind_dispatch(dispatch.clone());
+        return;
+    }
+    if let Ok(graph) = obj.cast::<crate::tier4::NodeGraph>() {
+        graph.borrow().bind_dispatch(dispatch.clone());
         return;
     }
     if let Ok(box_widget) = obj.cast::<BoxWidget>() {
@@ -995,7 +1020,7 @@ impl Button {
 pub(crate) struct Slider {
     id: IdCell,
     sender: SenderCell,
-    value: f32,
+    value: Readback<f32>,
     min: f32,
     max: f32,
     track_color: Option<(f32, f32, f32, f32)>,
@@ -1028,7 +1053,7 @@ impl Slider {
         Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
-            value,
+            value: Readback::new(value),
             min,
             max,
             track_color,
@@ -1038,9 +1063,20 @@ impl Slider {
         }
     }
 
+    #[getter]
+    fn value(&self) -> f32 {
+        self.value.get()
+    }
+
     /// Set the slider's value programmatically (as opposed to the user dragging it). Does
     /// *not* invoke `on_change` — that callback is for user-driven changes only.
+    /// Works before the slider is attached to a window.
     fn set_value(&self, value: f32) -> PyResult<()> {
+        let value = clamp_range(value, self.min, self.max);
+        self.value.set(value);
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
         mutate(&self.id, &self.sender, move |kind| {
             if let WidgetKind::Slider { value: current, min, max, .. } = kind {
                 *current = clamp_range(value, *min, *max);
@@ -1051,16 +1087,27 @@ impl Slider {
 
 impl Slider {
     fn describe(&self) -> DescribedWidget {
-        let on_change = self.on_change.as_ref().map(|cb| Python::attach(|py| cb.clone_ref(py)));
+        let user = self.on_change.as_ref().map(|cb| Python::attach(|py| cb.clone_ref(py)));
+        let mirror = self.value.clone();
+        let on_change: ChangeCallback = Arc::new(move |value| {
+            mirror.set(value);
+            if let Some(cb) = &user {
+                Python::attach(|py| {
+                    if let Err(err) = cb.call1(py, (value,)) {
+                        err.print(py);
+                    }
+                });
+            }
+        });
         DescribedWidget {
             style: StyleParams::leaf(0.0, None, Some(24.0)),
             kind: WidgetKind::Slider {
-                value: self.value,
+                value: self.value.get(),
                 min: self.min,
                 max: self.max,
                 track_color: rgba(self.track_color.unwrap_or(crate::theme::palette().track)),
                 thumb_color: rgba(self.thumb_color.unwrap_or(crate::theme::palette().accent)),
-                on_change: on_change.map(wrap_callback1),
+                on_change: Some(on_change),
             },
             id_cell: self.id.clone(),
             sender_cell: self.sender.clone(),
@@ -1221,6 +1268,7 @@ pub(crate) struct TextArea {
     selection_color: Option<(f32, f32, f32, f32)>,
     on_change: Option<Py<PyAny>>,
     on_submit: Option<Py<PyAny>>,
+    highlights: Mutex<Vec<(usize, usize, fastgui_core::widget::Color)>>,
 }
 
 #[pymethods]
@@ -1270,6 +1318,7 @@ impl TextArea {
             selection_color,
             on_change,
             on_submit,
+            highlights: Mutex::new(Vec::new()),
         }
     }
 
@@ -1277,6 +1326,24 @@ impl TextArea {
     #[getter]
     fn text(&self) -> String {
         self.text.get()
+    }
+
+    /// Replace syntax-color spans `(start_byte, end_byte, rgba)`. Empty clears them.
+    fn set_highlights(&self, spans: Vec<(usize, usize, (f32, f32, f32, f32))>) -> PyResult<()> {
+        let spans: Vec<_> = spans
+            .into_iter()
+            .filter(|(start, end, _)| end > start)
+            .map(|(start, end, color)| (start, end, rgba(color)))
+            .collect();
+        *self.highlights.lock().unwrap_or_else(|p| p.into_inner()) = spans.clone();
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return Ok(());
+        }
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::TextArea { highlights, .. } = kind {
+                *highlights = spans;
+            }
+        })
     }
 
     /// Replace the text (caret to the end, undo history cleared). Doesn't call `on_change`.
@@ -1321,6 +1388,7 @@ impl TextArea {
                 on_change: on_change.map(wrap_callback_text),
                 on_submit: on_submit.map(wrap_callback_text),
                 mirror: Some(self.text.clone()),
+                highlights: self.highlights.lock().unwrap_or_else(|p| p.into_inner()).clone(),
             },
             id_cell: self.id.clone(),
             sender_cell: self.sender.clone(),
@@ -3241,14 +3309,22 @@ pub(crate) struct Image {
     width: Option<f32>,
     height: Option<f32>,
     flex_grow: f32,
+    fit: fastgui_core::widget::LayerFit,
+    on_pointer: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl Image {
     #[new]
-    #[pyo3(signature = (width=None, height=None, flex_grow=1.0))]
-    fn new(width: Option<f32>, height: Option<f32>, flex_grow: f32) -> Self {
-        Self {
+    #[pyo3(signature = (width=None, height=None, flex_grow=1.0, fit="stretch", on_pointer=None))]
+    fn new(
+        width: Option<f32>,
+        height: Option<f32>,
+        flex_grow: f32,
+        fit: &str,
+        on_pointer: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        Ok(Self {
             image_id: next_image_id(),
             frames: FrameSlot::new(),
             dispatch: Mutex::new(None),
@@ -3257,7 +3333,9 @@ impl Image {
             width,
             height,
             flex_grow,
-        }
+            fit: parse_fit(fit)?,
+            on_pointer,
+        })
     }
 
     /// Submit a `(height, width, 3|4)` uint8 array as the image contents.
@@ -3300,7 +3378,27 @@ impl Image {
     }
 }
 
+fn parse_fit(fit: &str) -> PyResult<fastgui_core::widget::LayerFit> {
+    match fit.trim().to_ascii_lowercase().as_str() {
+        "stretch" | "" => Ok(fastgui_core::widget::LayerFit::Stretch),
+        "contain" | "fit" => Ok(fastgui_core::widget::LayerFit::Contain),
+        _ => Err(PyValueError::new_err("fit must be 'stretch' or 'contain'")),
+    }
+}
+
 impl Image {
+    fn pointer_callback(&self) -> Option<fastgui_core::widget::PointerCallback> {
+        let callback = self.on_pointer.as_ref()?;
+        let callback = Python::attach(|py| callback.clone_ref(py));
+        Some(Arc::new(move |action, dx, dy, x, y, w, h| {
+            Python::attach(|py| {
+                if let Err(err) = callback.call1(py, (action, dx, dy, x, y, w, h)) {
+                    err.print(py);
+                }
+            });
+        }))
+    }
+
     fn bind_dispatch(&self, dispatch: CommandDispatch) {
         *self.dispatch.lock().unwrap_or_else(|p| p.into_inner()) = Some(dispatch);
     }
@@ -3308,7 +3406,12 @@ impl Image {
     fn describe(&self) -> DescribedWidget {
         DescribedWidget {
             style: StyleParams::leaf(self.flex_grow, self.width, self.height),
-            kind: WidgetKind::Image { image_id: self.image_id, frames: self.frames.clone() },
+            kind: WidgetKind::Image {
+                image_id: self.image_id,
+                frames: self.frames.clone(),
+                fit: self.fit,
+                on_pointer: self.pointer_callback(),
+            },
             id_cell: self.id.clone(),
             sender_cell: self.sender.clone(),
             children: Vec::new(),

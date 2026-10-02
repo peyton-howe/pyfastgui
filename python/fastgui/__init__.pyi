@@ -73,6 +73,8 @@ class Slider:
         tooltip: str | None = None,
     ) -> None: ...
     def set_value(self, value: float) -> None: ...
+    @property
+    def value(self) -> float: ...
 
 class TextInput:
     """A single-line editable text field. Click or Tab to focus; supports selection, word
@@ -120,6 +122,9 @@ class TextArea:
         """The current text, including the user's latest edits. Safe from any thread."""
     def set_text(self, text: str) -> None:
         """Replace the text without calling `on_change`. Works before the field is attached."""
+    def set_highlights(self, spans: Sequence[tuple[int, int, RGBA]]) -> None:
+        """Color byte spans `(start, end, rgba)`. Empty clears them. The caret still uses the
+        full line's glyph stops."""
 
 class ScrollArea:
     """A scrollable viewport onto `content`. The mouse wheel / trackpad scrolls it (the innermost
@@ -490,6 +495,8 @@ class Image:
         width: float | None = None,
         height: float | None = None,
         flex_grow: float = 1.0,
+        fit: str = "stretch",
+        on_pointer: Callable[[int, float, float, float, float, float, float], None] | None = None,
     ) -> None: ...
     def set_image(self, data: Any) -> None:
         """Submit a (H, W, 3|4) uint8 array."""
@@ -667,3 +674,191 @@ class Window:
     @property
     def clear_color(self) -> tuple[float, float, float, float]: ...
     def run(self) -> None: ...
+
+class PlotLine:
+    """Polyline plot rasterized to an RGBA image layer. Wheel zoom, drag pan, double-click reset
+    when `interactive` (the default). `set_data` keeps the current view."""
+    def __init__(
+        self,
+        x: Any = None,
+        y: Any = None,
+        *,
+        color: RGBA | None = None,
+        background: RGBA | None = None,
+        thickness: float = 2.0,
+        x_range: tuple[float, float] | None = None,
+        y_range: tuple[float, float] | None = None,
+        pixel_width: int = 640,
+        pixel_height: int = 360,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+        interactive: bool = True,
+    ) -> None: ...
+    def set_data(self, x: Any, y: Any) -> None: ...
+    def set_series(self, series: Sequence[Any]) -> None: ...
+    def set_range(self, x_range: tuple[float, float] | None = None, y_range: tuple[float, float] | None = None) -> None: ...
+    def zoom(self, factor: float, fx: float, fy: float) -> None: ...
+    def pan(self, dx: float, dy: float) -> None: ...
+    def reset_view(self) -> None: ...
+    def view_range(self) -> tuple[tuple[float, float], tuple[float, float]]: ...
+
+class PlotScatter:
+    """Scatter plot. Same interaction and `set_series` shape as `PlotLine`."""
+    def __init__(
+        self,
+        x: Any = None,
+        y: Any = None,
+        *,
+        color: RGBA | None = None,
+        background: RGBA | None = None,
+        point_radius: float = 3.0,
+        x_range: tuple[float, float] | None = None,
+        y_range: tuple[float, float] | None = None,
+        pixel_width: int = 640,
+        pixel_height: int = 360,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+        interactive: bool = True,
+    ) -> None: ...
+    def set_data(self, x: Any, y: Any) -> None: ...
+    def set_series(self, series: Sequence[Any]) -> None: ...
+    def set_range(self, x_range: tuple[float, float] | None = None, y_range: tuple[float, float] | None = None) -> None: ...
+    def zoom(self, factor: float, fx: float, fy: float) -> None: ...
+    def pan(self, dx: float, dy: float) -> None: ...
+    def reset_view(self) -> None: ...
+    def view_range(self) -> tuple[tuple[float, float], tuple[float, float]]: ...
+
+class PlotHeatmap:
+    """2-D heatmap (`viridis`, `magma`, or `gray`). Pan/zoom moves a window over the grid."""
+    def __init__(
+        self,
+        values: Any = None,
+        *,
+        colormap: str = "viridis",
+        background: RGBA | None = None,
+        v_range: tuple[float, float] | None = None,
+        pixel_width: int = 640,
+        pixel_height: int = 360,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+        interactive: bool = True,
+    ) -> None: ...
+    def set_data(self, values: Any) -> None: ...
+    def zoom(self, factor: float, fx: float, fy: float) -> None: ...
+    def pan(self, dx: float, dy: float) -> None: ...
+    def reset_view(self) -> None: ...
+    def window(self) -> tuple[float, float, float, float]: ...
+
+class Gauge:
+    def __init__(
+        self,
+        value: float = 0.0,
+        min: float = 0.0,
+        max: float = 1.0,
+        *,
+        color: RGBA | None = None,
+        background: RGBA | None = None,
+        pixel_width: int = 320,
+        pixel_height: int = 180,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+    ) -> None: ...
+    @property
+    def value(self) -> float: ...
+    def set_value(self, value: float) -> None: ...
+
+class Timeline:
+    def __init__(
+        self,
+        tracks: Sequence[Any] | None = None,
+        duration: float = 10.0,
+        time: float = 0.0,
+        *,
+        color: RGBA | None = None,
+        background: RGBA | None = None,
+        pixel_width: int = 640,
+        pixel_height: int = 160,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+    ) -> None: ...
+    @property
+    def time(self) -> float: ...
+    def set_time(self, time: float) -> None: ...
+    def set_duration(self, duration: float) -> None: ...
+    def set_tracks(self, tracks: Sequence[Any]) -> None: ...
+
+class NodeGraph:
+    """Draggable nodes. Each node is `(x, y, title)` or `(x, y, w, h, title)` in frame pixels."""
+    def __init__(
+        self,
+        nodes: Sequence[Any] | None = None,
+        edges: Sequence[tuple[int, int]] | None = None,
+        *,
+        color: RGBA | None = None,
+        background: RGBA | None = None,
+        pixel_width: int = 640,
+        pixel_height: int = 360,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+    ) -> None: ...
+    def set_nodes(self, nodes: Sequence[Any]) -> None: ...
+    def set_edges(self, edges: Sequence[tuple[int, int]]) -> None: ...
+    def nodes(self) -> list[tuple[float, float, float, float, str, bool]]: ...
+
+class ImageViewer:
+    def __init__(
+        self,
+        array: Any,
+        colormap: str = "gray",
+        on_readout: Callable[[str], None] | None = None,
+        pixel_width: int = 480,
+        pixel_height: int = 270,
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+    ) -> None: ...
+    readout: str
+    def set_array(self, array: Any) -> None: ...
+    def reset_view(self) -> None: ...
+
+class LogView:
+    def __init__(self, max_lines: int = 1000, flex_grow: float = 1.0, height: float | None = None, width: float | None = None) -> None: ...
+    def append(self, line: str) -> None: ...
+    def clear(self) -> None: ...
+    def __len__(self) -> int: ...
+
+class CodeEditor:
+    def __init__(
+        self,
+        text: str = "",
+        placeholder: str = "",
+        width: float | None = None,
+        height: float | None = None,
+        flex_grow: float = 1.0,
+        on_change: Callable[[str], None] | None = None,
+    ) -> None: ...
+    @property
+    def text(self) -> str: ...
+    def set_text(self, text: str) -> None: ...
+
+class CommandPalette:
+    def __init__(self, commands: Sequence[tuple[str, Callable[[], None]]]) -> None: ...
+    def bind(self, anchor: Any) -> None: ...
+    def accelerators(self) -> list[tuple[str, Callable[[], None]]]: ...
+    def show(self) -> None: ...
+
+class Observable:
+    def __init__(self, value: Any) -> None: ...
+    def get(self) -> Any: ...
+    def set(self, value: Any) -> None: ...
+    def subscribe(self, fn: Callable[[Any], None]) -> None: ...
+    def bind_label(self, fmt: Callable[[Any], str] | None = None) -> Label: ...
+    def bind_text(self, widget: Any) -> Any: ...
+    def text_input(self, **kwargs: Any) -> TextInput: ...
+    def slider(self, min: float = 0.0, max: float = 1.0, **kwargs: Any) -> Slider: ...

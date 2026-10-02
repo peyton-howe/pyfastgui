@@ -1393,20 +1393,35 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 
 - **GPU plot widgets** (line, scatter, heatmap) fed straight from numpy or CUDA buffers —
   pyqtgraph-class functionality built in, at better frame rates. Recommended headline feature
-  once 7A–7C are in. — **Done (first slice, 2026-10-01):** `PlotLine` / `PlotScatter` /
-  `PlotHeatmap` rasterize into RGBA8 and upload via the existing `Image` GPU layer path;
-  `set_data` is thread-safe (numpy 1-D/2-D or sequences). Colormaps: viridis / magma / gray.
-  Demo `plots_demo.py`. Follow-ups: CUDA buffer ingest, interactive pan/zoom, multi-series,
-  true GPU geometry shaders.
-- **Image/tensor viewer** on `Viewport`: zoom, pan, pixel-value readout, colormaps. Requires the
-  still-missing `Viewport` aspect-ratio preservation (see M4 known simplifications).
-- **Node graph editor** — no built-in Qt equivalent.
-- **Log/console view** appendable from any thread without locks; code editor with syntax
-  highlighting.
-- **Timeline / sequencer**; gauges and meters for live telemetry.
-- **Command palette** (Ctrl+K-style search over app commands).
-- **Reactive data binding** — widgets bound to Python values/observables instead of manual
-  callback wiring.
+  once 7A–7C are in. — **Done (2026-10-01):** `PlotLine` / `PlotScatter` / `PlotHeatmap`
+  rasterize into RGBA8 and upload via the existing `Image` GPU layer path (not geometry
+  shaders — plots stay CPU-raster images so the Vulkan/Metal pipelines are unchanged).
+  The layer uses `fit=contain`, so a wide layout row letterboxes the raster instead of
+  stretching it. Wheel and drag map into that letterboxed rect. `Gauge` and `NodeGraph`
+  use the same fit (node hits are mapped into the letterboxed frame).
+  `set_data` is thread-safe and does not reset a zoomed view. Multi-series via `set_series`.
+  Wheel zoom, drag pan, double-click reset. Colormaps: viridis / magma / gray.
+  CUDA ingest reads `__cuda_array_interface__` (`<f4`/`<f8`, C-contiguous) through
+  `cuMemcpyDtoH` on the existing unverified driver — unsupported dtype/strides error before
+  any copy; macOS raises `RuntimeError`. Same verification caveat as M3 (no NVIDIA GPU here).
+  Demo `plots_demo.py`.
+- **Image/tensor viewer** — **Done:** `ImageViewer` resamples a numpy image or 2-D tensor
+  (gray / viridis / magma), letterboxes inside the upload buffer, and reports the pixel under
+  the cursor. Wheel / drag / double-click. `Viewport` and `Image` also take `fit="contain"`
+  so a raw layer can letterbox on the GPU (CUDA textures still stretch: the shared texture
+  does not store its size).
+- **Node graph editor** — **Done:** `NodeGraph` rasterizes titled nodes (5×7 bitmap) and
+  straight edges; press/drag/release moves the node under the cursor. The frame is
+  letterboxed, so a wide row does not stretch the nodes.
+- **Log/console view** — **Done:** `LogView.append` is safe from any thread (the caller does
+  not take a lock). **Code editor** — **Done:** `CodeEditor` retokenizes into `TextArea`
+  highlight spans (keywords, comments, strings, numbers). The caret still uses full-line stops.
+- **Timeline / sequencer; gauges** — **Done:** `Timeline` (clips + playhead) and `Gauge`.
+- **Command palette** — **Done:** `CommandPalette` (`Popup` + filter + list). `bind(anchor)`
+  then `accelerators()` (`Ctrl+K`) on the root box.
+- **Reactive data binding** — **Done:** `Observable` with `bind_label`, `bind_text`,
+  `text_input`, and `slider`. `TextInput.set_text` and `Slider.set_value` do not fire
+  `on_change`. Demo `tier4_demo.py`.
 
 ### 7F. Cross-cutting (plan early, don't bolt on)
 

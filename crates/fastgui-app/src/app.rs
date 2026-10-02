@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use fastgui_chrome::ChromeRenderer;
 use fastgui_core::theme::chrome_theme;
 use fastgui_core::widget::{
-    Color, DropZone, PopupAnchor, PopupPress, PopupSide, Rect, WidgetId, WidgetKind, WidgetTree,
-    SPLITTER_HIT_SLOP,
+    Color, DropZone, LayerFit, PointerCallback, PopupAnchor, PopupPress, PopupSide, Rect, WidgetId,
+    WidgetKind, WidgetTree, SPLITTER_HIT_SLOP,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
@@ -133,6 +133,8 @@ struct FloatingWindow<B: SurfaceBackend> {
     /// A `NumericScrub` / `SpinBox` value area being dragged: `(id, press x, value at press)`.
     dragging_scrub: Option<(WidgetId, f32, f32)>,
     dragging_scrollbar: Option<ScrollbarDrag>,
+    /// An `Image` with `on_pointer` being dragged (plots, the image viewer, the node graph).
+    dragging_pointer: Option<WidgetId>,
     pressed_button: Option<WidgetId>,
     last_click: Option<(Instant, (f32, f32))>,
     ime_allowed: bool,
@@ -184,6 +186,8 @@ struct App<B: SurfaceBackend> {
     /// `(widget, press x, value at press)` while scrubbing a `NumericScrub` / `SpinBox` value.
     dragging_scrub: Option<(WidgetId, f32, f32)>,
     dragging_scrollbar: Option<ScrollbarDrag>,
+    /// An `Image` with `on_pointer` being dragged.
+    dragging_pointer: Option<WidgetId>,
     /// A `Button` / `Checkbox` / `Radio` / `Toggle` pressed and not yet released; it activates
     /// if released over itself.
     pressed_button: Option<WidgetId>,
@@ -450,6 +454,7 @@ impl<B: SurfaceBackend> App<B> {
             dragging_text: None,
             dragging_scrub: None,
             dragging_scrollbar: None,
+            dragging_pointer: None,
             pressed_button: None,
             last_click: None,
             ime_allowed: false,
@@ -497,8 +502,8 @@ impl<B: SurfaceBackend> App<B> {
         let mut uploads = Vec::new();
         for id in self.widget_tree.walk() {
             let (layer_id, frames) = match self.widget_tree.kind(id) {
-                Some(WidgetKind::Viewport { viewport_id, frames }) => (*viewport_id, frames),
-                Some(WidgetKind::Image { image_id, frames }) => (*image_id, frames),
+                Some(WidgetKind::Viewport { viewport_id, frames, .. }) => (*viewport_id, frames),
+                Some(WidgetKind::Image { image_id, frames, .. }) => (*image_id, frames),
                 _ => continue,
             };
             live_ids.push(layer_id);
@@ -545,8 +550,8 @@ impl<B: SurfaceBackend> App<B> {
         let mut uploads = Vec::new();
         for id in floater.widget_tree.walk() {
             let (layer_id, frames) = match floater.widget_tree.kind(id) {
-                Some(WidgetKind::Viewport { viewport_id, frames }) => (*viewport_id, frames),
-                Some(WidgetKind::Image { image_id, frames }) => (*image_id, frames),
+                Some(WidgetKind::Viewport { viewport_id, frames, .. }) => (*viewport_id, frames),
+                Some(WidgetKind::Image { image_id, frames, .. }) => (*image_id, frames),
                 _ => continue,
             };
             live_ids.push(layer_id);
@@ -874,6 +879,16 @@ impl<B: SurfaceBackend> App<B> {
             self.widget_tree.set_focus(hit);
         }
         let Some(id) = hit else { return };
+        if let Some((hit_id, cb, rect)) = image_pointer(&self.widget_tree, self.cursor.0, self.cursor.1) {
+            let double = is_double_click(&mut self.last_click, self.cursor);
+            if double {
+                emit_pointer(&cb, 2, 0.0, 0.0, self.cursor, rect);
+            } else {
+                emit_pointer(&cb, 4, 0.0, 0.0, self.cursor, rect);
+                self.dragging_pointer = Some(hit_id);
+            }
+            return;
+        }
         let Some(kind) = self.widget_tree.kind(id) else { return };
         match kind {
             // Activate on release over the same widget (see `release_button`), so pressing and
@@ -1054,6 +1069,16 @@ impl<B: SurfaceBackend> App<B> {
         let Some(floater) = self.floating.get_mut(&window_id) else { return };
         if !is_flat_button(&floater.widget_tree, hit) {
             floater.widget_tree.set_focus(hit);
+        }
+        if let Some((hit_id, cb, rect)) = image_pointer(&floater.widget_tree, cursor.0, cursor.1) {
+            let double = is_double_click(&mut floater.last_click, cursor);
+            if double {
+                emit_pointer(&cb, 2, 0.0, 0.0, cursor, rect);
+            } else {
+                emit_pointer(&cb, 4, 0.0, 0.0, cursor, rect);
+                floater.dragging_pointer = Some(hit_id);
+            }
+            return;
         }
         let floater = &*floater;
         let Some(id) = hit else { return };
@@ -2114,13 +2139,25 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let logical = position.to_logical::<f64>(self.scale_factor.max(0.01));
+                let previous = self.cursor;
                 self.cursor = (logical.x as f32, logical.y as f32);
+                let (dx, dy) = (self.cursor.0 - previous.0, self.cursor.1 - previous.1);
                 let dragging = self.dragging_slider.is_some()
                     || self.dragging_splitter.is_some()
                     || self.dragging_panel_title.is_some()
                     || self.dragging_text.is_some()
                     || self.dragging_scrub.is_some()
-                    || self.dragging_scrollbar.is_some();
+                    || self.dragging_scrollbar.is_some()
+                    || self.dragging_pointer.is_some();
+                if let Some(id) = self.dragging_pointer {
+                    if let Some(rect) = self.widget_tree.absolute_rect(id) {
+                        if let Some(WidgetKind::Image { on_pointer: Some(cb), .. }) = self.widget_tree.kind(id) {
+                            emit_pointer(cb, 1, dx, dy, self.cursor, rect);
+                        }
+                    }
+                } else if let Some((_, cb, rect)) = image_pointer(&self.widget_tree, self.cursor.0, self.cursor.1) {
+                    emit_pointer(&cb, 3, dx, dy, self.cursor, rect);
+                }
                 if self.dragging_slider.is_some() {
                     self.update_dragged_slider();
                 }
@@ -2178,8 +2215,16 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                         || self.dragging_panel_title.is_some()
                         || self.dragging_text.is_some()
                         || self.dragging_scrub.is_some()
-                        || self.dragging_scrollbar.is_some();
+                        || self.dragging_scrollbar.is_some()
+                        || self.dragging_pointer.is_some();
                     let pressed = self.pressed_button.take();
+                    if let Some(id) = self.dragging_pointer.take() {
+                        if let Some(rect) = self.widget_tree.absolute_rect(id) {
+                            if let Some(WidgetKind::Image { on_pointer: Some(cb), .. }) = self.widget_tree.kind(id) {
+                                emit_pointer(cb, 5, 0.0, 0.0, self.cursor, rect);
+                            }
+                        }
+                    }
                     self.dragging_slider = None;
                     self.dragging_splitter = None;
                     self.dragging_text = None;
@@ -2228,7 +2273,10 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
             WindowEvent::MouseWheel { delta, .. } => {
                 self.suppress_tooltip();
                 let (dx, dy) = wheel_delta(delta, self.scale_factor);
-                if self.widget_tree.scroll_at(self.cursor.0, self.cursor.1, dx, dy) {
+                if let Some((_, cb, rect)) = image_pointer(&self.widget_tree, self.cursor.0, self.cursor.1) {
+                    emit_pointer(&cb, 0, dx, dy, self.cursor, rect);
+                    self.render_now(event_loop);
+                } else if self.widget_tree.scroll_at(self.cursor.0, self.cursor.1, dx, dy) {
                     self.render_now(event_loop);
                 }
             }
@@ -2315,18 +2363,36 @@ impl<B: SurfaceBackend> App<B> {
                 self.render_now(event_loop);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                {
+                let pointer_drag = {
                     let Some(floater) = self.floating.get_mut(&window_id) else { return };
                     let logical = position.to_logical::<f64>(floater.scale_factor.max(0.01));
+                    let previous = floater.cursor;
                     floater.cursor = (logical.x as f32, logical.y as f32);
-                }
-                let dragging_widget = self.floating.get(&window_id).is_some_and(|f| {
-                    f.dragging_slider.is_some()
-                        || f.dragging_splitter.is_some()
-                        || f.dragging_text.is_some()
-                        || f.dragging_scrub.is_some()
-                        || f.dragging_scrollbar.is_some()
-                });
+                    let (dx, dy) = (floater.cursor.0 - previous.0, floater.cursor.1 - previous.1);
+                    if let Some(id) = floater.dragging_pointer {
+                        if let Some(rect) = floater.widget_tree.absolute_rect(id) {
+                            if let Some(WidgetKind::Image { on_pointer: Some(cb), .. }) = floater.widget_tree.kind(id) {
+                                emit_pointer(cb, 1, dx, dy, floater.cursor, rect);
+                            }
+                        }
+                        true
+                    } else if let Some((_, cb, rect)) = image_pointer(&floater.widget_tree, floater.cursor.0, floater.cursor.1)
+                    {
+                        emit_pointer(&cb, 3, dx, dy, floater.cursor, rect);
+                        false
+                    } else {
+                        false
+                    }
+                };
+                let dragging_widget = pointer_drag
+                    || self.floating.get(&window_id).is_some_and(|f| {
+                        f.dragging_slider.is_some()
+                            || f.dragging_splitter.is_some()
+                            || f.dragging_text.is_some()
+                            || f.dragging_scrub.is_some()
+                            || f.dragging_scrollbar.is_some()
+                            || f.dragging_pointer.is_some()
+                    });
                 if let Some(floater) = self.floating.get_mut(&window_id) {
                     if let Some(id) = floater.dragging_text {
                         text_input::handle_drag(
@@ -2392,11 +2458,19 @@ impl<B: SurfaceBackend> App<B> {
                             || f.dragging_text.is_some()
                             || f.dragging_scrub.is_some()
                             || f.dragging_scrollbar.is_some()
+                            || f.dragging_pointer.is_some()
                     }) || self.dragging_floating_panel.is_some_and(|(id, _)| id == window_id)
                         || self.dragging_floating_resize.as_ref().is_some_and(|d| d.window_id == window_id)
                         || self.dragging_from_floating.is_some();
                     let pressed = self.floating.get_mut(&window_id).and_then(|f| f.pressed_button.take());
                     if let Some(floater) = self.floating.get_mut(&window_id) {
+                        if let Some(id) = floater.dragging_pointer.take() {
+                            if let Some(rect) = floater.widget_tree.absolute_rect(id) {
+                                if let Some(WidgetKind::Image { on_pointer: Some(cb), .. }) = floater.widget_tree.kind(id) {
+                                    emit_pointer(cb, 5, 0.0, 0.0, floater.cursor, rect);
+                                }
+                            }
+                        }
                         floater.dragging_slider = None;
                         floater.dragging_splitter = None;
                         floater.dragging_text = None;
@@ -2447,7 +2521,12 @@ impl<B: SurfaceBackend> App<B> {
             WindowEvent::MouseWheel { delta, .. } => {
                 let scrolled = self.floating.get_mut(&window_id).is_some_and(|floater| {
                     let (dx, dy) = wheel_delta(delta, floater.scale_factor);
-                    floater.widget_tree.scroll_at(floater.cursor.0, floater.cursor.1, dx, dy)
+                    if let Some((_, cb, rect)) = image_pointer(&floater.widget_tree, floater.cursor.0, floater.cursor.1) {
+                        emit_pointer(&cb, 0, dx, dy, floater.cursor, rect);
+                        true
+                    } else {
+                        floater.widget_tree.scroll_at(floater.cursor.0, floater.cursor.1, dx, dy)
+                    }
                 });
                 if scrolled {
                     self.render_now(event_loop);
@@ -2479,7 +2558,11 @@ fn viewport_draw(tree: &WidgetTree, id: WidgetId, viewport_id: u64, rect: Rect, 
     }
     let scale = scale_factor as f32;
     let visible = tree.clip_rect(id).map_or(rect, |clip| clip.intersect(&rect));
-    Some(ViewportDraw { viewport_id, rect: scale_rect(rect, scale), visible: scale_rect(visible, scale) })
+    let fit = match tree.kind(id) {
+        Some(WidgetKind::Viewport { fit, .. } | WidgetKind::Image { fit, .. }) => *fit,
+        _ => LayerFit::Stretch,
+    };
+    Some(ViewportDraw { viewport_id, rect: scale_rect(rect, scale), visible: scale_rect(visible, scale), fit })
 }
 
 /// A wheel/trackpad event as a scroll in layout units: positive reveals content further
@@ -2506,6 +2589,25 @@ fn grab_scrollbar(tree: &WidgetTree, cursor: (f32, f32)) -> Option<ScrollbarDrag
 fn drag_scrollbar(tree: &mut WidgetTree, drag: ScrollbarDrag, cursor: (f32, f32)) {
     let along = if drag.vertical { cursor.1 } else { cursor.0 };
     tree.drag_scrollbar(drag.area, drag.vertical, along - drag.grab);
+}
+
+fn image_pointer(tree: &WidgetTree, x: f32, y: f32) -> Option<(WidgetId, PointerCallback, Rect)> {
+    let mut node = tree.hit_test(x, y);
+    while let Some(id) = node {
+        if let Some(WidgetKind::Image { on_pointer: Some(cb), .. }) = tree.kind(id) {
+            if let Some(rect) = tree.absolute_rect(id) {
+                if rect.width > 0.0 && rect.height > 0.0 {
+                    return Some((id, cb.clone(), rect));
+                }
+            }
+        }
+        node = tree.parent(id);
+    }
+    None
+}
+
+fn emit_pointer(cb: &PointerCallback, action: u8, dx: f32, dy: f32, cursor: (f32, f32), rect: Rect) {
+    cb(action, dx, dy, cursor.0 - rect.x, cursor.1 - rect.y, rect.width, rect.height);
 }
 
 fn is_text_input(tree: &WidgetTree, id: WidgetId) -> bool {
@@ -2633,6 +2735,7 @@ pub fn run<B: SurfaceBackend>(
         dragging_text: None,
         dragging_scrub: None,
         dragging_scrollbar: None,
+        dragging_pointer: None,
         pressed_button: None,
         last_click: None,
         ime_allowed: false,

@@ -17,7 +17,13 @@ def main() -> None:
     status = fg.Label("Streaming sine into PlotLine…", font_size=14.0, color=(0.7, 0.75, 0.85, 1.0))
 
     x = np.linspace(0.0, 4.0 * np.pi, 400)
-    line = fg.PlotLine(x, np.sin(x), color=(0.35, 0.75, 1.0, 1.0), pixel_width=640, pixel_height=220)
+    line = fg.PlotLine(pixel_width=640, pixel_height=220, interactive=True)
+    line.set_series(
+        [
+            (x, np.sin(x), (0.35, 0.75, 1.0, 1.0)),
+            (x, np.cos(x), (0.95, 0.55, 0.35, 1.0)),
+        ]
+    )
     scatter = fg.PlotScatter(
         np.random.default_rng(0).normal(size=200),
         np.random.default_rng(1).normal(size=200),
@@ -40,7 +46,13 @@ def main() -> None:
         t0 = time.monotonic()
         while not stop.is_set():
             t = time.monotonic() - t0
-            line.set_data(x, np.sin(x + t) * np.cos(0.25 * t))
+            # set_series keeps the current zoom/pan.
+            line.set_series(
+                [
+                    (x, np.sin(x + t) * np.cos(0.25 * t), (0.35, 0.75, 1.0, 1.0)),
+                    (x, np.cos(x + t), (0.95, 0.55, 0.35, 1.0)),
+                ]
+            )
             stop.wait(1 / 30)
 
     thread = threading.Thread(target=animate, daemon=True)
@@ -53,7 +65,7 @@ def main() -> None:
             padding=16.0,
             background=(0.10, 0.11, 0.13, 1.0),
             children=[
-                fg.Label("PlotLine (live numpy)", font_size="small"),
+                fg.Label("PlotLine — wheel zoom, drag pan, double-click reset (zoom survives live updates)", font_size="small"),
                 line,
                 fg.Label("PlotScatter", font_size="small"),
                 scatter,
