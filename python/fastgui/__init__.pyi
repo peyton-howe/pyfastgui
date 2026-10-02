@@ -6,18 +6,39 @@ FontSize = Union[float, Literal["small", "body", "large"]]
 # A gap/padding in layout units, or a theme spacing by name.
 Spacing = Union[float, Literal["small", "medium", "large"]]
 
-class CudaSurface:
-    """Unverified: see Viewport.create_cuda_surface."""
+# A CUDA stream: an int CUstream handle, torch.cuda.Stream, a cupy stream, or any object with
+# __cuda_stream__().
+CudaStream = Any
 
+class CudaFrame:
+    """One frame of a CudaSurface. Use as a context manager; inside the block it exposes
+    __cuda_array_interface__ ((height, width, 4) uint8, packed rows), so
+    torch.as_tensor(frame, device="cuda") or cupy.asarray(frame) wrap it without a copy. An
+    exception in the block drops the frame. Unverified on NVIDIA hardware."""
+
+    def __enter__(self) -> CudaFrame: ...
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool: ...
     @property
-    def device_ptr(self) -> int: ...
-    @property
-    def pitch(self) -> int: ...
+    def __cuda_array_interface__(self) -> dict[str, Any]: ...
+
+class CudaSurface:
+    """Zero-copy CUDA target behind a Viewport, from Viewport.create_cuda_surface. Unverified on
+    NVIDIA hardware."""
+
     @property
     def width(self) -> int: ...
     @property
     def height(self) -> int: ...
-    def signal_ready(self) -> None: ...
+    @property
+    def closed(self) -> bool:
+        """True once the window dropped the surface (closed, viewport removed, another
+        create_cuda_surface, or a submit_frame). frame() raises from then on."""
+        ...
+    def frame(self, stream: CudaStream | None = None) -> CudaFrame:
+        """A frame written on `stream` (default: the legacy default stream). Entering waits,
+        GPU-side on `stream`, for a free slot; leaving publishes what `stream` has written by
+        then."""
+        ...
 
 class Viewport:
     def __init__(self) -> None: ...
@@ -25,11 +46,24 @@ class Viewport:
         """Submit a (H, W, 3|4) uint8 frame. Copies into an owned buffer today; a packed-RGBA
         high-FPS path will want fewer copies later."""
         ...
+    def submit_cuda(self, array: Any, stream: CudaStream | None = None) -> None:
+        """Submit a CUDA array (anything with __cuda_array_interface__: torch, cupy, numba,
+        jax) shaped (H, W, 4) uint8 with contiguous pixels. Copied after the work queued on
+        `stream` (default: the array's own), and `stream` waits for the copy, so the array can
+        be reused right away. One GPU-to-GPU copy on Windows/Vulkan/NVIDIA; elsewhere (macOS,
+        Linux for now, a non-NVIDIA window GPU, before run()) a copy through host memory.
+        Host arrays go to submit_frame. Unverified on NVIDIA hardware."""
+        ...
+    @property
+    def cuda_status(self) -> str:
+        """How the last submit_cuda reached the screen: "interop", "host copy: <reason>", or
+        "unused"."""
+        ...
     def create_cuda_surface(self, width: int, height: int) -> CudaSurface:
-        """Unverified, Windows-only zero-copy CUDA surface. Call after set_viewport(), once
-        window.run() has started (from a callback or another thread). Raises RuntimeError
-        instead of blocking if run() hasn't started within ~2s, and on macOS/Linux
-        (not supported / not implemented yet)."""
+        """Zero-copy CUDA surface (Windows/Vulkan/NVIDIA). Call after set_viewport(), once
+        window.run() has started (from a callback or another thread); raises RuntimeError if
+        run() hasn't started within ~2s, or where interop isn't available (submit_cuda works
+        everywhere)."""
         ...
 
 class Label:

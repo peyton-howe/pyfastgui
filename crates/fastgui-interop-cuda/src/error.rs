@@ -1,17 +1,11 @@
 use crate::sys::CUresult;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum CudaError {
-    #[error("failed to load nvcuda.dll: {0}")]
-    Load(#[from] libloading::Error),
-    #[error("nvcuda.dll is missing the expected entry point {0}")]
-    MissingSymbol(&'static str, #[source] libloading::Error),
+    #[error("failed to load the CUDA driver ({library}): {message}")]
+    Load { library: &'static str, message: String },
+    #[error("the CUDA driver is missing the expected entry point {0}")]
+    MissingSymbol(&'static str),
     #[error("CUDA driver call failed: {message} (CUresult {code})")]
     Driver { code: CUresult, message: String },
-}
-
-impl CudaError {
-    pub(crate) fn missing(name: &'static str, err: libloading::Error) -> Self {
-        Self::MissingSymbol(name, err)
-    }
 }

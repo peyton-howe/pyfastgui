@@ -160,6 +160,32 @@ validation errors on real hardware.** The CUDA-side import (`cuImportExternalMem
 is the single highest-risk unverified area of the whole project.** If anyone picks up work
 near CUDA interop, prioritize getting time on real NVIDIA hardware before relying on it.
 
+**M3 redesign (2026-10-01, branch `cuda-submit`).** Decision: fastgui owns the interop (users
+can't do it without the render thread's device, and only the render thread knows when Vulkan is
+done reading), but users hand it CUDA arrays instead of writing into a raw pointer:
+- `Viewport.submit_cuda(array, stream=None)`: any `__cuda_array_interface__` object, (H, W, 4)
+  uint8 with contiguous pixels. GPU-to-GPU copy on Windows/Vulkan/NVIDIA; **host-copy fallback**
+  everywhere else (macOS, Linux, non-NVIDIA window GPU, floating panel, before `run()`).
+  `Viewport.cuda_status` reports the path. Host arrays go to `submit_frame`.
+- `create_cuda_surface` → `CudaSurface.frame(stream)` context manager exposing
+  `__cuda_array_interface__` (zero CUDA-side copy). `device_ptr`/`pitch`/`signal_ready` are gone.
+- Protocol: 3 slots in one exported linear buffer, `ready` (CUDA→VK) and `release` (VK→CUDA)
+  timeline semaphores, a CPU slot table (`fastgui-app::cuda_handles`), and fastgui's own CUDA
+  stream ordered against the caller's with events both ways; publish from `cuLaunchHostFunc`.
+  The render thread copies the slot into an optimal-tiled image (so no linear-image sampling).
+- Old bugs fixed on the way: signal on fastgui's private stream (not ordered after the caller's
+  kernel), single buffer with no Vulkan→CUDA "done reading" signal (tearing), CUDA device 0
+  assumed (now matched by Vulkan device UUID), `cuCtxSetCurrent` clobbering the caller's
+  context (now push/pop), missing `CUDA_EXTERNAL_MEMORY_DEDICATED`, leaked NT handles and
+  mapped buffers.
+- Verified here: slot-table unit tests; headless Vulkan test of the layer with Vulkan playing
+  CUDA (`cuda_test.rs`, zero validation errors on AMD); every CUDA struct offset asserted
+  against cuda-bindings 13.4.3 (measured through its compiled structs); Python validation and
+  fallback tests on 3.14 and 3.14t; live window fallback check. **Still never run on NVIDIA.**
+  First thing to try there: `python/examples/cuda_viewport.py` and `--surface`.
+- Follow-ups: Linux opaque-fd export; DLPack input (JAX-only users); float/grayscale input needs
+  a conversion kernel; viewports in floating panels only get the host copy.
+
 **M4 — Widget tree, layout, text rendering, input.** `fastgui_core::widget::WidgetTree` wraps
 `taffy::TaffyTree`; `WidgetKind` enum (`Container`/`Label`/`Button`/`Slider`); absolute-rect
 tracking + `hit_test()`. `fastgui-chrome::ChromeRenderer` rasterizes the *whole* tree into one
@@ -1424,9 +1450,10 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
   use the same fit (node hits are mapped into the letterboxed frame).
   `set_data` is thread-safe and does not reset a zoomed view. Multi-series via `set_series`.
   Wheel zoom, drag pan, double-click reset. Colormaps: viridis / magma / gray.
-  CUDA ingest reads `__cuda_array_interface__` (`<f4`/`<f8`, C-contiguous) through
-  `cuMemcpyDtoH` on the existing unverified driver — unsupported dtype/strides error before
-  any copy; macOS raises `RuntimeError`. Same verification caveat as M3 (no NVIDIA GPU here).
+  CUDA ingest reads `__cuda_array_interface__` (`<f4`/`<f8`, C-contiguous) and copies it to
+  the host after the array's stream (`fastgui_interop_cuda::copy_to_host`, on the owning
+  device's context) — unsupported dtype/strides error before any copy; macOS raises
+  `RuntimeError`. Same verification caveat as M3 (no NVIDIA GPU here).
   Demo `plots_demo.py`. Histogram, bar, contour, height-field surface, and triangle mesh
   use the same raster (`PlotHistogram`, `PlotBar`, `PlotContour`, `PlotSurface`, `PlotMesh`).
   Contour is isolines on a heatmap grid (`filled=True` paints the bands). `PlotSurface` takes a
@@ -1436,8 +1463,7 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 - **Image/tensor viewer** — **Done:** `ImageViewer` resamples a numpy image or 2-D tensor
   (gray / viridis / magma), letterboxes inside the upload buffer, and reports the pixel under
   the cursor. Wheel / drag / double-click. `Viewport` and `Image` also take `fit="contain"`
-  so a raw layer can letterbox on the GPU (CUDA textures still stretch: the shared texture
-  does not store its size).
+  so a raw layer can letterbox on the GPU (CUDA layers too, since `cuda-submit`).
 - **Node graph editor** — **Done:** `NodeGraph` rasterizes titled nodes (5×7 bitmap) and
   straight edges; press/drag/release moves the node under the cursor. The frame is
   letterboxed, so a wide row does not stretch the nodes.

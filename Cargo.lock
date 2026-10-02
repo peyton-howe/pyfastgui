@@ -748,6 +748,7 @@ dependencies = [
 name = "fastgui-py"
 version = "0.0.1"
 dependencies = [
+ "fastgui-app",
  "fastgui-core",
  "fastgui-interop-cuda",
  "fastgui-render-mtl",

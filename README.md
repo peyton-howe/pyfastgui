@@ -27,9 +27,11 @@ fastgui instead:
   panel) as a command sent across a channel to the render thread, rather than requiring the
   caller to be "on the UI thread" — the free-threaded Python build can call into fastgui from
   any thread without contention.
-- Supports zero-copy GPU interop on the Vulkan backend: a CUDA kernel can write directly into a
-  texture displayed next frame, with no CPU round-trip (see `Viewport.create_cuda_surface` —
-  currently unverified on real hardware, and not available on macOS; see below).
+- Takes CUDA arrays directly: `Viewport.submit_cuda(tensor)` accepts anything with
+  `__cuda_array_interface__` (torch, cupy, numba, jax), ordered against the caller's stream.
+  On Windows/Vulkan/NVIDIA it's one GPU-to-GPU copy (or none, via `create_cuda_surface`);
+  elsewhere it falls back to a copy through host memory. Currently unverified on NVIDIA
+  hardware; see below.
 
 ## Quickstart
 
@@ -130,7 +132,7 @@ All under [`python/examples/`](python/examples/), runnable directly once install
 | [`basic_window.py`](python/examples/basic_window.py) | Minimal window bring-up. |
 | [`threaded_mutation.py`](python/examples/threaded_mutation.py) | Calling a `Window` mutator concurrently from several threads — no GIL, no crash. |
 | [`live_camera_feed.py`](python/examples/live_camera_feed.py) | Streaming numpy frames into a `Viewport` from a background thread. |
-| [`cuda_viewport.py`](python/examples/cuda_viewport.py) | GPU-to-GPU CUDA→Vulkan interop, zero CPU copy. **Unverified — no NVIDIA GPU has tested this path. Not available on macOS.** |
+| [`cuda_viewport.py`](python/examples/cuda_viewport.py) | cupy frames via `submit_cuda` (GPU-to-GPU where interop exists, host copy elsewhere), or `--surface` for zero-copy `create_cuda_surface`. **Unverified — no NVIDIA GPU has tested this path.** |
 | [`widgets_demo.py`](python/examples/widgets_demo.py) | `Box` layout, `Label`, `Button`, `Slider`, click/drag input. |
 | [`text_input_demo.py`](python/examples/text_input_demo.py) | `TextInput` fields, keyboard focus (Tab/Shift+Tab), selection, clipboard, undo, IME. |
 | [`list_demo.py`](python/examples/list_demo.py) | A virtualized `ListView` of 1,000,000 rows with live filtering, keyboard selection and activation. |
@@ -196,12 +198,13 @@ CPU pixmap with `FASTGUI_CHROME=cpu`); `fastgui-py` is the PyO3 layer and picks 
 
 ## Known limitations
 
-- **CUDA interop is unverified on real hardware, and is Vulkan-only.** The Vulkan-side export
-  path (`VK_KHR_external_memory_win32` + `VK_KHR_timeline_semaphore`) has been validated with
-  zero Vulkan validation errors on real (AMD) hardware, but the CUDA-side import has never run
-  against an actual NVIDIA GPU. On macOS there is no CUDA↔Metal path;
-  `Viewport.create_cuda_surface` raises `RuntimeError`. Treat the CUDA API as unverified until
-  someone runs it on NVIDIA hardware.
+- **CUDA interop is unverified on NVIDIA hardware, and is Windows/Vulkan-only.** The Vulkan
+  half (exported slot buffer, timeline semaphores, the pickup copy) is tested headless with
+  zero validation errors on real (AMD) hardware, and the CUDA struct layouts are checked
+  against NVIDIA's own bindings, but the CUDA side has never run on an NVIDIA GPU.
+  `submit_cuda` falls back to a host copy wherever interop isn't available (macOS, Linux, a
+  window on a non-NVIDIA GPU, viewports in floating panels); `create_cuda_surface` raises
+  there instead. `Viewport.cuda_status` says which path is in use.
 - **Linux is less exercised than Windows and macOS.** It uses the same Vulkan backend as
   Windows. It has been tested on X11 (Xvfb + xfwm4) with Mesa llvmpipe (software Vulkan):
   every example, the docking/tab/splitter/floating interactions, and a free-threaded 3.14t
