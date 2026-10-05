@@ -2,6 +2,7 @@ mod backend;
 mod charts;
 mod cuda;
 mod dialogs;
+mod interaction;
 mod plots;
 mod tier4;
 mod theme;
@@ -39,6 +40,10 @@ pub(crate) struct Viewport {
     dispatch: Mutex<Option<CommandDispatch>>,
     fit: fastgui_core::widget::LayerFit,
     cuda: Mutex<cuda::CudaState>,
+    /// The viewport's node in its window once shown, for live `set_file_drop` changes.
+    id: widgets::IdCell,
+    sender: widgets::SenderCell,
+    interaction: interaction::Interaction,
 }
 
 #[pymethods]
@@ -58,6 +63,9 @@ impl Viewport {
             dispatch: Mutex::new(None),
             fit,
             cuda: Mutex::new(cuda::CudaState::default()),
+            id: std::sync::Arc::new(Mutex::new(None)),
+            sender: std::sync::Arc::new(Mutex::new(None)),
+            interaction: interaction::Interaction::new(true),
         })
     }
 
@@ -152,6 +160,13 @@ impl Viewport {
         Ok(())
     }
 
+    /// Call `on_drop(paths, x, y)` when files are dropped on this viewport from the OS (`paths`
+    /// is a list of strings; `x, y` the point in the viewport's coordinates). `None` stops it.
+    #[pyo3(signature = (on_drop))]
+    fn set_file_drop(&self, on_drop: Option<Py<PyAny>>) -> PyResult<()> {
+        self.interaction.set_file_drop(on_drop, &self.id, &self.sender)
+    }
+
     /// How the last `submit_cuda` reached the screen: `"interop"` (GPU-to-GPU), `"host copy:
     /// <reason>"`, or `"unused"`.
     #[getter]
@@ -181,7 +196,14 @@ impl Viewport {
     }
 
     pub(crate) fn describe_widget(&self) -> widgets::DescribedWidget {
-        widgets::described_viewport(self.viewport_id, self.frame_slot.clone(), self.fit)
+        widgets::described_viewport(
+            self.viewport_id,
+            self.frame_slot.clone(),
+            self.fit,
+            self.id.clone(),
+            self.sender.clone(),
+            self.interaction.spec(),
+        )
     }
 
     fn push_cpu_frame(&self, frame: CpuFrame) {

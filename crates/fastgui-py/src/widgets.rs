@@ -13,13 +13,14 @@ use fastgui_core::widget::{
 use fastgui_core::text_edit::TextEdit;
 use fastgui_core::{CpuFrame, FrameSlot, PixelFormat, Readback, MAX_CPU_FRAME_EXTENT};
 use crate::theme::{FontSize, Spacing};
+use crate::interaction::{Interaction, InteractionSpec};
 use crate::backend::{Command, CommandDispatch};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PySequence};
 
-type IdCell = Arc<Mutex<Option<WidgetId>>>;
-type SenderCell = Arc<Mutex<Option<CommandDispatch>>>;
+pub(crate) type IdCell = Arc<Mutex<Option<WidgetId>>>;
+pub(crate) type SenderCell = Arc<Mutex<Option<CommandDispatch>>>;
 /// Interior-mutable cell a `Panel`/`Tabs` region's rearrange handler lives in — `None` until a
 /// `DockArea` claims it (`Panel::set_rearrange_handler`), so a standalone `Panel` not inside a
 /// `DockArea` just has a no-op drag (see `WidgetKind::PanelTitleBar`'s doc comment).
@@ -378,12 +379,15 @@ pub(crate) fn described_viewport(
     viewport_id: u64,
     frames: fastgui_core::FrameSlot<fastgui_core::CpuFrame>,
     fit: fastgui_core::widget::LayerFit,
+    id_cell: IdCell,
+    sender_cell: SenderCell,
+    interaction: InteractionSpec,
 ) -> DescribedWidget {
     DescribedWidget {
         style: StyleParams::leaf(1.0, None, None),
         kind: WidgetKind::Viewport { viewport_id, frames, fit },
-        id_cell: Arc::new(Mutex::new(None)),
-        sender_cell: Arc::new(Mutex::new(None)),
+        id_cell,
+        sender_cell,
         children: Vec::new(),
         splitter_bar: None,
         tab_bar: None,
@@ -391,6 +395,7 @@ pub(crate) fn described_viewport(
         context_menu: None,
         accelerators: Vec::new(),
         hover_action: None,
+        interaction: Some(interaction),
     }
 }
 
@@ -407,6 +412,8 @@ pub(crate) struct DescribedWidget {
     accelerators: Vec<(String, ClickCallback)>,
     /// Run after the cursor rests on the widget (`WidgetTree::set_hover_action`).
     hover_action: Option<ClickCallback>,
+    /// `enabled` and drag-and-drop (`crate::interaction`); `None` for widgets without them.
+    interaction: Option<InteractionSpec>,
 }
 
 impl DescribedWidget {
@@ -429,6 +436,7 @@ impl DescribedWidget {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: None,
         }
     }
 
@@ -691,6 +699,7 @@ pub(crate) fn attach(
         context_menu,
         accelerators,
         hover_action,
+        interaction,
     } = described;
     let id = tree.new_node(style.to_style(), kind);
     tree.add_child(parent, id);
@@ -704,6 +713,9 @@ pub(crate) fn attach(
     }
     if let Some(callback) = hover_action {
         tree.set_hover_action(id, Some(callback));
+    }
+    if let Some(spec) = interaction {
+        spec.apply(tree, id);
     }
     for (shortcut, callback) in accelerators {
         // Unparseable shortcuts are rejected when the Box is constructed (`parse_accelerators`).
@@ -925,6 +937,7 @@ impl Label {
             context_menu,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: None,
         }
     }
 }
@@ -934,6 +947,7 @@ impl Label {
 pub(crate) struct Button {
     id: IdCell,
     sender: SenderCell,
+    interaction: Interaction,
     /// Latest text (constructor or `set_text`); survives rebuilds.
     text: Mutex<String>,
     font_size: Option<FontSize>,
@@ -950,6 +964,18 @@ pub(crate) struct Button {
 
 #[pymethods]
 impl Button {
+    /// Whether this widget takes input. A disabled widget is dimmed and ignores clicks, focus,
+    /// drags and shortcuts (it still scrolls). Disabling a `Box` disables everything inside it.
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.interaction.enabled()
+    }
+
+    /// Enable or disable this widget. Safe from any thread, before or after it's shown.
+    fn set_enabled(&self, enabled: bool) -> PyResult<()> {
+        self.interaction.set_enabled(enabled, &self.id, &self.sender)
+    }
+
     #[new]
     #[pyo3(signature = (
         text,
@@ -961,6 +987,7 @@ impl Button {
         tooltip=None,
         context_menu=None,
         on_hover=None,
+        enabled=true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -973,10 +1000,12 @@ impl Button {
         tooltip: Option<String>,
         context_menu: Option<Py<PyAny>>,
         on_hover: Option<Py<PyAny>>,
+        enabled: bool,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
+            interaction: Interaction::new(enabled),
             text: Mutex::new(text),
             font_size,
             text_color,
@@ -1053,6 +1082,7 @@ impl Button {
             context_menu,
             accelerators: Vec::new(),
             hover_action: self.on_hover.as_ref().map(|cb| wrap_callback0(Python::attach(|py| cb.clone_ref(py)))),
+            interaction: Some(self.interaction.spec()),
         }
     }
 }
@@ -1062,6 +1092,7 @@ impl Button {
 pub(crate) struct Slider {
     id: IdCell,
     sender: SenderCell,
+    interaction: Interaction,
     value: Readback<f32>,
     min: f32,
     max: f32,
@@ -1073,6 +1104,18 @@ pub(crate) struct Slider {
 
 #[pymethods]
 impl Slider {
+    /// Whether this widget takes input. A disabled widget is dimmed and ignores clicks, focus,
+    /// drags and shortcuts (it still scrolls). Disabling a `Box` disables everything inside it.
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.interaction.enabled()
+    }
+
+    /// Enable or disable this widget. Safe from any thread, before or after it's shown.
+    fn set_enabled(&self, enabled: bool) -> PyResult<()> {
+        self.interaction.set_enabled(enabled, &self.id, &self.sender)
+    }
+
     #[new]
     #[pyo3(signature = (
         value=0.0,
@@ -1082,7 +1125,9 @@ impl Slider {
         track_color=None,
         thumb_color=None,
         tooltip=None,
+        enabled=true,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         value: f32,
         min: f32,
@@ -1091,10 +1136,12 @@ impl Slider {
         track_color: Option<(f32, f32, f32, f32)>,
         thumb_color: Option<(f32, f32, f32, f32)>,
         tooltip: Option<String>,
+        enabled: bool,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
+            interaction: Interaction::new(enabled),
             value: Readback::new(value),
             min,
             max,
@@ -1160,6 +1207,7 @@ impl Slider {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: Some(self.interaction.spec()),
         }
     }
 }
@@ -1169,6 +1217,7 @@ impl Slider {
 pub(crate) struct TextInput {
     id: IdCell,
     sender: SenderCell,
+    interaction: Interaction,
     /// The current text, published by the render thread on every edit (and by `set_text`), so
     /// `.text` never waits on it. Also what `describe` builds from, so the text survives a
     /// rebuild (e.g. a `DockArea` rearrange).
@@ -1187,6 +1236,18 @@ pub(crate) struct TextInput {
 
 #[pymethods]
 impl TextInput {
+    /// Whether this widget takes input. A disabled widget is dimmed and ignores clicks, focus,
+    /// drags and shortcuts (it still scrolls). Disabling a `Box` disables everything inside it.
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.interaction.enabled()
+    }
+
+    /// Enable or disable this widget. Safe from any thread, before or after it's shown.
+    fn set_enabled(&self, enabled: bool) -> PyResult<()> {
+        self.interaction.set_enabled(enabled, &self.id, &self.sender)
+    }
+
     #[new]
     #[pyo3(signature = (
         text="",
@@ -1200,6 +1261,7 @@ impl TextInput {
         placeholder_color=None,
         background=None,
         selection_color=None,
+        enabled=true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1214,10 +1276,12 @@ impl TextInput {
         placeholder_color: Option<(f32, f32, f32, f32)>,
         background: Option<(f32, f32, f32, f32)>,
         selection_color: Option<(f32, f32, f32, f32)>,
+        enabled: bool,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
+            interaction: Interaction::new(enabled),
             text: Readback::new(TextEdit::new(text).text().to_owned()),
             placeholder: placeholder.to_owned(),
             font_size,
@@ -1289,6 +1353,7 @@ impl TextInput {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: Some(self.interaction.spec()),
         }
     }
 }
@@ -1298,6 +1363,7 @@ impl TextInput {
 pub(crate) struct TextArea {
     id: IdCell,
     sender: SenderCell,
+    interaction: Interaction,
     text: Readback<String>,
     placeholder: String,
     font_size: Option<FontSize>,
@@ -1315,6 +1381,18 @@ pub(crate) struct TextArea {
 
 #[pymethods]
 impl TextArea {
+    /// Whether this widget takes input. A disabled widget is dimmed and ignores clicks, focus,
+    /// drags and shortcuts (it still scrolls). Disabling a `Box` disables everything inside it.
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.interaction.enabled()
+    }
+
+    /// Enable or disable this widget. Safe from any thread, before or after it's shown.
+    fn set_enabled(&self, enabled: bool) -> PyResult<()> {
+        self.interaction.set_enabled(enabled, &self.id, &self.sender)
+    }
+
     #[new]
     #[pyo3(signature = (
         text="",
@@ -1329,6 +1407,7 @@ impl TextArea {
         placeholder_color=None,
         background=None,
         selection_color=None,
+        enabled=true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1344,10 +1423,12 @@ impl TextArea {
         placeholder_color: Option<(f32, f32, f32, f32)>,
         background: Option<(f32, f32, f32, f32)>,
         selection_color: Option<(f32, f32, f32, f32)>,
+        enabled: bool,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
+            interaction: Interaction::new(enabled),
             text: Readback::new(TextEdit::new_multiline(text).text().to_owned()),
             placeholder: placeholder.to_owned(),
             font_size,
@@ -1441,6 +1522,7 @@ impl TextArea {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: Some(self.interaction.spec()),
         }
     }
 }
@@ -1450,6 +1532,7 @@ impl TextArea {
 pub(crate) struct ListView {
     id: IdCell,
     sender: SenderCell,
+    interaction: Interaction,
     /// The current items — what `describe` builds from, kept in sync by `set_items`.
     items: Arc<Mutex<Arc<Vec<String>>>>,
     selected: Readback<Option<usize>>,
@@ -1477,6 +1560,33 @@ fn wrap_index_callback(callback: Py<PyAny>) -> IndexCallback {
 
 #[pymethods]
 impl ListView {
+    /// Whether this widget takes input. A disabled widget is dimmed and ignores clicks, focus,
+    /// drags and shortcuts (it still scrolls). Disabling a `Box` disables everything inside it.
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.interaction.enabled()
+    }
+
+    /// Enable or disable this widget. Safe from any thread, before or after it's shown.
+    fn set_enabled(&self, enabled: bool) -> PyResult<()> {
+        self.interaction.set_enabled(enabled, &self.id, &self.sender)
+    }
+
+    /// Make this widget a drag source: dragging it carries `tag` and the bytes `data` returns
+    /// (called with the row index `(index)` when the drag starts; `str` is sent as UTF-8, `None` cancels
+    /// the drag). Without `data` the payload is the row index. `tag=None` stops dragging.
+    #[pyo3(signature = (tag, data=None))]
+    fn set_drag_source(&self, tag: Option<String>, data: Option<Py<PyAny>>) -> PyResult<()> {
+        self.interaction.set_drag_source(tag, data, &self.id, &self.sender)
+    }
+
+    /// Accept drops of the tags in `accept` (one tag, a sequence, or `None` for any), calling
+    /// `on_drop(tag, data, index)`, where `index` is the gap the drop lands in (insert before that row; `len` appends). `on_drop=None` stops accepting drops.
+    #[pyo3(signature = (accept, on_drop))]
+    fn set_drop_target(&self, py: Python<'_>, accept: Option<Bound<'_, PyAny>>, on_drop: Option<Py<PyAny>>) -> PyResult<()> {
+        self.interaction.set_drop_target(py, accept.as_ref(), on_drop, &self.id, &self.sender)
+    }
+
     #[new]
     #[pyo3(signature = (
         items,
@@ -1490,6 +1600,7 @@ impl ListView {
         text_color=None,
         background=None,
         selection_color=None,
+        enabled=true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1504,6 +1615,7 @@ impl ListView {
         text_color: Option<(f32, f32, f32, f32)>,
         background: Option<(f32, f32, f32, f32)>,
         selection_color: Option<(f32, f32, f32, f32)>,
+        enabled: bool,
     ) -> PyResult<Self> {
         if row_height <= 0.0 {
             return Err(PyValueError::new_err("row_height must be positive"));
@@ -1511,6 +1623,7 @@ impl ListView {
         Ok(Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
+            interaction: Interaction::new(enabled),
             items: Arc::new(Mutex::new(Arc::new(items))),
             selected: Readback::new(None),
             row_height,
@@ -1603,6 +1716,7 @@ impl ListView {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: Some(self.interaction.spec()),
         }
     }
 }
@@ -1724,6 +1838,7 @@ fn coerce_table_data(
 pub(crate) struct Table {
     id: IdCell,
     sender: SenderCell,
+    interaction: Interaction,
     data: Arc<Mutex<Arc<TableData>>>,
     selected: Readback<Option<usize>>,
     row_height: f32,
@@ -1743,6 +1858,18 @@ pub(crate) struct Table {
 
 #[pymethods]
 impl Table {
+    /// Whether this widget takes input. A disabled widget is dimmed and ignores clicks, focus,
+    /// drags and shortcuts (it still scrolls). Disabling a `Box` disables everything inside it.
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.interaction.enabled()
+    }
+
+    /// Enable or disable this widget. Safe from any thread, before or after it's shown.
+    fn set_enabled(&self, enabled: bool) -> PyResult<()> {
+        self.interaction.set_enabled(enabled, &self.id, &self.sender)
+    }
+
     #[new]
     #[pyo3(signature = (
         columns,
@@ -1760,6 +1887,7 @@ impl Table {
         background=None,
         selection_color=None,
         grid_color=None,
+        enabled=true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1778,6 +1906,7 @@ impl Table {
         background: Option<(f32, f32, f32, f32)>,
         selection_color: Option<(f32, f32, f32, f32)>,
         grid_color: Option<(f32, f32, f32, f32)>,
+        enabled: bool,
     ) -> PyResult<Self> {
         if row_height <= 0.0 {
             return Err(PyValueError::new_err("row_height must be positive"));
@@ -1789,6 +1918,7 @@ impl Table {
         Ok(Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
+            interaction: Interaction::new(enabled),
             data: Arc::new(Mutex::new(data)),
             selected: Readback::new(None),
             row_height,
@@ -1886,6 +2016,7 @@ impl Table {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: Some(self.interaction.spec()),
         }
     }
 }
@@ -1975,6 +2106,7 @@ fn path_from_py(path: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<u32>>> {
 pub(crate) struct TreeView {
     id: IdCell,
     sender: SenderCell,
+    interaction: Interaction,
     data: Arc<Mutex<Arc<TreeData>>>,
     /// Expanded node ids — kept so describe / set_nodes can restore expand state.
     expanded: Arc<Mutex<HashSet<u32>>>,
@@ -1993,6 +2125,33 @@ pub(crate) struct TreeView {
 
 #[pymethods]
 impl TreeView {
+    /// Whether this widget takes input. A disabled widget is dimmed and ignores clicks, focus,
+    /// drags and shortcuts (it still scrolls). Disabling a `Box` disables everything inside it.
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.interaction.enabled()
+    }
+
+    /// Enable or disable this widget. Safe from any thread, before or after it's shown.
+    fn set_enabled(&self, enabled: bool) -> PyResult<()> {
+        self.interaction.set_enabled(enabled, &self.id, &self.sender)
+    }
+
+    /// Make this widget a drag source: dragging it carries `tag` and the bytes `data` returns
+    /// (called with the node path `(path)` when the drag starts; `str` is sent as UTF-8, `None` cancels
+    /// the drag). Without `data` the payload is the node path as `"0/2/1"`. `tag=None` stops dragging.
+    #[pyo3(signature = (tag, data=None))]
+    fn set_drag_source(&self, tag: Option<String>, data: Option<Py<PyAny>>) -> PyResult<()> {
+        self.interaction.set_drag_source(tag, data, &self.id, &self.sender)
+    }
+
+    /// Accept drops of the tags in `accept` (one tag, a sequence, or `None` for any), calling
+    /// `on_drop(tag, data, path, place)`, where `place` is `"before"`, `"inside"` or `"after"` the node at `path`. `on_drop=None` stops accepting drops.
+    #[pyo3(signature = (accept, on_drop))]
+    fn set_drop_target(&self, py: Python<'_>, accept: Option<Bound<'_, PyAny>>, on_drop: Option<Py<PyAny>>) -> PyResult<()> {
+        self.interaction.set_drop_target(py, accept.as_ref(), on_drop, &self.id, &self.sender)
+    }
+
     #[new]
     #[pyo3(signature = (
         nodes,
@@ -2006,6 +2165,7 @@ impl TreeView {
         text_color=None,
         background=None,
         selection_color=None,
+        enabled=true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -2020,6 +2180,7 @@ impl TreeView {
         text_color: Option<(f32, f32, f32, f32)>,
         background: Option<(f32, f32, f32, f32)>,
         selection_color: Option<(f32, f32, f32, f32)>,
+        enabled: bool,
     ) -> PyResult<Self> {
         if row_height <= 0.0 {
             return Err(PyValueError::new_err("row_height must be positive"));
@@ -2028,6 +2189,7 @@ impl TreeView {
         Ok(Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
+            interaction: Interaction::new(enabled),
             data: Arc::new(Mutex::new(data)),
             expanded: Arc::new(Mutex::new(HashSet::new())),
             selected: Readback::new(None),
@@ -2193,6 +2355,7 @@ impl TreeView {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: Some(self.interaction.spec()),
         }
     }
 }
@@ -2332,6 +2495,7 @@ impl Popup {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: None,
         };
         let kind = WidgetKind::Popup {
             anchor,
@@ -2462,6 +2626,7 @@ impl ScrollArea {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: None,
         })
     }
 }
@@ -2472,6 +2637,7 @@ impl ScrollArea {
 pub(crate) struct Checkbox {
     id: IdCell,
     sender: SenderCell,
+    interaction: Interaction,
     checked: Readback<bool>,
     label: String,
     font_size: Option<FontSize>,
@@ -2484,6 +2650,18 @@ pub(crate) struct Checkbox {
 
 #[pymethods]
 impl Checkbox {
+    /// Whether this widget takes input. A disabled widget is dimmed and ignores clicks, focus,
+    /// drags and shortcuts (it still scrolls). Disabling a `Box` disables everything inside it.
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.interaction.enabled()
+    }
+
+    /// Enable or disable this widget. Safe from any thread, before or after it's shown.
+    fn set_enabled(&self, enabled: bool) -> PyResult<()> {
+        self.interaction.set_enabled(enabled, &self.id, &self.sender)
+    }
+
     #[new]
     #[pyo3(signature = (
         label,
@@ -2494,7 +2672,9 @@ impl Checkbox {
         box_color=None,
         check_color=None,
         tooltip=None,
+        enabled=true,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         label: String,
         checked: bool,
@@ -2504,10 +2684,12 @@ impl Checkbox {
         box_color: Option<(f32, f32, f32, f32)>,
         check_color: Option<(f32, f32, f32, f32)>,
         tooltip: Option<String>,
+        enabled: bool,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
+            interaction: Interaction::new(enabled),
             checked: Readback::new(checked),
             label,
             font_size,
@@ -2571,6 +2753,7 @@ impl Checkbox {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: Some(self.interaction.spec()),
         }
     }
 }
@@ -2580,6 +2763,7 @@ impl Checkbox {
 pub(crate) struct Radio {
     id: IdCell,
     sender: SenderCell,
+    interaction: Interaction,
     selected: Readback<bool>,
     label: String,
     group_id: u64,
@@ -2592,6 +2776,18 @@ pub(crate) struct Radio {
 
 #[pymethods]
 impl Radio {
+    /// Whether this widget takes input. A disabled widget is dimmed and ignores clicks, focus,
+    /// drags and shortcuts (it still scrolls). Disabling a `Box` disables everything inside it.
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.interaction.enabled()
+    }
+
+    /// Enable or disable this widget. Safe from any thread, before or after it's shown.
+    fn set_enabled(&self, enabled: bool) -> PyResult<()> {
+        self.interaction.set_enabled(enabled, &self.id, &self.sender)
+    }
+
     #[new]
     #[pyo3(signature = (
         label,
@@ -2602,7 +2798,9 @@ impl Radio {
         text_color=None,
         box_color=None,
         dot_color=None,
+        enabled=true,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         label: String,
         group: Option<u64>,
@@ -2612,6 +2810,7 @@ impl Radio {
         text_color: Option<(f32, f32, f32, f32)>,
         box_color: Option<(f32, f32, f32, f32)>,
         dot_color: Option<(f32, f32, f32, f32)>,
+        enabled: bool,
     ) -> PyResult<Self> {
         let group_id = parse_radio_group(group)?;
         let mirror = Readback::new(selected);
@@ -2622,6 +2821,7 @@ impl Radio {
         Ok(Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
+            interaction: Interaction::new(enabled),
             selected: mirror,
             label,
             group_id,
@@ -2731,6 +2931,7 @@ impl Radio {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: Some(self.interaction.spec()),
         }
     }
 }
@@ -2740,6 +2941,7 @@ impl Radio {
 pub(crate) struct Toggle {
     id: IdCell,
     sender: SenderCell,
+    interaction: Interaction,
     checked: Readback<bool>,
     track_off: Option<(f32, f32, f32, f32)>,
     track_on: Option<(f32, f32, f32, f32)>,
@@ -2750,6 +2952,18 @@ pub(crate) struct Toggle {
 
 #[pymethods]
 impl Toggle {
+    /// Whether this widget takes input. A disabled widget is dimmed and ignores clicks, focus,
+    /// drags and shortcuts (it still scrolls). Disabling a `Box` disables everything inside it.
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.interaction.enabled()
+    }
+
+    /// Enable or disable this widget. Safe from any thread, before or after it's shown.
+    fn set_enabled(&self, enabled: bool) -> PyResult<()> {
+        self.interaction.set_enabled(enabled, &self.id, &self.sender)
+    }
+
     #[new]
     #[pyo3(signature = (
         checked=false,
@@ -2758,6 +2972,7 @@ impl Toggle {
         track_on=None,
         thumb_color=None,
         tooltip=None,
+        enabled=true,
     ))]
     fn new(
         checked: bool,
@@ -2766,10 +2981,12 @@ impl Toggle {
         track_on: Option<(f32, f32, f32, f32)>,
         thumb_color: Option<(f32, f32, f32, f32)>,
         tooltip: Option<String>,
+        enabled: bool,
     ) -> Self {
         Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
+            interaction: Interaction::new(enabled),
             checked: Readback::new(checked),
             track_off,
             track_on,
@@ -2830,6 +3047,7 @@ impl Toggle {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: Some(self.interaction.spec()),
         }
     }
 }
@@ -2839,6 +3057,7 @@ impl Toggle {
 pub(crate) struct SpinBox {
     id: IdCell,
     sender: SenderCell,
+    interaction: Interaction,
     value: Readback<f32>,
     min: f32,
     max: f32,
@@ -2854,6 +3073,18 @@ pub(crate) struct SpinBox {
 
 #[pymethods]
 impl SpinBox {
+    /// Whether this widget takes input. A disabled widget is dimmed and ignores clicks, focus,
+    /// drags and shortcuts (it still scrolls). Disabling a `Box` disables everything inside it.
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.interaction.enabled()
+    }
+
+    /// Enable or disable this widget. Safe from any thread, before or after it's shown.
+    fn set_enabled(&self, enabled: bool) -> PyResult<()> {
+        self.interaction.set_enabled(enabled, &self.id, &self.sender)
+    }
+
     #[new]
     #[pyo3(signature = (
         value=0.0,
@@ -2867,6 +3098,7 @@ impl SpinBox {
         text_color=None,
         background=None,
         button_color=None,
+        enabled=true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -2881,6 +3113,7 @@ impl SpinBox {
         text_color: Option<(f32, f32, f32, f32)>,
         background: Option<(f32, f32, f32, f32)>,
         button_color: Option<(f32, f32, f32, f32)>,
+        enabled: bool,
     ) -> PyResult<Self> {
         let value = require_finite("value", value)?;
         let min = require_finite("min", min)?;
@@ -2890,6 +3123,7 @@ impl SpinBox {
         Ok(Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
+            interaction: Interaction::new(enabled),
             value: Readback::new(value),
             min,
             max,
@@ -2951,6 +3185,7 @@ impl SpinBox {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: Some(self.interaction.spec()),
         }
     }
 }
@@ -2960,6 +3195,7 @@ impl SpinBox {
 pub(crate) struct NumericScrub {
     id: IdCell,
     sender: SenderCell,
+    interaction: Interaction,
     value: Readback<f32>,
     min: f32,
     max: f32,
@@ -2974,6 +3210,18 @@ pub(crate) struct NumericScrub {
 
 #[pymethods]
 impl NumericScrub {
+    /// Whether this widget takes input. A disabled widget is dimmed and ignores clicks, focus,
+    /// drags and shortcuts (it still scrolls). Disabling a `Box` disables everything inside it.
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.interaction.enabled()
+    }
+
+    /// Enable or disable this widget. Safe from any thread, before or after it's shown.
+    fn set_enabled(&self, enabled: bool) -> PyResult<()> {
+        self.interaction.set_enabled(enabled, &self.id, &self.sender)
+    }
+
     #[new]
     #[pyo3(signature = (
         value=0.0,
@@ -2986,6 +3234,7 @@ impl NumericScrub {
         width=None,
         text_color=None,
         background=None,
+        enabled=true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -2999,6 +3248,7 @@ impl NumericScrub {
         width: Option<f32>,
         text_color: Option<(f32, f32, f32, f32)>,
         background: Option<(f32, f32, f32, f32)>,
+        enabled: bool,
     ) -> PyResult<Self> {
         let value = require_finite("value", value)?;
         let min = require_finite("min", min)?;
@@ -3008,6 +3258,7 @@ impl NumericScrub {
         Ok(Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
+            interaction: Interaction::new(enabled),
             value: Readback::new(value),
             min,
             max,
@@ -3067,6 +3318,7 @@ impl NumericScrub {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: Some(self.interaction.spec()),
         }
     }
 }
@@ -3159,6 +3411,7 @@ impl ProgressBar {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: None,
         }
     }
 }
@@ -3169,6 +3422,7 @@ impl ProgressBar {
 pub(crate) struct ComboBox {
     id: IdCell,
     sender: SenderCell,
+    interaction: Interaction,
     items: Arc<Mutex<Arc<Vec<String>>>>,
     selected: Readback<Option<usize>>,
     placeholder: String,
@@ -3184,6 +3438,18 @@ pub(crate) struct ComboBox {
 
 #[pymethods]
 impl ComboBox {
+    /// Whether this widget takes input. A disabled widget is dimmed and ignores clicks, focus,
+    /// drags and shortcuts (it still scrolls). Disabling a `Box` disables everything inside it.
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.interaction.enabled()
+    }
+
+    /// Enable or disable this widget. Safe from any thread, before or after it's shown.
+    fn set_enabled(&self, enabled: bool) -> PyResult<()> {
+        self.interaction.set_enabled(enabled, &self.id, &self.sender)
+    }
+
     #[new]
     #[pyo3(signature = (
         items=None,
@@ -3197,6 +3463,7 @@ impl ComboBox {
         placeholder_color=None,
         background=None,
         border=None,
+        enabled=true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -3211,12 +3478,14 @@ impl ComboBox {
         placeholder_color: Option<(f32, f32, f32, f32)>,
         background: Option<(f32, f32, f32, f32)>,
         border: Option<(f32, f32, f32, f32)>,
+        enabled: bool,
     ) -> Self {
         let items = items.unwrap_or_default();
         let selected = selected.filter(|&i| i < items.len());
         Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
+            interaction: Interaction::new(enabled),
             items: Arc::new(Mutex::new(Arc::new(items))),
             selected: Readback::new(selected),
             placeholder: placeholder.to_owned(),
@@ -3336,6 +3605,7 @@ impl ComboBox {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: Some(self.interaction.spec()),
         }
     }
 }
@@ -3348,6 +3618,7 @@ pub(crate) struct Image {
     dispatch: Mutex<Option<CommandDispatch>>,
     id: IdCell,
     sender: SenderCell,
+    interaction: Interaction,
     width: Option<f32>,
     height: Option<f32>,
     flex_grow: f32,
@@ -3357,6 +3628,14 @@ pub(crate) struct Image {
 
 #[pymethods]
 impl Image {
+
+    /// Call `on_drop(paths, x, y)` when files are dropped on this widget from the OS (`paths`
+    /// is a list of strings; `x, y` the point in the widget's coordinates). `None` stops it.
+    #[pyo3(signature = (on_drop))]
+    fn set_file_drop(&self, on_drop: Option<Py<PyAny>>) -> PyResult<()> {
+        self.interaction.set_file_drop(on_drop, &self.id, &self.sender)
+    }
+
     #[new]
     #[pyo3(signature = (width=None, height=None, flex_grow=1.0, fit="stretch", on_pointer=None))]
     fn new(
@@ -3372,6 +3651,7 @@ impl Image {
             dispatch: Mutex::new(None),
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
+            interaction: Interaction::new(true),
             width,
             height,
             flex_grow,
@@ -3463,6 +3743,7 @@ impl Image {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: Some(self.interaction.spec()),
         }
     }
 }
@@ -3560,6 +3841,7 @@ impl Grid {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: None,
         })
     }
 }
@@ -3570,6 +3852,7 @@ impl Grid {
 pub(crate) struct BoxWidget {
     id: IdCell,
     sender: SenderCell,
+    interaction: Interaction,
     direction: FlexDirection,
     gap: Spacing,
     padding: Spacing,
@@ -3589,6 +3872,33 @@ pub(crate) struct BoxWidget {
 
 #[pymethods]
 impl BoxWidget {
+    /// Whether this widget takes input. A disabled widget is dimmed and ignores clicks, focus,
+    /// drags and shortcuts (it still scrolls). Disabling a `Box` disables everything inside it.
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.interaction.enabled()
+    }
+
+    /// Enable or disable this widget. Safe from any thread, before or after it's shown.
+    fn set_enabled(&self, enabled: bool) -> PyResult<()> {
+        self.interaction.set_enabled(enabled, &self.id, &self.sender)
+    }
+
+    /// Make this widget a drag source: dragging it carries `tag` and the bytes `data` returns
+    /// (called with the no arguments when the drag starts; `str` is sent as UTF-8, `None` cancels
+    /// the drag). Without `data` the payload is empty bytes. `tag=None` stops dragging.
+    #[pyo3(signature = (tag, data=None))]
+    fn set_drag_source(&self, tag: Option<String>, data: Option<Py<PyAny>>) -> PyResult<()> {
+        self.interaction.set_drag_source(tag, data, &self.id, &self.sender)
+    }
+
+    /// Accept drops of the tags in `accept` (one tag, a sequence, or `None` for any), calling
+    /// `on_drop(tag, data, x, y)`, the point in this box's coordinates. `on_drop=None` stops accepting drops.
+    #[pyo3(signature = (accept, on_drop))]
+    fn set_drop_target(&self, py: Python<'_>, accept: Option<Bound<'_, PyAny>>, on_drop: Option<Py<PyAny>>) -> PyResult<()> {
+        self.interaction.set_drop_target(py, accept.as_ref(), on_drop, &self.id, &self.sender)
+    }
+
     /// Change the fill color (`None`: transparent). Works before the box is shown, and survives
     /// rebuilds (e.g. `Window.set_theme`).
     #[pyo3(signature = (color=None))]
@@ -3620,6 +3930,7 @@ impl BoxWidget {
         visible=true,
         context_menu=None,
         accelerators=None,
+        enabled=true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -3635,6 +3946,7 @@ impl BoxWidget {
         visible: bool,
         context_menu: Option<Py<PyAny>>,
         accelerators: Option<Bound<'_, PyList>>,
+        enabled: bool,
     ) -> PyResult<Self> {
         let direction = match direction {
             "row" => FlexDirection::Row,
@@ -3663,6 +3975,7 @@ impl BoxWidget {
         Ok(Self {
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
+            interaction: Interaction::new(enabled),
             direction,
             gap,
             padding,
@@ -3744,6 +4057,7 @@ impl BoxWidget {
             context_menu,
             accelerators,
             hover_action: None,
+            interaction: Some(self.interaction.spec()),
         })
     }
 }
@@ -3844,6 +4158,7 @@ impl Splitter {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: None,
         })
     }
 }
@@ -4069,6 +4384,7 @@ impl Panel {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: None,
         };
 
         Ok(DescribedWidget {
@@ -4092,6 +4408,7 @@ impl Panel {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: None,
         })
     }
 }
@@ -4252,6 +4569,7 @@ impl Tabs {
             context_menu: None,
             accelerators: Vec::new(),
             hover_action: None,
+            interaction: None,
         })
     }
 }

@@ -147,6 +147,7 @@ All under [`python/examples/`](python/examples/), runnable directly once install
 | [`inspector_demo.py`](python/examples/inspector_demo.py) | M7 7D: `PropertyInspector` (label + 7B editors) driven by a tree selection. |
 | [`plots_demo.py`](python/examples/plots_demo.py) | M7 7E: numpy-fed line, scatter, heatmap, histogram, bar, contour, 3D surface, 3D scatter, and mesh plots (CPU raster, GPU image layer). |
 | [`tier4_demo.py`](python/examples/tier4_demo.py) | M7 7E: `ImageViewer`, `LogView`, `CodeEditor`, `CommandPalette` (Ctrl+K), `Observable`, `Gauge`, `Timeline`, `NodeGraph`. |
+| [`interaction_demo.py`](python/examples/interaction_demo.py) | M7 7F: hover state layer, `set_enabled` on a control box, list reorder and tree reparent by drag-and-drop, a drop zone, and OS file drops on an `Image`. |
 | [`dock_layout.py`](python/examples/dock_layout.py) | A `DockArea` of resizable, titled `Panel`s with a live `Viewport` in the center. |
 | [`dock_rearrange_demo.py`](python/examples/dock_rearrange_demo.py) | Drag a panel's title bar to split or tab-merge regions, including dropping at the window's outer edge to span the whole dock area. |
 | [`tabs_demo.py`](python/examples/tabs_demo.py) | Multiple `Panel`s sharing one `DockArea` region via `Tabs`, switched by clicking a header segment. |
@@ -177,6 +178,11 @@ All under [`python/examples/`](python/examples/), runnable directly once install
   including growing an existing `Tabs` group, ungroup, whole-window edge drops, and re-docking
   a floating panel; see its docstring in
   [`python/fastgui/__init__.py`](python/fastgui/__init__.py) for the remaining gaps).
+- **States and drag-and-drop**: every control and `Box` takes `enabled=` / `set_enabled()`
+  (a disabled `Box` disables everything in it: dimmed, no clicks, focus, drags or shortcuts).
+  Hovered controls get the theme's `hover` state layer. `ListView`, `TreeView` and `Box` take
+  `set_drag_source(tag, data)` / `set_drop_target(accept, on_drop)` (payload: a string tag plus
+  bytes); `Viewport` and `Image` take `set_file_drop(on_drop)` for files dropped from the OS.
 - **Window**: `Window(title, width, height)` — `set_content(widget)`, `set_clear_color(...)`,
   `add_floating_panel(panel, x, y, width, height)`, `.run()` (blocks, owns the render loop).
 
@@ -217,14 +223,14 @@ CPU pixmap with `FASTGUI_CHROME=cpu`); `fastgui-py` is the PyO3 layer and picks 
   Linux aarch64 and Windows ARM build from source.
 - **Free-threaded Python means 3.14t.** PyO3 0.29 doesn't build for 3.13t (see
   [Install](#install)). GIL builds need CPython 3.11+.
-- **No hover or disabled states** on controls yet (menu rows are the exception). Planned as one
-  theme-token pass across all widgets.
 - **Text editing gaps:** `TextArea` has no soft wrap, the caret doesn't blink, and clicking a
   scrollbar track doesn't page. No bidi/RTL caret movement.
-- **No drag-and-drop** between widgets or from the OS (file drops), other than rearranging
-  docked panels.
+- **Drag-and-drop is main-window only.** Widget drags work inside the main window, not in
+  floating panels or between windows. OS file drops land at the cursor on Windows; elsewhere
+  they land where the cursor last moved in the window. GPU `Viewport`/`Image` layers aren't
+  dimmed when disabled (they draw above chrome).
 - **No accessibility support.** Screen readers can't see fastgui widgets yet.
-- **`Viewport` stretches its frame** to the layout rect instead of preserving aspect ratio.
+- **`Viewport` and `Image` stretch by default**; pass `fit="contain"` to letterbox.
 - **`Table`** has no column resize or sort, and **`DockArea`** layouts aren't saved or restored.
 - **`Viewport.submit_frame` always copies** the numpy/buffer into an owned `Vec<u8>` before
   upload. Expected for the CPU path; a packed-RGBA camera feed will want a fewer-copy path later.

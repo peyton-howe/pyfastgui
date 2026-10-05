@@ -10,6 +10,7 @@ mod command;
 mod constants;
 mod coords;
 mod cuda_handles;
+pub mod dnd;
 mod forms;
 mod ghost;
 mod keyboard;

@@ -200,7 +200,6 @@ class Menu:
             if it.on_click is not None:
                 it.on_click()
 
-        label_color = theme.text if item.enabled else theme.text_muted
         # Resting on a submenu row opens its submenu; on any other row, closes the open one —
         # native menus, no click needed. (The app waits a moment first, so sweeping across rows
         # toward an open submenu doesn't close it.)
@@ -209,15 +208,17 @@ class Menu:
                 self._open_submenu_for(it.submenu, h["btn"])
         else:
             on_hover = self._close_submenu
-        # Flat rows: transparent until hover (`surface_active`), like a native menu.
+        # Flat rows: transparent until hovered (the theme's `hover` state layer), like a native
+        # menu. A disabled row is a disabled button: dimmed, no hover, no click.
         btn = Button(
             self._item_label(item),
-            on_click=activate if item.enabled else None,
+            on_click=activate,
             font_size="small",
-            text_color=label_color,
+            text_color=theme.text,
             background=None,
             flat=True,
             on_hover=on_hover,
+            enabled=item.enabled,
         )
         holder["btn"] = btn
         return btn

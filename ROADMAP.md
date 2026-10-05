@@ -1483,9 +1483,30 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
   skipping this is where fastgui would fall short of it.
 - **HiDPI** scale factor applied to chrome.
 - **Drag-and-drop** between widgets and from the OS, generalizing the docking drag code.
+  — **Done (7F.2, 2026-10-05, branch `m7-7f-hover-dnd`):** payload is a string tag plus bytes
+  (`fastgui_core::dnd`). `WidgetTree` side tables for drag sources / drop targets / file-drop
+  handlers; `drop_target_at` resolves the target and its preview rect (list insertion gap, tree
+  before/inside/after, or the widget). `fastgui_app::dnd::WidgetDrag` runs the gesture and
+  shares the dock drag's threshold (`past_drag_threshold`, now used by the dock's two checks
+  too) and its preview path: chrome takes one resolved `drop_preview` rect, whichever drag
+  produced it. OS files (`DroppedFile`) are collected per event burst and routed by cursor
+  (`GetCursorPos` on Windows, since no cursor events arrive during an OLE drag). Python:
+  `set_drag_source` / `set_drop_target` on `ListView`, `TreeView`, `Box`; `set_file_drop` on
+  `Viewport`, `Image`. Escape cancels; grab / not-allowed cursor. Main window only (floaters
+  and cross-window drags not yet).
 - **Disabled and hover states** for every control — a shared follow-up after 7B. Touches
   every `WidgetKind`, input handling (skip presses / focus), and theming (`Theme` tokens for
   disabled/hover fills). Do not bolt onto individual 7B widgets one at a time.
+  — **Done (7F.1, same branch):** `Theme.hover` / `Theme.disabled` tokens (translucent).
+  Chrome draws one hover state layer over any hovered `is_hoverable()` widget (replacing the
+  button-only fill; menu rows included) and one veil per disabled subtree (after its children,
+  so nested widgets aren't dimmed twice). `WidgetTree::set_disabled` side table with ancestor
+  inheritance: presses, focus, Tab, accelerators, context menus, splitter and image-pointer
+  input skip disabled widgets; scrolling and hover actions still work (native menus close a
+  submenu when you hover a disabled row). Python: `enabled=` / `.enabled` / `set_enabled()`
+  on the 13 interactive controls and `Box`; `MenuItem(enabled=False)` is now a disabled
+  button. Hover couldn't be checked live here (this session's synthetic cursor moves don't
+  reach the window); chrome tests cover it.
 
 ### Suggested order
 

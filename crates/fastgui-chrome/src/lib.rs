@@ -28,7 +28,7 @@ use cosmic_text::{Attrs, Buffer, Color as CosmicColor, Family, FontSystem, Metri
 use fastgui_core::text_edit::{TextEdit, TextMeasure};
 use fastgui_core::theme::chrome_theme;
 use fastgui_core::widget::{
-    Color, DropZone, LayerFit, WidgetKind, WidgetTree, LINE_HEIGHT_RATIO as LAYOUT_LINE_HEIGHT_RATIO,
+    Color, LayerFit, WidgetId, WidgetKind, WidgetTree, LINE_HEIGHT_RATIO as LAYOUT_LINE_HEIGHT_RATIO,
     TEXT_INPUT_PADDING, TEXT_INPUT_VERTICAL_PADDING,
 };
 use fastgui_core::{ChromeFrame, PixelRect};
@@ -42,6 +42,8 @@ const DROP_INDICATOR_KEY: u64 = u64::MAX;
 /// Flipped into a `ScrollArea`'s id for the key of its scrollbars' item (drawn after its
 /// content, so the bars sit on top).
 const SCROLLBAR_KEY_BIT: u64 = 1 << 63;
+/// Set on a disabled subtree's veil item's key (`WidgetId` keys never use it either).
+const DISABLED_KEY_BIT: u64 = 1 << 62;
 
 /// Once damage covers more than this share of the window, repaint (and upload) all of it: the
 /// partial path's per-rect overhead stops paying for itself.
@@ -125,9 +127,9 @@ impl ChromeRenderer {
     /// `WidgetTree::compute_layout` first) into a `width`x`height` RGBA8 frame. Layout rects and
     /// font sizes are in the same units as `compute_layout` and are multiplied by `scale` so a
     /// HiDPI window can keep layout in points while the pixmap matches backing pixels.
-    /// `drop_indicator` — `(region rect, zone)` — draws a translucent highlight over the sub-area
-    /// of that region a dragged `Panel` title bar would land in if released right now; `None`
-    /// when no drag is in progress.
+    /// `drop_preview` draws a translucent highlight over that rect: where a drag in progress
+    /// would land if released right now (a dock zone, a list insertion line, a tree row, a drop
+    /// target); `None` when no drag is in progress.
     ///
     /// Returns `None` when nothing visible changed since the previous call, so there is nothing
     /// to upload. Otherwise the frame's `damage` lists the rects that changed, or is `None` when
@@ -137,7 +139,7 @@ impl ChromeRenderer {
         tree: &WidgetTree,
         width: u32,
         height: u32,
-        drop_indicator: Option<(WidgetRect, DropZone)>,
+        drop_preview: Option<WidgetRect>,
         scale: f32,
     ) -> Option<ChromeFrame<'_>> {
         let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
@@ -145,7 +147,7 @@ impl ChromeRenderer {
         let window = PixelRect { x: 0, y: 0, width, height };
 
         self.text_cache.generation += 1;
-        let items = self.build_items(tree, drop_indicator, scale, window);
+        let items = self.build_items(tree, drop_preview, scale, window);
         self.text_cache.evict();
 
         let same_size = self.frame.as_ref().is_some_and(|f| f.width() == width && f.height() == height);
@@ -192,12 +194,12 @@ impl ChromeRenderer {
     fn build_items(
         &mut self,
         tree: &WidgetTree,
-        drop_indicator: Option<(WidgetRect, DropZone)>,
+        drop_preview: Option<WidgetRect>,
         scale: f32,
         window: PixelRect,
     ) -> Vec<Item> {
         let family = chrome_theme().font_family;
-        self.build_items_in(tree, drop_indicator, scale, window, family)
+        self.build_items_in(tree, drop_preview, scale, window, family)
     }
 
     /// `build_items` with an explicit font family instead of the theme's (tests).
@@ -209,7 +211,7 @@ impl ChromeRenderer {
     fn build_items_in(
         &mut self,
         tree: &WidgetTree,
-        drop_indicator: Option<(WidgetRect, DropZone)>,
+        drop_preview: Option<WidgetRect>,
         scale: f32,
         window: PixelRect,
         family: Option<Arc<str>>,
@@ -223,7 +225,14 @@ impl ChromeRenderer {
         let mut overlay = Vec::new();
         let mut in_overlay = false;
         let popups: Vec<_> = tree.walk().filter(|&id| matches!(tree.kind(id), Some(WidgetKind::Popup { .. }))).collect();
+        // Disabled subtrees still open: their veil goes in once the walk leaves the subtree, so it
+        // covers the children too but each subtree is dimmed only once.
+        let mut veils: Vec<(WidgetId, bool, Item)> = Vec::new();
         for id in tree.walk() {
+            while veils.last().is_some_and(|(root, ..)| !is_within(tree, id, *root)) {
+                let (_, overlay_veil, item) = veils.pop().expect("checked above");
+                if overlay_veil { overlay.push(item) } else { items.push(item) }
+            }
             in_overlay |= popups.contains(&id);
             let (Some(logical_rect), Some(kind)) = (tree.absolute_rect(id), tree.kind(id)) else {
                 continue;
@@ -243,13 +252,7 @@ impl ChromeRenderer {
                     self.push_text(&mut ops, WidgetRect { width: rect.width + size, ..rect }, text, size, *color);
                 }
                 WidgetKind::Button { text, font_size, text_color, background, flat, .. } => {
-                    let fill = if tree.hovered() == Some(id) {
-                        theme.hover
-                    } else if *flat && background.0[3] <= 0.001 {
-                        Color::TRANSPARENT
-                    } else {
-                        *background
-                    };
+                    let fill = if *flat && background.0[3] <= 0.001 { Color::TRANSPARENT } else { *background };
                     if fill.0[3] > 0.001 {
                         push_fill(&mut ops, rect, fill);
                     }
@@ -708,14 +711,31 @@ impl ChromeRenderer {
                     self.push_centered_text(&mut ops, scale_rect(chevron, scale), "▾", font_size * scale * 0.85, color);
                 }
             }
+            // One hover treatment for every clickable control (menu rows and flat buttons
+            // included): a translucent state layer over the whole widget.
+            if tree.hovered() == Some(id) && kind.is_hoverable() && !tree.is_disabled(id) {
+                push_fill(&mut ops, rect, theme.hover);
+            }
             if tree.focused() == Some(id) {
                 push_outline(&mut ops, rect, FOCUS_RING_WIDTH * scale, theme.accent);
             }
-            if let Some(clip) = tree.clip_rect(id) {
-                ops = clip_ops(ops, Clip::from_rect(scale_rect(clip, scale)));
+            let clip = tree.clip_rect(id).map(|clip| Clip::from_rect(scale_rect(clip, scale)));
+            if let Some(clip) = clip {
+                ops = clip_ops(ops, clip);
+            }
+            if tree.is_disabled_root(id) {
+                let mut veil = Vec::new();
+                push_fill(&mut veil, rect, theme.disabled);
+                if let Some(clip) = clip {
+                    veil = clip_ops(veil, clip);
+                }
+                veils.push((id, in_overlay, Item::new(u64::from(id) ^ DISABLED_KEY_BIT, veil, window)));
             }
             let target = if in_overlay { &mut overlay } else { &mut items };
             target.push(Item::new(u64::from(id), ops, window));
+        }
+        for (_, overlay_veil, item) in veils.into_iter().rev() {
+            if overlay_veil { overlay.push(item) } else { items.push(item) }
         }
 
         // Overlay scrollbars, after all content so nothing scrolled covers them.
@@ -748,8 +768,8 @@ impl ChromeRenderer {
         // widget covers it. `fastgui-app` also skips GPU viewport layers under it. Always
         // present (empty without a drag) so showing/hiding it doesn't change the key sequence.
         let mut ops = Vec::new();
-        if let Some((region_rect, zone)) = drop_indicator {
-            push_fill(&mut ops, scale_rect(zone.preview_rect(region_rect), scale), theme.drop_indicator);
+        if let Some(preview) = drop_preview {
+            push_fill(&mut ops, scale_rect(preview, scale), theme.drop_indicator);
         }
         items.push(Item::new(DROP_INDICATOR_KEY, ops, window));
         self.overlay_items = items.len();
@@ -1383,6 +1403,18 @@ impl Clip {
 /// Restrict `ops` to `clip`: fills are cut to it exactly, ops entirely outside are dropped,
 /// and circles/text that straddle it carry it along (see `Op::Circle` / `Op::Text`). Clipping
 /// already-clipped ops again (a list inside a scroll area) keeps the overlap of both clips.
+/// Whether `id` is `root` or inside its subtree.
+fn is_within(tree: &WidgetTree, id: WidgetId, root: WidgetId) -> bool {
+    let mut node = Some(id);
+    while let Some(current) = node {
+        if current == root {
+            return true;
+        }
+        node = tree.parent(current);
+    }
+    false
+}
+
 fn clip_ops(ops: Vec<Op>, clip: Clip) -> Vec<Op> {
     let (cl, ct, cr, cb) = (clip.left as f32, clip.top as f32, clip.right as f32, clip.bottom as f32);
     ops.into_iter()
