@@ -17,7 +17,9 @@ def main() -> None:
     status = fg.Label("Streaming sine into PlotLine…", font_size=14.0, color=(0.7, 0.75, 0.85, 1.0))
 
     x = np.linspace(0.0, 4.0 * np.pi, 400)
-    line = fg.PlotLine(pixel_width=640, pixel_height=220, interactive=True)
+    # Plots have no intrinsic size: inside a ScrollArea (unbounded height) give each one a height,
+    # and in a row give them flex_grow so they share its width.
+    line = fg.PlotLine(pixel_width=640, pixel_height=220, height=220, flex_grow=0, interactive=True)
     line.set_series(
         [
             (x, np.sin(x), (0.35, 0.75, 1.0, 1.0)),
@@ -31,12 +33,14 @@ def main() -> None:
         point_radius=2.5,
         pixel_width=640,
         pixel_height=220,
+        height=220,
+        flex_grow=0,
     )
     yy, xx = np.mgrid[0:64, 0:96]
     field = np.sin(xx / 8.0) * np.cos(yy / 6.0)
-    heat = fg.PlotHeatmap(field, colormap="viridis", pixel_width=640, pixel_height=220)
-    hist = fg.PlotHistogram(np.random.default_rng(0).normal(size=800), bins=28, pixel_width=640, pixel_height=220, height=200, flex_grow=0)
-    bar = fg.PlotBar([3, 5, 2, 7, 4, 6], color=(0.95, 0.55, 0.35, 1.0), pixel_width=640, pixel_height=220, height=200, flex_grow=0)
+    heat = fg.PlotHeatmap(field, colormap="viridis", pixel_width=640, pixel_height=220, height=220, flex_grow=0)
+    hist = fg.PlotHistogram(np.random.default_rng(0).normal(size=800), bins=28, pixel_width=640, pixel_height=220, height=200, flex_grow=1)
+    bar = fg.PlotBar([3, 5, 2, 7, 4, 6], color=(0.95, 0.55, 0.35, 1.0), pixel_width=640, pixel_height=220, height=200, flex_grow=1)
     contour = fg.PlotContour(field, levels=8, filled=True, pixel_width=640, pixel_height=220, height=200, flex_grow=0)
     z = field[::2, ::2]
     surface = fg.PlotSurface(
@@ -46,7 +50,7 @@ def main() -> None:
         pixel_width=640,
         pixel_height=280,
         height=240,
-        flex_grow=0,
+        flex_grow=1,
     )
     scatter3d = fg.PlotScatter3D(
         xx[::4, ::4].ravel(),
@@ -56,7 +60,7 @@ def main() -> None:
         pixel_width=640,
         pixel_height=280,
         height=240,
-        flex_grow=0,
+        flex_grow=1,
     )
     # A small pyramid so the mesh path is obvious next to the height field.
     mesh_v = np.array(
@@ -64,7 +68,7 @@ def main() -> None:
         dtype=np.float64,
     )
     mesh_f = [(0, 1, 4), (1, 2, 4), (2, 3, 4), (3, 0, 4), (0, 2, 1), (0, 3, 2)]
-    mesh = fg.PlotMesh(mesh_v, mesh_f, colormap="magma", pixel_width=640, pixel_height=280, height=240, flex_grow=0)
+    mesh = fg.PlotMesh(mesh_v, mesh_f, colormap="magma", pixel_width=640, pixel_height=280, height=240, flex_grow=1)
 
     stop = threading.Event()
 

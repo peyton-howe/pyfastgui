@@ -1026,7 +1026,8 @@ impl PlotHeatmap {
 
     fn apply_pan(&self, dx: f64, dy: f64) {
         let window = *self.window.lock().unwrap_or_else(|p| p.into_inner());
-        *self.window.lock().unwrap_or_else(|p| p.into_inner()) = pan_window(window, -dx, dy);
+        // Window row 0 is the top, so a downward drag (+dy) moves the window up: content follows the cursor.
+        *self.window.lock().unwrap_or_else(|p| p.into_inner()) = pan_window(window, -dx, -dy);
         self.redraw();
     }
 
@@ -1060,7 +1061,8 @@ impl PlotHeatmap {
                 }
                 1 => {
                     let (_, _, ddx, ddy) = contained_pointer(lx, ly, dx, dy, w, h, pw, ph);
-                    view = pan_window(view, -ddx, ddy);
+                    // Window row 0 is the top, so a downward drag (+dy) moves the window up: content follows the cursor.
+                    view = pan_window(view, -ddx, -ddy);
                 }
                 _ => return,
             }

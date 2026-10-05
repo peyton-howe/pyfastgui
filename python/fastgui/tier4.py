@@ -24,7 +24,8 @@ _NUMBER = (0.95, 0.70, 0.40, 1.0)
 
 
 def highlight_python(text: str) -> list[tuple[int, int, tuple[float, float, float, float]]]:
-    """Byte spans for keywords, comments, strings, and numbers."""
+    """UTF-8 byte spans (what `TextArea.set_highlights` takes) for keywords, comments, strings,
+    and numbers."""
     spans: list[tuple[int, int, tuple[float, float, float, float]]] = []
     i = 0
     n = len(text)
@@ -66,7 +67,17 @@ def highlight_python(text: str) -> list[tuple[int, int, tuple[float, float, floa
             i = j
             continue
         i += 1
-    return spans
+    return _char_spans_to_bytes(text, spans)
+
+
+def _char_spans_to_bytes(text, spans):
+    """The scan above indexes `str` characters; convert to UTF-8 byte offsets."""
+    if text.isascii():
+        return spans
+    offsets = [0]
+    for ch in text:
+        offsets.append(offsets[-1] + len(ch.encode("utf-8")))
+    return [(offsets[a], offsets[b], color) for a, b, color in spans]
 
 
 def _clamp_span(a: float, b: float) -> tuple[float, float]:
@@ -161,7 +172,8 @@ class ImageViewer:
             self._window = _zoom_window(self._window, fx, fy, factor)
         elif action == 1:
             fx = (-dx / w) if w else 0.0
-            fy = (dy / h) if h else 0.0
+            # Window row 0 is the top: a downward drag moves the window up, content follows.
+            fy = (-dy / h) if h else 0.0
             self._window = _pan_window(self._window, fx, fy)
         else:
             return

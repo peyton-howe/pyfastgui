@@ -51,7 +51,8 @@ impl CudaDriver {
                 PFN_cuDevicePrimaryCtxRetain
             ),
             ctx_set_current: resolve!(lib, "cuCtxSetCurrent", PFN_cuCtxSetCurrent),
-            memcpy_dtoh: resolve!(lib, "cuMemcpyDtoH", PFN_cuMemcpyDtoH),
+            // `_v2`: cuda.h maps cuMemcpyDtoH to it; the unsuffixed export takes a 32-bit device pointer.
+            memcpy_dtoh: resolve!(lib, "cuMemcpyDtoH_v2", PFN_cuMemcpyDtoH),
             stream_create: resolve!(lib, "cuStreamCreate", PFN_cuStreamCreate),
             stream_synchronize: resolve!(lib, "cuStreamSynchronize", PFN_cuStreamSynchronize),
             stream_destroy: resolve!(lib, "cuStreamDestroy", PFN_cuStreamDestroy),

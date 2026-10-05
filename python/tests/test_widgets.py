@@ -651,5 +651,46 @@ class ShortcutLabelTests(unittest.TestCase):
         self.assertEqual(_shortcut_label("F5"), "F5")
 
 
+
+class DragDirectionAndHighlightTests(unittest.TestCase):
+    """`pan(dx, dy)` is a drag in plot fractions with screen y down: the content follows the
+    cursor. Grid-backed plots keep row 0 at the top, so a downward drag moves their window up."""
+
+    def test_heatmap_and_contour_follow_a_downward_drag(self):
+        grid = [[0.0, 1.0, 2.0], [0.0, 1.0, 2.0], [0.0, 1.0, 2.0]]
+        for plot in (
+            fg.PlotHeatmap(grid, pixel_width=80, pixel_height=60),
+            fg.PlotContour(grid, levels=2, pixel_width=80, pixel_height=60),
+        ):
+            with self.subTest(plot=type(plot).__name__):
+                plot.zoom(2.0, 0.5, 0.5)
+                _, _, r0, r1 = plot.window()
+                plot.pan(0.0, 0.1)
+                _, _, n0, n1 = plot.window()
+                self.assertLess(n0, r0, "dragging down should reveal rows above")
+                self.assertLess(n1, r1)
+
+    def test_image_viewer_follows_a_downward_drag(self):
+        import numpy as np
+
+        viewer = fg.ImageViewer(np.zeros((8, 8), dtype=np.float32), pixel_width=32, pixel_height=32)
+        viewer._pointer(0, 0.0, -1.0, 16.0, 16.0, 32.0, 32.0)  # zoom in around the center
+        _, _, r0, _ = viewer._window
+        viewer._pointer(1, 0.0, 4.0, 16.0, 16.0, 32.0, 32.0)  # drag down 4 px
+        self.assertLess(viewer._window[2], r0)
+
+    def test_highlight_spans_are_utf8_bytes(self):
+        from fastgui.tier4 import highlight_python
+
+        text = "s = 'é…'  # café\nif x: pass\n"
+        data = text.encode("utf-8")
+        words = {data[a:b].decode("utf-8") for a, b, _ in highlight_python(text)}
+        self.assertEqual(words, {"'é…'", "# café", "if", "pass"})
+        ascii_text = "def f(): return 1"
+        self.assertEqual(
+            [ascii_text[a:b] for a, b, _ in highlight_python(ascii_text)], ["def", "return", "1"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

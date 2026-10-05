@@ -1057,9 +1057,11 @@ pub fn raster_contour(
         }
     }
 
+    // `gc`/`gr` are sample indices (fractional between samples). The bands above draw sample
+    // `(r, c)` over its whole cell, so a sample sits at its cell's centre, not its corner.
     let to_screen = |gc: f64, gr: f64| -> (f32, f32) {
-        let fx = (gc / cols as f64 - col0) / (col1 - col0);
-        let fy = (gr / rows as f64 - row0) / (row1 - row0);
+        let fx = ((gc + 0.5) / cols as f64 - col0) / (col1 - col0);
+        let fy = ((gr + 0.5) / rows as f64 - row0) / (row1 - row0);
         let x = area.x0 as f32 + fx as f32 * (area.pw.saturating_sub(1) as f32);
         let y = area.y0 as f32 + fy as f32 * (area.ph.saturating_sub(1) as f32);
         (x, y)
@@ -1245,10 +1247,11 @@ fn raster_projected(
     let scale = (area.pw.min(area.ph) as f64) * 0.78 * zoom;
     let ox = area.x0 as f64 + area.pw as f64 * 0.5;
     let oy = area.y0 as f64 + area.ph as f64 * 0.5;
-    let project = |v: [f64; 3]| -> (f32, f32, f64) {
+    // Screen position and depth, plus the rotated view-space point (for lighting).
+    let project = |v: [f64; 3]| -> (f32, f32, f64, [f64; 3]) {
         let n = [(v[0] - center[0]) / extent, (v[1] - center[1]) / extent, (v[2] - center[2]) / extent];
         let (x, y, z) = rotate_view(n[0], n[1], n[2], view);
-        ((ox + x * scale) as f32, (oy - y * scale) as f32, z)
+        ((ox + x * scale) as f32, (oy - y * scale) as f32, z, [x, y, z])
     };
     let mut tris = Vec::with_capacity(faces.len());
     for face in faces {
@@ -1261,12 +1264,10 @@ fn raster_projected(
         let pa = project(*a);
         let pb = project(*b);
         let pc = project(*c);
-        let ux = (pb.0 - pa.0) as f64;
-        let uy = (pb.1 - pa.1) as f64;
-        let uz = pb.2 - pa.2;
-        let vx = (pc.0 - pa.0) as f64;
-        let vy = (pc.1 - pa.1) as f64;
-        let vz = pc.2 - pa.2;
+        // Normal in view space, where all three axes share one unit. (Screen pixels for x/y
+        // against normalized depth for z made every face's normal nearly the same.)
+        let [ux, uy, uz] = [pb.3[0] - pa.3[0], pb.3[1] - pa.3[1], pb.3[2] - pa.3[2]];
+        let [vx, vy, vz] = [pc.3[0] - pa.3[0], pc.3[1] - pa.3[1], pc.3[2] - pa.3[2]];
         let nx = uy * vz - uz * vy;
         let ny = uz * vx - ux * vz;
         let nz = ux * vy - uy * vx;
@@ -1583,6 +1584,52 @@ mod tests {
         );
         let colored = frame.data.chunks_exact(4).filter(|px| px[0] != 26 || px[1] != 28).count();
         assert!(colored > 30, "isolines should paint, got {colored}");
+    }
+
+    #[test]
+    fn contour_lines_sit_on_band_edges() {
+        // Ramp 0..3 across 4 columns, one level at 1.5: columns 0-1 fill one band, 2-3 the next,
+        // and the isoline must run along that edge, not half a cell to the left of it.
+        let values: Vec<f64> = (0..16).map(|i| (i % 4) as f64).collect();
+        let (width, height) = (200, 120);
+        let frame = raster_contour(width, height, &values, 4, 4, &[1.5], None, PlotStyle::default(), Colormap::Viridis, true, None);
+        let px = |x: u32, y: u32| -> [u8; 4] {
+            let i = ((y * width + x) * 4) as usize;
+            frame.data[i..i + 4].try_into().unwrap()
+        };
+        let y = height / 2;
+        // Lines are anti-aliased near-white; both viridis bands here have a low blue channel.
+        let line: Vec<u32> = (0..width).filter(|&x| px(x, y)[2] > 150).collect();
+        assert!(!line.is_empty(), "the isoline should cross the middle row");
+        let x = line[line.len() / 2];
+        assert_ne!(px(x - 3, y), px(x + 3, y), "isoline at x={x} should separate the two bands");
+    }
+
+    #[test]
+    fn mesh_lighting_depends_on_slope() {
+        // Same mean height (same colormap color), different slopes: only lighting tells them apart.
+        let verts = [
+            [0.0, 0.0, 0.5],
+            [1.0, 0.0, 0.5],
+            [0.0, 1.0, 0.5],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [2.0, 0.0, 1.5],
+        ];
+        let faces = [[0, 1, 2], [3, 4, 5]];
+        let frame = raster_mesh(160, 120, &verts, &faces, PlotStyle::default(), Colormap::Gray, MeshView::default());
+        let background = [26, 28, 33];
+        let mut brightness: Vec<u8> = frame
+            .data
+            .chunks_exact(4)
+            .filter(|px| px[..3] != background && px[0] == px[1] && px[1] == px[2])
+            .map(|px| px[0])
+            .collect();
+        brightness.sort_unstable();
+        brightness.dedup();
+        let (lo, hi) = (brightness[0], *brightness.last().unwrap());
+        // Before shading used view space this was about 1 level; now it is ~20.
+        assert!(hi - lo > 10, "faces at different slopes should shade differently, got {brightness:?}");
     }
 
     #[test]
