@@ -42,6 +42,22 @@ pub type TextCallback = Arc<dyn Fn(String) + Send + Sync>;
 pub type PanelCloseCallback = Arc<dyn Fn(u64) + Send + Sync>;
 /// Right-click context menu: window coordinates of the press.
 pub type PointCallback = Arc<dyn Fn(f32, f32) + Send + Sync>;
+/// Pointer interaction on an image layer (plots, the image viewer, the node graph).
+///
+/// `(action, dx, dy, local_x, local_y, width, height)` in layout units, relative to the widget.
+/// `action`: 0 wheel (`dy` is the scroll delta, positive down), 1 drag, 2 double-click,
+/// 3 hover move, 4 press, 5 release.
+pub type PointerCallback = Arc<dyn Fn(u8, f32, f32, f32, f32, f32, f32) + Send + Sync>;
+
+/// How a `Viewport` / `Image` texture maps into its layout rect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LayerFit {
+    /// Stretch the texture to the whole rect (historical behavior).
+    #[default]
+    Stretch,
+    /// Letterbox so the texture keeps its pixel aspect ratio.
+    Contain,
+}
 
 /// A keyboard accelerator (`Ctrl+S`, `Cmd+Shift+N`, …). `primary` is Cmd on macOS and Ctrl
 /// elsewhere; both `Cmd` and `Ctrl` in the shortcut string set it.
@@ -624,6 +640,9 @@ pub enum WidgetKind {
         on_change: Option<TextCallback>,
         on_submit: Option<TextCallback>,
         mirror: Option<Readback<String>>,
+        /// Optional syntax spans `(start_byte, end_byte, color)` into `edit`'s text. Empty means
+        /// the whole buffer uses `text_color`.
+        highlights: Vec<(usize, usize, Color)>,
     },
     /// A viewport onto its (usually single) child, scrolled by `offset` (layout units, both
     /// axes; clamped to the content's overflow at each layout). Children lay out at their
@@ -719,6 +738,7 @@ pub enum WidgetKind {
     Viewport {
         viewport_id: u64,
         frames: FrameSlot<crate::CpuFrame>,
+        fit: LayerFit,
     },
     /// A labeled on/off control. `checked` is the current value; `on_change` fires on toggle
     /// (Space/click). Indicator size is `CHECK_SIZE`; chrome draws the box and checkmark.
@@ -800,6 +820,10 @@ pub enum WidgetKind {
     Image {
         image_id: u64,
         frames: FrameSlot<crate::CpuFrame>,
+        fit: LayerFit,
+        /// When set, wheel / drag / hover over this image are delivered here instead of
+        /// scrolling a parent `ScrollArea`.
+        on_pointer: Option<PointerCallback>,
     },
     /// Closed field showing the selected item (or `placeholder`) with a chevron; click / Space /
     /// ArrowDown opens a non-modal `Popup` anchored below with a `ListView` of `items`.
@@ -3746,7 +3770,7 @@ mod tests {
                 size: Size { width: Dimension::percent(1.0), height: Dimension::percent(1.0) },
                 ..Default::default()
             },
-            WidgetKind::Viewport { viewport_id: 1, frames: slot.clone() },
+            WidgetKind::Viewport { viewport_id: 1, frames: slot.clone(), fit: LayerFit::Stretch },
         );
         tree.add_child(root, id);
         tree.compute_layout(64.0, 32.0);
@@ -3885,6 +3909,7 @@ mod tests {
                 on_change: None,
                 on_submit: None,
                 mirror: None,
+                highlights: Vec::new(),
             },
         );
         tree.add_child(root, id);

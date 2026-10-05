@@ -360,6 +360,7 @@ impl MetalRenderer {
         }
         for draw in viewports {
             let Some(layer) = self.layers.get(&draw.viewport_id) else { continue };
+            let draw = draw.letterboxed(layer.texture.width, layer.texture.height);
             let Some(([x, y, w, h], [sx, sy, sw, sh])) = draw.viewport_and_scissor(self.width, self.height) else {
                 continue;
             };

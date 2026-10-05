@@ -548,6 +548,7 @@ fn text_area_tree(text: &str) -> (WidgetTree, WidgetId) {
             on_change: None,
             on_submit: None,
             mirror: None,
+            highlights: Vec::new(),
         },
     );
     tree.add_child(root, area);
@@ -1031,7 +1032,12 @@ fn form_controls_rasterize_without_panicking() {
         &mut tree,
         column,
         Style { size: Size { width: Dimension::length(80.0), height: Dimension::length(48.0) }, ..Default::default() },
-        WidgetKind::Image { image_id: 99, frames: fastgui_core::FrameSlot::new() },
+        WidgetKind::Image {
+            image_id: 99,
+            frames: fastgui_core::FrameSlot::new(),
+            fit: fastgui_core::widget::LayerFit::Stretch,
+            on_pointer: None,
+        },
     );
     add(
         &mut tree,
@@ -1070,6 +1076,7 @@ fn form_controls_rasterize_without_panicking() {
             on_change: None,
             on_submit: None,
             mirror: None,
+            highlights: Vec::new(),
         },
     );
 
