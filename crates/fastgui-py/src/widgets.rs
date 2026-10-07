@@ -10,6 +10,7 @@ use fastgui_core::widget::{
     TabSelectCallback, TableColumn, TableData, TextCallback, TreeData, TreeNodeData, WidgetId, WidgetKind,
     WidgetTree,
 };
+use fastgui_core::dnd::TreePlace;
 use fastgui_core::text_edit::TextEdit;
 use fastgui_core::{CpuFrame, FrameSlot, PixelFormat, Readback, MAX_CPU_FRAME_EXTENT};
 use crate::theme::{FontSize, Spacing};
@@ -2311,6 +2312,54 @@ impl TreeView {
         })
     }
 
+    /// Move the node at `source` (with its subtree) `place`d `"before"`, `"inside"` (as the last
+    /// child) or `"after"` the node at `target`. Unlike `set_nodes`, every node keeps its expand
+    /// state and the selection stays on its node; an `"inside"` target opens to show the moved
+    /// node. Raises `ValueError` if a path doesn't resolve or `target` is `source` or inside it.
+    /// Works before attaching.
+    #[pyo3(signature = (source, target, place="inside"))]
+    fn move_node(&self, source: &Bound<'_, PyAny>, target: &Bound<'_, PyAny>, place: &str) -> PyResult<()> {
+        let source = path_from_py(Some(source))?.ok_or_else(|| PyValueError::new_err("source path required"))?;
+        let target = path_from_py(Some(target))?.ok_or_else(|| PyValueError::new_err("target path required"))?;
+        let place = match place {
+            "before" => TreePlace::Before,
+            "inside" => TreePlace::Inside,
+            "after" => TreePlace::After,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "place must be \"before\", \"inside\" or \"after\", got {other:?}"
+                )))
+            }
+        };
+        let (data, expanded, selected) = {
+            let data = self.data.lock().unwrap_or_else(|p| p.into_inner());
+            let expanded = self.expanded.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let selected = self.selected.get().and_then(|path| data.id_at_path(&path));
+            data.moved(&expanded, selected, &source, &target, place).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "can't move {source:?} {} {target:?}: a path doesn't resolve, or the target is the node itself or inside it",
+                    place.as_str()
+                ))
+            })?
+        };
+        let data = Arc::new(data);
+        *self.data.lock().unwrap_or_else(|p| p.into_inner()) = data.clone();
+        self.selected.set(selected.map(|id| data.path_of(id)));
+        if self.id.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            *self.expanded.lock().unwrap_or_else(|p| p.into_inner()) = expanded;
+            return Ok(());
+        }
+        // The expand set is shared with the shown tree; swap it with the data in one step on the
+        // render thread so no frame pairs new ids with old expand state.
+        mutate(&self.id, &self.sender, move |kind| {
+            if let WidgetKind::TreeView { data: current, expanded: shown, selected: shown_selected, .. } = kind {
+                *current = data;
+                *shown.lock().unwrap_or_else(|p| p.into_inner()) = expanded;
+                *shown_selected = selected;
+            }
+        })
+    }
+
     /// Selected node path as a list of child indices, or `None`.
     #[getter]
     fn selected(&self) -> Option<Vec<usize>> {
@@ -3693,6 +3742,23 @@ impl Image {
             out
         };
         self.frames.submit(CpuFrame { width, height, format: PixelFormat::Rgba8, data: rgba });
+        if let Some(dispatch) = self.dispatch.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            dispatch.waker.wake();
+        }
+        Ok(())
+    }
+
+    /// Load a PNG or JPEG file (chosen by its contents, not its extension) and show it. Decodes
+    /// on the calling thread without holding the GIL. Raises `OSError` if the file can't be
+    /// read and `ValueError` if it isn't a supported image.
+    fn load(&self, py: Python<'_>, path: std::path::PathBuf) -> PyResult<()> {
+        let frame = py.detach(|| crate::image_file::decode(&path)).map_err(|err| match err {
+            crate::image_file::DecodeError::Io(err) => PyErr::from(err),
+            crate::image_file::DecodeError::Format(message) => {
+                PyValueError::new_err(format!("{}: {message}", path.display()))
+            }
+        })?;
+        self.frames.submit(frame);
         if let Some(dispatch) = self.dispatch.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
             dispatch.waker.wake();
         }

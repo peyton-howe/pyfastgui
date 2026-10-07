@@ -687,7 +687,7 @@ impl<B: SurfaceBackend> App<B> {
     /// Drive button/menu hover fills; redraw when the hovered widget changes.
     fn update_hovered_widget(&mut self) {
         let hit = self.widget_tree.hit_test(self.cursor.0, self.cursor.1);
-        if self.widget_tree.set_hovered(hit) {
+        if self.widget_tree.set_hovered_at(hit, self.cursor.0, self.cursor.1) {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
@@ -782,7 +782,7 @@ impl<B: SurfaceBackend> App<B> {
             floater.hover_since = Instant::now();
             floater.hover_action_done = None;
         }
-        if floater.widget_tree.set_hovered(hit) {
+        if floater.widget_tree.set_hovered_at(hit, floater.cursor.0, floater.cursor.1) {
             floater.window.request_redraw();
         }
     }
@@ -2353,6 +2353,8 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                     emit_pointer(&cb, 0, dx, dy, self.cursor, rect);
                     self.render_now(event_loop);
                 } else if self.widget_tree.scroll_at(self.cursor.0, self.cursor.1, dx, dy) {
+                    // A different row is under the (unmoved) cursor now.
+                    self.update_hovered_widget();
                     self.render_now(event_loop);
                 }
             }

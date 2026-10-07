@@ -180,9 +180,12 @@ All under [`python/examples/`](python/examples/), runnable directly once install
   [`python/fastgui/__init__.py`](python/fastgui/__init__.py) for the remaining gaps).
 - **States and drag-and-drop**: every control and `Box` takes `enabled=` / `set_enabled()`
   (a disabled `Box` disables everything in it: dimmed, no clicks, focus, drags or shortcuts).
-  Hovered controls get the theme's `hover` state layer. `ListView`, `TreeView` and `Box` take
+  Hovered controls, and the row under the cursor in lists, tables, trees and combo-box
+  drop-downs, get the theme's `hover` state layer. `ListView`, `TreeView` and `Box` take
   `set_drag_source(tag, data)` / `set_drop_target(accept, on_drop)` (payload: a string tag plus
   bytes); `Viewport` and `Image` take `set_file_drop(on_drop)` for files dropped from the OS.
+  `Image.load(path)` shows a PNG or JPEG; `TreeView.move_node(source, target, place)` moves a
+  node keeping every node's expand state.
 - **Window**: `Window(title, width, height)` — `set_content(widget)`, `set_clear_color(...)`,
   `add_floating_panel(panel, x, y, width, height)`, `.run()` (blocks, owns the render loop).
 

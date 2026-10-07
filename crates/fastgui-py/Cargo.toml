@@ -13,8 +13,10 @@ crate-type = ["cdylib"]
 fastgui-app = { path = "../fastgui-app" }
 fastgui-core = { path = "../fastgui-core" }
 fastgui-interop-cuda = { path = "../fastgui-interop-cuda" }
+png = "0.17"
 pyo3 = { version = "0.29", features = ["extension-module"] }
 rfd = "0.15"
+zune-jpeg = "0.5.15"
 
 [features]
 # Stable-ABI build for GIL CPython (one `cp311-abi3` wheel covers 3.11+). Off by default so the

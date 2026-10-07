@@ -1507,6 +1507,11 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
   on the 13 interactive controls and `Box`; `MenuItem(enabled=False)` is now a disabled
   button. Hover couldn't be checked live here (this session's synthetic cursor moves don't
   reach the window); chrome tests cover it.
+  Follow-ups from the first hands-on test (2026-10-07): rows of `ListView` / `Table` /
+  `TreeView` (so combo-box drop-downs) get the hover layer too, via `WidgetTree::set_hovered_at`
+  (tracks the row; rebuilds only when it changes). `Image.load(path)` decodes PNG (`png`) and
+  JPEG (`zune-jpeg`) off the GIL. `TreeView.move_node` (core `TreeData::moved`) moves a node
+  keeping per-node expand state and selection; the demo used `set_nodes`, which collapses all.
 
 ### Suggested order
 

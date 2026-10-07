@@ -407,6 +407,95 @@ impl TreeData {
     }
 
     /// Resolve a child-index path to a node id.
+    /// This tree with the node at `source` (and its subtree) moved before, inside (as the last
+    /// child), or after the node at `target`, plus `expanded` and `selected` carried over to the
+    /// new ids: every node keeps its own expand / selection state, and an `Inside` target is
+    /// expanded so the moved node shows. `None` when either path doesn't resolve or `target` is
+    /// `source` or inside it.
+    pub fn moved(
+        &self,
+        expanded: &HashSet<u32>,
+        selected: Option<u32>,
+        source: &[u32],
+        target: &[u32],
+        place: TreePlace,
+    ) -> Option<(TreeData, HashSet<u32>, Option<u32>)> {
+        struct Item {
+            label: String,
+            expanded: bool,
+            selected: bool,
+            target: bool,
+            children: Vec<Item>,
+        }
+        fn nest(data: &TreeData, id: u32, expanded: &HashSet<u32>, selected: Option<u32>, target: u32) -> Item {
+            let node = &data.nodes[id as usize];
+            Item {
+                label: node.label.clone(),
+                expanded: expanded.contains(&id),
+                selected: selected == Some(id),
+                target: id == target,
+                children: node.children.iter().map(|&c| nest(data, c, expanded, selected, target)).collect(),
+            }
+        }
+        /// The list holding the item at `path`, and its index there.
+        fn slot<'a>(items: &'a mut Vec<Item>, path: &[usize]) -> (&'a mut Vec<Item>, usize) {
+            let (&last, parents) = path.split_last().expect("non-empty path");
+            let mut list = items;
+            for &i in parents {
+                list = &mut list[i].children;
+            }
+            (list, last)
+        }
+        fn find_target(items: &[Item], prefix: &mut Vec<usize>) -> bool {
+            for (i, item) in items.iter().enumerate() {
+                prefix.push(i);
+                if item.target || find_target(&item.children, prefix) {
+                    return true;
+                }
+                prefix.pop();
+            }
+            false
+        }
+        fn flatten(items: &[Item]) -> Vec<TreeNodeData> {
+            items.iter().map(|item| TreeNodeData { label: item.label.clone(), children: flatten(&item.children) }).collect()
+        }
+        /// Preorder flags, matching `from_nested`'s id order.
+        fn preorder(items: &[Item], flags: &mut Vec<(bool, bool)>) {
+            for item in items {
+                flags.push((item.expanded, item.selected));
+                preorder(&item.children, flags);
+            }
+        }
+
+        self.id_at_path(source)?;
+        let target_id = self.id_at_path(target)?;
+        if target.starts_with(source) {
+            return None;
+        }
+        let mut items: Vec<Item> = self.roots.iter().map(|&r| nest(self, r, expanded, selected, target_id)).collect();
+        let source: Vec<usize> = source.iter().map(|&i| i as usize).collect();
+        let (list, index) = slot(&mut items, &source);
+        let moving = list.remove(index);
+        let mut at = Vec::new();
+        find_target(&items, &mut at);
+        let (list, index) = slot(&mut items, &at);
+        match place {
+            TreePlace::Before => list.insert(index, moving),
+            TreePlace::After => list.insert(index + 1, moving),
+            TreePlace::Inside => {
+                list[index].expanded = true;
+                list[index].children.push(moving);
+            }
+        }
+
+        let roots = flatten(&items);
+        let mut flags = Vec::new();
+        preorder(&items, &mut flags);
+        let expanded = flags.iter().enumerate().filter(|(_, f)| f.0).map(|(i, _)| i as u32).collect();
+        let selected = flags.iter().position(|f| f.1).map(|i| i as u32);
+        Some((TreeData::from_nested(&roots), expanded, selected))
+    }
+
     pub fn id_at_path(&self, path: &[u32]) -> Option<u32> {
         let (&first, rest) = path.split_first()?;
         let mut id = *self.roots.get(first as usize)?;
@@ -1054,6 +1143,9 @@ pub struct WidgetTree {
     accelerators: Vec<(Option<WidgetId>, Accel, ClickCallback)>,
     /// Widget under the cursor (for hover fills). Cleared on `reset`.
     hovered: Option<WidgetId>,
+    /// Row of `hovered` under the cursor when it's a `ListView` / `Table` / `TreeView` (a
+    /// `TreeView` row is its index among the visible rows).
+    hovered_row: Option<usize>,
     /// Widgets set disabled (`set_disabled`); their whole subtree is disabled with them.
     disabled: HashSet<WidgetId>,
     /// Drag-and-drop side tables (`set_drag_source`, `set_drop_target`, `set_file_drop`).
@@ -1092,6 +1184,7 @@ impl WidgetTree {
             hover_actions: HashMap::new(),
             accelerators: Vec::new(),
             hovered: None,
+            hovered_row: None,
             disabled: HashSet::new(),
             drag_sources: HashMap::new(),
             drop_targets: HashMap::new(),
@@ -1139,6 +1232,7 @@ impl WidgetTree {
         self.hover_actions.clear();
         self.accelerators.clear();
         self.hovered = None;
+        self.hovered_row = None;
         self.disabled.clear();
         self.drag_sources.clear();
         self.drop_targets.clear();
@@ -1976,14 +2070,49 @@ impl WidgetTree {
         self.hovered
     }
 
-    /// Update the hovered widget. Returns whether it changed (caller should redraw).
+    /// Update the hovered widget (keyboard menu navigation: no row). Returns whether it changed
+    /// (caller should redraw).
     pub fn set_hovered(&mut self, id: Option<WidgetId>) -> bool {
-        if self.hovered == id {
+        if self.hovered == id && self.hovered_row.is_none() {
             return false;
         }
         self.hovered = id;
+        self.hovered_row = None;
         self.mark_dirty();
         true
+    }
+
+    /// The cursor is at `(x, y)` over widget `id`: hover it, and the row under the cursor when
+    /// it's a list, table or tree. Returns whether either changed — moving within one row
+    /// doesn't rebuild chrome.
+    pub fn set_hovered_at(&mut self, id: Option<WidgetId>, x: f32, y: f32) -> bool {
+        let row = id.and_then(|id| self.row_at(id, x, y));
+        if self.hovered == id && self.hovered_row == row {
+            return false;
+        }
+        self.hovered = id;
+        self.hovered_row = row;
+        self.mark_dirty();
+        true
+    }
+
+    /// The hovered row of `id`, if `id` is the hovered list / table / tree.
+    pub fn hovered_row(&self, id: WidgetId) -> Option<usize> {
+        self.hovered_row.filter(|_| self.hovered == Some(id))
+    }
+
+    /// The row of list / table / tree `id` at `(x, y)`; `None` for other widgets.
+    fn row_at(&self, id: WidgetId, _x: f32, y: f32) -> Option<usize> {
+        match self.kind(id)? {
+            WidgetKind::ListView { .. } => self.list_row_at(id, y),
+            WidgetKind::Table { .. } => self.table_row_at(id, y),
+            WidgetKind::TreeView { row_height, scroll, .. } if *row_height > 0.0 => {
+                let rect = self.absolute_rect(id)?;
+                let row = ((y - rect.y + scroll) / row_height).floor();
+                (row >= 0.0 && (row as usize) < self.tree_visible_ids(id).len()).then_some(row as usize)
+            }
+            _ => None,
+        }
     }
 
     /// Set or clear the right-click handler for `id` (window coordinates).
@@ -4321,5 +4450,52 @@ mod tests {
         assert_eq!((x, y), (local.x + 5.0 - origin.x, local.y + 5.0 - origin.y));
         tree.reset();
         assert!(tree.file_drop_at(5.0, 5.0).is_none(), "reset clears the handlers");
+    }
+
+    #[test]
+    fn row_hover_follows_the_cursor_without_rebuilding_within_a_row() {
+        let (mut tree, list, _, _) = list_tree(3);
+        assert!(tree.set_hovered_at(Some(list), 10.0, 25.0));
+        assert_eq!(tree.hovered_row(list), Some(1));
+        tree.clear_dirty();
+        assert!(!tree.set_hovered_at(Some(list), 40.0, 35.0), "same row: nothing to redraw");
+        assert!(!tree.is_dirty());
+        assert!(tree.set_hovered_at(Some(list), 10.0, 45.0));
+        assert_eq!(tree.hovered_row(list), Some(2));
+        assert!(tree.set_hovered_at(Some(list), 10.0, 75.0), "below the last row");
+        assert_eq!(tree.hovered_row(list), None);
+        tree.set_hovered_at(Some(list), 10.0, 5.0);
+        tree.set_hovered(Some(list));
+        assert_eq!(tree.hovered_row(list), None, "keyboard hover carries no row");
+    }
+
+    #[test]
+    fn moving_a_tree_node_keeps_expand_and_selection_state() {
+        let data = sample_tree_data(); // Sensors[Camera, IMU[accel, gyro]], Logs
+        let expanded: HashSet<u32> = [0, 2].into(); // Sensors and IMU open
+        let gyro = data.id_at_path(&[0, 1, 1]);
+        // Move IMU (open, with gyro selected inside) into Logs.
+        let (moved, expanded, selected) = data.moved(&expanded, gyro, &[0, 1], &[1], TreePlace::Inside).unwrap();
+        let label = |path: &[u32]| moved.nodes[moved.id_at_path(path).unwrap() as usize].label.clone();
+        assert_eq!(label(&[0]), "Sensors");
+        assert_eq!(label(&[0, 0]), "Camera");
+        assert_eq!(label(&[1]), "Logs");
+        assert_eq!(label(&[1, 0]), "IMU");
+        assert_eq!(label(&[1, 0, 1]), "gyro");
+        let id = |path: &[u32]| moved.id_at_path(path).unwrap();
+        assert!(expanded.contains(&id(&[0])), "Sensors stays open");
+        assert!(expanded.contains(&id(&[1, 0])), "IMU stays open where it landed");
+        assert!(expanded.contains(&id(&[1])), "Logs opens to show the dropped node");
+        assert_eq!(selected, Some(id(&[1, 0, 1])), "gyro stays selected");
+
+        // Before / after reorder siblings; a node can't go into its own subtree.
+        let none = HashSet::new();
+        let (before, _, _) = data.moved(&none, None, &[1], &[0], TreePlace::Before).unwrap();
+        assert_eq!(before.nodes[before.roots[0] as usize].label, "Logs");
+        let (after, _, _) = data.moved(&none, None, &[0, 0], &[0, 1], TreePlace::After).unwrap();
+        assert_eq!(after.nodes[after.id_at_path(&[0, 1]).unwrap() as usize].label, "Camera");
+        assert!(data.moved(&none, None, &[0], &[0, 1], TreePlace::Inside).is_none());
+        assert!(data.moved(&none, None, &[0], &[0], TreePlace::After).is_none());
+        assert!(data.moved(&none, None, &[9], &[0], TreePlace::After).is_none());
     }
 }

@@ -93,5 +93,87 @@ class DragAndDropTests(unittest.TestCase):
         self.assertFalse(items.enabled)
 
 
+def write_png(path, width, height, rgb):
+    """A tiny RGB PNG with the standard library only."""
+    import struct
+    import zlib
+
+    def chunk(kind, data):
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    rows = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)))
+        f.write(chunk(b"IDAT", zlib.compress(rows)))
+        f.write(chunk(b"IEND", b""))
+
+
+class ImageLoadTests(unittest.TestCase):
+    def test_png_loads_and_bad_files_raise(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            png = os.path.join(tmp, "red.png")
+            write_png(png, 4, 3, (255, 0, 0))
+            image = fg.Image()
+            image.load(png)
+            image.load(pathlib_path(png))
+            not_image = os.path.join(tmp, "notes.txt")
+            with open(not_image, "w") as f:
+                f.write("hello")
+            with self.assertRaises(ValueError):
+                image.load(not_image)
+            with self.assertRaises(OSError):
+                image.load(os.path.join(tmp, "missing.png"))
+
+    def test_jpeg_loads(self):
+        import os
+
+        sample = r"C:\Windows\Web\Wallpaper\Windows\img0.jpg"
+        if not os.path.exists(sample):
+            self.skipTest("no sample JPEG on this machine")
+        fg.Image().load(sample)
+
+
+def pathlib_path(path):
+    import pathlib
+
+    return pathlib.Path(path)
+
+
+class TreeMoveTests(unittest.TestCase):
+    def tree(self):
+        return fg.TreeView([
+            fg.TreeNode("Sensors", [fg.TreeNode("Camera"), fg.TreeNode("IMU", [fg.TreeNode("gyro")])]),
+            fg.TreeNode("Logs"),
+        ])
+
+    def test_move_keeps_selection_on_its_node(self):
+        tree = self.tree()
+        tree.select([0, 1, 0])  # gyro
+        tree.move_node([0, 1], [1], "inside")  # IMU into Logs
+        self.assertEqual(tree.label([1, 0]), "IMU")
+        self.assertEqual(tree.label([1, 0, 0]), "gyro")
+        self.assertEqual(tree.selected, [1, 0, 0], "selection followed gyro")
+        tree.move_node([1], [0], "before")
+        self.assertEqual(tree.label([0]), "Logs")
+        tree.move_node([1, 0], [0], "after")  # Camera after Logs, at the root
+        self.assertEqual(tree.label([1]), "Camera")
+
+    def test_bad_moves_raise(self):
+        tree = self.tree()
+        with self.assertRaises(ValueError):
+            tree.move_node([0], [0, 1], "inside")  # into its own subtree
+        with self.assertRaises(ValueError):
+            tree.move_node([0], [0], "after")
+        with self.assertRaises(ValueError):
+            tree.move_node([5], [0], "after")
+        with self.assertRaises(ValueError):
+            tree.move_node([1], [0], "below")
+
+
 if __name__ == "__main__":
     unittest.main()

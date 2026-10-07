@@ -1186,3 +1186,80 @@ fn hover_and_disabled_match_between_gpu_and_cpu() {
     tree.set_disabled(container, true);
     check_gpu_matches_cpu(&mut gpu, &mut cpu, &mut atlas, &mut tree, (240, 80), None, 1.0);
 }
+
+#[test]
+fn hovered_menu_row_in_a_popup_gets_the_state_layer() {
+    use fastgui_core::widget::PopupAnchor;
+    let theme = fastgui_core::theme::chrome_theme();
+    let mut tree = WidgetTree::new();
+    let mut row = None;
+    tree.open_popup(
+        WidgetKind::Popup {
+            anchor: PopupAnchor::Center,
+            modal: false,
+            background: Color([0.16, 0.17, 0.20, 1.0]),
+            border: Color([0.3, 0.3, 0.4, 1.0]),
+            on_dismiss: None,
+            restore_focus: None,
+            click_through: false,
+            closes_on_anchor_click: true,
+            open: None,
+        },
+        |tree, popup| {
+            let button = tree.new_node(
+                Style { size: Size { width: Dimension::length(120.0), height: Dimension::length(24.0) }, ..Default::default() },
+                WidgetKind::Button {
+                    text: "Open".into(),
+                    font_size: 14.0,
+                    text_color: Color([1.0; 4]),
+                    background: Color::TRANSPARENT,
+                    flat: true,
+                    on_click: Some(std::sync::Arc::new(|| {})),
+                },
+            );
+            tree.add_child(popup, button);
+            row = Some(button);
+        },
+    );
+    tree.compute_layout(240.0, 130.0);
+    let row = row.unwrap();
+    let r = tree.absolute_rect(row).unwrap();
+    assert_eq!(tree.hit_test(r.x + 5.0, r.y + 5.0), Some(row), "the cursor finds the row itself");
+    tree.set_hovered(Some(row));
+    let mut chrome = ChromeRenderer::new();
+    chrome.build_quads(&tree, 240, 130, None, 1.0).expect("frame");
+    assert_eq!(quads_colored(&chrome, theme.hover).len(), 1);
+}
+
+#[test]
+fn hovered_list_rows_get_the_state_layer() {
+    let theme = fastgui_core::theme::chrome_theme();
+    let mut tree = WidgetTree::new();
+    let root = tree.root();
+    let list = tree.new_node(
+        Style { size: Size { width: Dimension::length(150.0), height: Dimension::length(100.0) }, ..Default::default() },
+        WidgetKind::ListView {
+            items: (0..4).map(|i| format!("item {i}")).collect(),
+            row_height: 20.0,
+            font_size: 14.0,
+            scroll: 0.0,
+            selected: None,
+            text_color: Color([1.0; 4]),
+            background: Color([0.16, 0.17, 0.2, 1.0]),
+            selection_color: Color([0.2, 0.4, 0.8, 0.6]),
+            on_select: None,
+            on_activate: None,
+            mirror: None,
+        },
+    );
+    tree.add_child(root, list);
+    tree.compute_layout(200.0, 120.0);
+    let mut chrome = ChromeRenderer::new();
+    chrome.build_quads(&tree, 200, 120, None, 1.0).expect("first frame");
+    assert!(quads_colored(&chrome, theme.hover).is_empty());
+    tree.set_hovered_at(Some(list), 20.0, 45.0);
+    chrome.build_quads(&tree, 200, 120, None, 1.0).expect("row hover rebuilds");
+    let hover = quads_colored(&chrome, theme.hover);
+    assert_eq!(hover.len(), 1, "one row tinted");
+    assert_eq!(chrome.gpu.quads[hover[0]].rect[1], 40.0, "row 2's top edge");
+}

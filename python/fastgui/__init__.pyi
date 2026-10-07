@@ -1,3 +1,4 @@
+import os
 from typing import Any, Callable, Literal, Sequence, Union
 
 RGBA = tuple[float, float, float, float]
@@ -399,6 +400,11 @@ class TreeView:
     def set_expanded(self, path: Sequence[int], expanded: bool) -> None: ...
     def label(self, path: Sequence[int]) -> str: ...
     def set_label(self, path: Sequence[int], label: str) -> None: ...
+    def move_node(self, source: Sequence[int], target: Sequence[int], place: str = "inside") -> None:
+        """Move the node at `source` "before", "inside" or "after" the node at `target`, keeping
+        every node's expand state and the selection (unlike `set_nodes`). `ValueError` if a path
+        doesn't resolve or `target` is `source` or inside it."""
+        ...
     @property
     def selected(self) -> list[int] | None: ...
 
@@ -756,6 +762,10 @@ class Image:
         ...
     def set_image(self, data: Any) -> None:
         """Submit a (H, W, 3|4) uint8 array."""
+        ...
+    def load(self, path: str | os.PathLike[str]) -> None:
+        """Show a PNG or JPEG file (chosen by content, not extension). Raises `OSError` if it
+        can't be read, `ValueError` if it isn't a supported image."""
         ...
 
 class Grid:

@@ -276,6 +276,9 @@ impl ChromeRenderer {
                         if *selected == Some(index) {
                             push_fill(&mut ops, row_px, *selection_color);
                         }
+                        if row_hovered(tree, id, index) {
+                            push_fill(&mut ops, row_px, theme.hover);
+                        }
                         let line = font_size * LINE_HEIGHT_RATIO;
                         let text = WidgetRect {
                             x: row.x + LIST_TEXT_INSET,
@@ -361,6 +364,9 @@ impl ChromeRenderer {
                         if *selected == Some(index) {
                             push_fill(&mut body_ops, scale_rect(row, scale), *selection_color);
                         }
+                        if row_hovered(tree, id, index) {
+                            push_fill(&mut body_ops, scale_rect(row, scale), theme.hover);
+                        }
                         let mut cx = logical_rect.x - scroll_x;
                         for (col, width) in widths.iter().enumerate() {
                             let text = WidgetRect {
@@ -442,6 +448,9 @@ impl ChromeRenderer {
                         };
                         if *selected == Some(node_id) {
                             push_fill(&mut ops, scale_rect(row, scale), *selection_color);
+                        }
+                        if row_hovered(tree, id, flat) {
+                            push_fill(&mut ops, scale_rect(row, scale), theme.hover);
                         }
                         let gutter_x = row.x + node.depth as f32 * fastgui_core::widget::TREE_INDENT;
                         let gutter = WidgetRect {
@@ -1403,6 +1412,12 @@ impl Clip {
 /// Restrict `ops` to `clip`: fills are cut to it exactly, ops entirely outside are dropped,
 /// and circles/text that straddle it carry it along (see `Op::Circle` / `Op::Text`). Clipping
 /// already-clipped ops again (a list inside a scroll area) keeps the overlap of both clips.
+/// Row `index` of list / table / tree `id` is under the cursor (and `id` takes input): it gets
+/// the same hover state layer whole controls do.
+fn row_hovered(tree: &WidgetTree, id: WidgetId, index: usize) -> bool {
+    tree.hovered_row(id) == Some(index) && !tree.is_disabled(id)
+}
+
 /// Whether `id` is `root` or inside its subtree.
 fn is_within(tree: &WidgetTree, id: WidgetId, root: WidgetId) -> bool {
     let mut node = Some(id);

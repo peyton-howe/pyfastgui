@@ -3,8 +3,8 @@
 - Hover any button, checkbox or slider: the theme's `hover` state layer. The toggle at the top
   disables the whole control box (`Box.set_enabled`): dimmed, no clicks, no focus, no Tab.
 - Drag list rows to reorder them, or onto the drop zone.
-- Drag tree nodes before / onto / after other nodes to move them.
-- Drop files from Explorer / Finder onto the image.
+- Drag tree nodes before / onto / after other nodes to move them (open nodes stay open).
+- Drop a PNG or JPEG from Explorer / Finder onto the image to show it; other files are listed.
 - File > Save is a disabled menu item.
 """
 
@@ -20,21 +20,6 @@ TREE = [
 
 def to_nodes(items):
     return [fg.TreeNode(label, to_nodes(children)) for label, children in items]
-
-
-def take(items, path):
-    """Remove and return the node at `path` from the nested `[label, children]` lists."""
-    *parents, last = path
-    for index in parents:
-        items = items[index][1]
-    return items.pop(last)
-
-
-def siblings_and_index(items, path):
-    *parents, last = path
-    for index in parents:
-        items = items[index][1]
-    return items, last
 
 
 def main() -> None:
@@ -93,27 +78,19 @@ def main() -> None:
     zone.set_drop_target("fruit", lambda tag, data, x, y: zone_label.set_text(f"Dropped {data.decode()}"))
 
     # --- tree reparent -----------------------------------------------------------------------
-    tree_items = [list(node) for node in TREE]
-    tree = fg.TreeView(to_nodes(tree_items), height=200, flex_grow=0)
+    tree = fg.TreeView(to_nodes(TREE), height=200, flex_grow=0)
     tree.set_drag_source("node")  # default payload: the node's path, "0/1"
 
     def move(tag: str, data: bytes, path: list[int], place: str) -> None:
         source = [int(part) for part in data.decode().split("/")]
-        if path[: len(source)] == source:
-            status.set_text("Can't move a node into itself")
+        label, target_label = tree.label(source), tree.label(path)
+        try:
+            # Keeps every node's expand state, unlike rebuilding with set_nodes.
+            tree.move_node(source, path, place)
+        except ValueError:
+            status.set_text(f"Can't move {label} into itself")
             return
-        node = take(tree_items, source)
-        # Removing the source shifts later siblings (and their subtrees) up by one.
-        if len(source) <= len(path) and path[: len(source) - 1] == source[:-1] and path[len(source) - 1] > source[-1]:
-            path = path[: len(source) - 1] + [path[len(source) - 1] - 1] + path[len(source):]
-        if place == "inside":
-            siblings, index = siblings_and_index(tree_items, path)
-            siblings[index][1].append(node)
-        else:
-            siblings, index = siblings_and_index(tree_items, path)
-            siblings.insert(index + (1 if place == "after" else 0), node)
-        tree.set_nodes(to_nodes(tree_items))
-        status.set_text(f"Moved {node[0]} {place} {'/'.join(map(str, path))}")
+        status.set_text(f"Moved {label} {place} {target_label}")
 
     tree.set_drop_target("node", move)
 
@@ -123,7 +100,14 @@ def main() -> None:
 
     def on_files(paths: list[str], x: float, y: float) -> None:
         names = ", ".join(p.replace("\\", "/").rsplit("/", 1)[-1] for p in paths)
-        files_label.set_text(f"{len(paths)} file(s) at ({x:.0f}, {y:.0f}): {names}")
+        for path in paths:
+            try:
+                image.load(path)  # PNG or JPEG, by content
+            except (OSError, ValueError):
+                continue
+            files_label.set_text(f"Showing {path.replace(chr(92), '/').rsplit('/', 1)[-1]}")
+            return
+        files_label.set_text(f"{len(paths)} file(s) at ({x:.0f}, {y:.0f}), no PNG/JPEG: {names}")
 
     image.set_file_drop(on_files)
     try:

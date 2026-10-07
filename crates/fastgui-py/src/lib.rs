@@ -2,6 +2,7 @@ mod backend;
 mod charts;
 mod cuda;
 mod dialogs;
+mod image_file;
 mod interaction;
 mod plots;
 mod tier4;
