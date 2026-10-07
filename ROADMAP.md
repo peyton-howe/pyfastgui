@@ -160,6 +160,32 @@ validation errors on real hardware.** The CUDA-side import (`cuImportExternalMem
 is the single highest-risk unverified area of the whole project.** If anyone picks up work
 near CUDA interop, prioritize getting time on real NVIDIA hardware before relying on it.
 
+**M3 redesign (2026-10-01, branch `cuda-submit`).** Decision: fastgui owns the interop (users
+can't do it without the render thread's device, and only the render thread knows when Vulkan is
+done reading), but users hand it CUDA arrays instead of writing into a raw pointer:
+- `Viewport.submit_cuda(array, stream=None)`: any `__cuda_array_interface__` object, (H, W, 4)
+  uint8 with contiguous pixels. GPU-to-GPU copy on Windows/Vulkan/NVIDIA; **host-copy fallback**
+  everywhere else (macOS, Linux, non-NVIDIA window GPU, floating panel, before `run()`).
+  `Viewport.cuda_status` reports the path. Host arrays go to `submit_frame`.
+- `create_cuda_surface` → `CudaSurface.frame(stream)` context manager exposing
+  `__cuda_array_interface__` (zero CUDA-side copy). `device_ptr`/`pitch`/`signal_ready` are gone.
+- Protocol: 3 slots in one exported linear buffer, `ready` (CUDA→VK) and `release` (VK→CUDA)
+  timeline semaphores, a CPU slot table (`fastgui-app::cuda_handles`), and fastgui's own CUDA
+  stream ordered against the caller's with events both ways; publish from `cuLaunchHostFunc`.
+  The render thread copies the slot into an optimal-tiled image (so no linear-image sampling).
+- Old bugs fixed on the way: signal on fastgui's private stream (not ordered after the caller's
+  kernel), single buffer with no Vulkan→CUDA "done reading" signal (tearing), CUDA device 0
+  assumed (now matched by Vulkan device UUID), `cuCtxSetCurrent` clobbering the caller's
+  context (now push/pop), missing `CUDA_EXTERNAL_MEMORY_DEDICATED`, leaked NT handles and
+  mapped buffers.
+- Verified here: slot-table unit tests; headless Vulkan test of the layer with Vulkan playing
+  CUDA (`cuda_test.rs`, zero validation errors on AMD); every CUDA struct offset asserted
+  against cuda-bindings 13.4.3 (measured through its compiled structs); Python validation and
+  fallback tests on 3.14 and 3.14t; live window fallback check. **Still never run on NVIDIA.**
+  First thing to try there: `python/examples/cuda_viewport.py` and `--surface`.
+- Follow-ups: Linux opaque-fd export; DLPack input (JAX-only users); float/grayscale input needs
+  a conversion kernel; viewports in floating panels only get the host copy.
+
 **M4 — Widget tree, layout, text rendering, input.** `fastgui_core::widget::WidgetTree` wraps
 `taffy::TaffyTree`; `WidgetKind` enum (`Container`/`Label`/`Button`/`Slider`); absolute-rect
 tracking + `hit_test()`. `fastgui-chrome::ChromeRenderer` rasterizes the *whole* tree into one
@@ -1173,6 +1199,29 @@ Concrete and fully achievable/verifiable on this machine (at least the Windows l
   (a root `.gitignore` already exists in the git tree — extend it if wheel/build artifacts
   grow).
 
+**Done (2026-10-01, M8 packaging, branch `m8-release`)** except the CI run and the publish:
+- **PyPI name:** `fastgui` is taken (an unrelated project by userElaina). The distribution is
+  **`pyfastgui`**; the import name stays `fastgui`. `pyfastgui` was free on 2026-10-01.
+- **abi3 floor is 3.11, not 3.10:** `PyBuffer` (`Viewport.submit_frame`, `Image`) is only in
+  the limited API from 3.11, and 3.10 reaches EOL this month. `fastgui-py` has an opt-in
+  `abi3` cargo feature (`pyo3/abi3-py311`). It's off by default so `maturin develop` and the
+  3.14t build stay version-specific; CI passes `--features abi3` for the GIL wheel only.
+- `pyproject.toml`: readme, PEP 639 license expression + `LICENSE-MIT` / `LICENSE-APACHE`,
+  classifiers, URLs, `examples`/`test` extras. `python/fastgui/py.typed` added.
+- `.github/workflows/wheels.yml`: {windows-x64, macos-arm64, manylinux_2_28 x86_64} ×
+  {abi3, cp314t}, plus an sdist, a smoke job (install from `dist/` with `--no-index`, import,
+  pytest on 3.11 / 3.14 / 3.14t per OS, run on a copy of the tests so `import fastgui` can't
+  hit the source tree), and trusted publishing on `v*` tags (`rc` → TestPyPI, else PyPI).
+  **Not yet run on GitHub.** It still needs the `testpypi`/`pypi` environments and trusted
+  publishers set up.
+- **Verified locally (Windows, Vulkan):** both wheels plus the sdist build. Fresh scratch venvs
+  installed from the wheels, run outside the repo, pass 76/76 tests on 3.14 and 3.14t (GIL
+  stays disabled on 3.14t). `widgets_demo` and `menus_demo` open, render correctly
+  (PrintWindow screenshots), and exit cleanly on WM_CLOSE with empty stderr, for both wheels.
+- **Remaining M8 gate:** green CI run; the plot demo from the wheel once 7E merges; one real-GPU
+  window from the wheel on macOS and Linux; TestPyPI `0.0.1rc1`; PyPI only after a three-OS
+  wheel install produces a window.
+
 ### 6C. Docs — done
 
 - `README.md` at the project root: what fastgui is and why (GPU-native, free-threaded-safe
@@ -1401,9 +1450,10 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
   use the same fit (node hits are mapped into the letterboxed frame).
   `set_data` is thread-safe and does not reset a zoomed view. Multi-series via `set_series`.
   Wheel zoom, drag pan, double-click reset. Colormaps: viridis / magma / gray.
-  CUDA ingest reads `__cuda_array_interface__` (`<f4`/`<f8`, C-contiguous) through
-  `cuMemcpyDtoH` on the existing unverified driver — unsupported dtype/strides error before
-  any copy; macOS raises `RuntimeError`. Same verification caveat as M3 (no NVIDIA GPU here).
+  CUDA ingest reads `__cuda_array_interface__` (`<f4`/`<f8`, C-contiguous) and copies it to
+  the host after the array's stream (`fastgui_interop_cuda::copy_to_host`, on the owning
+  device's context) — unsupported dtype/strides error before any copy; macOS raises
+  `RuntimeError`. Same verification caveat as M3 (no NVIDIA GPU here).
   Demo `plots_demo.py`. Histogram, bar, contour, height-field surface, and triangle mesh
   use the same raster (`PlotHistogram`, `PlotBar`, `PlotContour`, `PlotSurface`, `PlotMesh`).
   Contour is isolines on a heatmap grid (`filled=True` paints the bands). `PlotSurface` takes a
@@ -1413,8 +1463,7 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 - **Image/tensor viewer** — **Done:** `ImageViewer` resamples a numpy image or 2-D tensor
   (gray / viridis / magma), letterboxes inside the upload buffer, and reports the pixel under
   the cursor. Wheel / drag / double-click. `Viewport` and `Image` also take `fit="contain"`
-  so a raw layer can letterbox on the GPU (CUDA textures still stretch: the shared texture
-  does not store its size).
+  so a raw layer can letterbox on the GPU (CUDA layers too, since `cuda-submit`).
 - **Node graph editor** — **Done:** `NodeGraph` rasterizes titled nodes (5×7 bitmap) and
   straight edges; press/drag/release moves the node under the cursor. The frame is
   letterboxed, so a wide row does not stretch the nodes.
@@ -1434,9 +1483,35 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
   skipping this is where fastgui would fall short of it.
 - **HiDPI** scale factor applied to chrome.
 - **Drag-and-drop** between widgets and from the OS, generalizing the docking drag code.
+  — **Done (7F.2, 2026-10-05, branch `m7-7f-hover-dnd`):** payload is a string tag plus bytes
+  (`fastgui_core::dnd`). `WidgetTree` side tables for drag sources / drop targets / file-drop
+  handlers; `drop_target_at` resolves the target and its preview rect (list insertion gap, tree
+  before/inside/after, or the widget). `fastgui_app::dnd::WidgetDrag` runs the gesture and
+  shares the dock drag's threshold (`past_drag_threshold`, now used by the dock's two checks
+  too) and its preview path: chrome takes one resolved `drop_preview` rect, whichever drag
+  produced it. OS files (`DroppedFile`) are collected per event burst and routed by cursor
+  (`GetCursorPos` on Windows, since no cursor events arrive during an OLE drag). Python:
+  `set_drag_source` / `set_drop_target` on `ListView`, `TreeView`, `Box`; `set_file_drop` on
+  `Viewport`, `Image`. Escape cancels; grab / not-allowed cursor. Main window only (floaters
+  and cross-window drags not yet).
 - **Disabled and hover states** for every control — a shared follow-up after 7B. Touches
   every `WidgetKind`, input handling (skip presses / focus), and theming (`Theme` tokens for
   disabled/hover fills). Do not bolt onto individual 7B widgets one at a time.
+  — **Done (7F.1, same branch):** `Theme.hover` / `Theme.disabled` tokens (translucent).
+  Chrome draws one hover state layer over any hovered `is_hoverable()` widget (replacing the
+  button-only fill; menu rows included) and one veil per disabled subtree (after its children,
+  so nested widgets aren't dimmed twice). `WidgetTree::set_disabled` side table with ancestor
+  inheritance: presses, focus, Tab, accelerators, context menus, splitter and image-pointer
+  input skip disabled widgets; scrolling and hover actions still work (native menus close a
+  submenu when you hover a disabled row). Python: `enabled=` / `.enabled` / `set_enabled()`
+  on the 13 interactive controls and `Box`; `MenuItem(enabled=False)` is now a disabled
+  button. Hover couldn't be checked live here (this session's synthetic cursor moves don't
+  reach the window); chrome tests cover it.
+  Follow-ups from the first hands-on test (2026-10-07): rows of `ListView` / `Table` /
+  `TreeView` (so combo-box drop-downs) get the hover layer too, via `WidgetTree::set_hovered_at`
+  (tracks the row; rebuilds only when it changes). `Image.load(path)` decodes PNG (`png`) and
+  JPEG (`zune-jpeg`) off the GIL. `TreeView.move_node` (core `TreeData::moved`) moves a node
+  keeping per-node expand state and selection; the demo used `set_nodes`, which collapses all.
 
 ### Suggested order
 

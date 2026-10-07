@@ -10,6 +10,7 @@ mod command;
 mod constants;
 mod coords;
 mod cuda_handles;
+pub mod dnd;
 mod forms;
 mod ghost;
 mod keyboard;
@@ -21,7 +22,9 @@ pub use app::{run, RunError};
 pub use command::{Command, CommandDispatch, EventWaker, RenderThreadHandles};
 pub use constants::*;
 pub use coords::scale_rect;
-pub use cuda_handles::CudaExportHandles;
+pub use cuda_handles::{
+    AcquireError, AcquiredSlot, CudaExportHandles, CudaLayerShared, PublishedSlot, CUDA_SLOTS,
+};
 pub use ghost::build_tear_ghost_tree;
 pub use resize_edge::{classify_float_resize_edge, resize_edge_cursor, ResizeEdge};
 pub use surface::{MainResizePolicy, SurfaceBackend, ViewportDraw};

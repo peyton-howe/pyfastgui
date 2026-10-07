@@ -1,3 +1,4 @@
+import os
 from typing import Any, Callable, Literal, Sequence, Union
 
 RGBA = tuple[float, float, float, float]
@@ -6,30 +7,68 @@ FontSize = Union[float, Literal["small", "body", "large"]]
 # A gap/padding in layout units, or a theme spacing by name.
 Spacing = Union[float, Literal["small", "medium", "large"]]
 
-class CudaSurface:
-    """Unverified: see Viewport.create_cuda_surface."""
+# A CUDA stream: an int CUstream handle, torch.cuda.Stream, a cupy stream, or any object with
+# __cuda_stream__().
+CudaStream = Any
 
+class CudaFrame:
+    """One frame of a CudaSurface. Use as a context manager; inside the block it exposes
+    __cuda_array_interface__ ((height, width, 4) uint8, packed rows), so
+    torch.as_tensor(frame, device="cuda") or cupy.asarray(frame) wrap it without a copy. An
+    exception in the block drops the frame. Unverified on NVIDIA hardware."""
+
+    def __enter__(self) -> CudaFrame: ...
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool: ...
     @property
-    def device_ptr(self) -> int: ...
-    @property
-    def pitch(self) -> int: ...
+    def __cuda_array_interface__(self) -> dict[str, Any]: ...
+
+class CudaSurface:
+    """Zero-copy CUDA target behind a Viewport, from Viewport.create_cuda_surface. Unverified on
+    NVIDIA hardware."""
+
     @property
     def width(self) -> int: ...
     @property
     def height(self) -> int: ...
-    def signal_ready(self) -> None: ...
+    @property
+    def closed(self) -> bool:
+        """True once the window dropped the surface (closed, viewport removed, another
+        create_cuda_surface, or a submit_frame). frame() raises from then on."""
+        ...
+    def frame(self, stream: CudaStream | None = None) -> CudaFrame:
+        """A frame written on `stream` (default: the legacy default stream). Entering waits,
+        GPU-side on `stream`, for a free slot; leaving publishes what `stream` has written by
+        then."""
+        ...
 
 class Viewport:
     def __init__(self) -> None: ...
+    def set_file_drop(self, on_drop: Callable[[list[str], float, float], None] | None) -> None:
+        """Call `on_drop(paths, x, y)` when files are dropped on this widget from the OS. `None`
+        stops it."""
+        ...
     def submit_frame(self, data: Any) -> None:
         """Submit a (H, W, 3|4) uint8 frame. Copies into an owned buffer today; a packed-RGBA
         high-FPS path will want fewer copies later."""
         ...
+    def submit_cuda(self, array: Any, stream: CudaStream | None = None) -> None:
+        """Submit a CUDA array (anything with __cuda_array_interface__: torch, cupy, numba,
+        jax) shaped (H, W, 4) uint8 with contiguous pixels. Copied after the work queued on
+        `stream` (default: the array's own), and `stream` waits for the copy, so the array can
+        be reused right away. One GPU-to-GPU copy on Windows/Vulkan/NVIDIA; elsewhere (macOS,
+        Linux for now, a non-NVIDIA window GPU, before run()) a copy through host memory.
+        Host arrays go to submit_frame. Unverified on NVIDIA hardware."""
+        ...
+    @property
+    def cuda_status(self) -> str:
+        """How the last submit_cuda reached the screen: "interop", "host copy: <reason>", or
+        "unused"."""
+        ...
     def create_cuda_surface(self, width: int, height: int) -> CudaSurface:
-        """Unverified, Windows-only zero-copy CUDA surface. Call after set_viewport(), once
-        window.run() has started (from a callback or another thread). Raises RuntimeError
-        instead of blocking if run() hasn't started within ~2s, and on macOS/Linux
-        (not supported / not implemented yet)."""
+        """Zero-copy CUDA surface (Windows/Vulkan/NVIDIA). Call after set_viewport(), once
+        window.run() has started (from a callback or another thread); raises RuntimeError if
+        run() hasn't started within ~2s, or where interop isn't available (submit_cuda works
+        everywhere)."""
         ...
 
 class Label:
@@ -55,7 +94,17 @@ class Button:
         tooltip: str | None = None,
         context_menu: Any = None,
         on_hover: Callable[[], None] | None = None,
+        enabled: bool = True,
     ) -> None: ...
+    @property
+    def enabled(self) -> bool:
+        """Whether this widget takes input (see `set_enabled`)."""
+        ...
+    def set_enabled(self, enabled: bool) -> None:
+        """Disable (dimmed; ignores clicks, focus, drags and shortcuts, still scrolls) or
+        re-enable. On a `Box`, everything inside it too. Safe from any thread, before or after
+        the widget is shown."""
+        ...
     def set_text(self, text: str) -> None: ...
     def set_background(self, color: RGBA | None = None) -> None:
         """Update fill; `None` clears to transparent (menu-title open highlight)."""
@@ -71,7 +120,17 @@ class Slider:
         track_color: RGBA | None = None,
         thumb_color: RGBA | None = None,
         tooltip: str | None = None,
+        enabled: bool = True,
     ) -> None: ...
+    @property
+    def enabled(self) -> bool:
+        """Whether this widget takes input (see `set_enabled`)."""
+        ...
+    def set_enabled(self, enabled: bool) -> None:
+        """Disable (dimmed; ignores clicks, focus, drags and shortcuts, still scrolls) or
+        re-enable. On a `Box`, everything inside it too. Safe from any thread, before or after
+        the widget is shown."""
+        ...
     def set_value(self, value: float) -> None: ...
     @property
     def value(self) -> float: ...
@@ -92,7 +151,17 @@ class TextInput:
         placeholder_color: RGBA | None = None,
         background: RGBA | None = None,
         selection_color: RGBA | None = None,
+        enabled: bool = True,
     ) -> None: ...
+    @property
+    def enabled(self) -> bool:
+        """Whether this widget takes input (see `set_enabled`)."""
+        ...
+    def set_enabled(self, enabled: bool) -> None:
+        """Disable (dimmed; ignores clicks, focus, drags and shortcuts, still scrolls) or
+        re-enable. On a `Box`, everything inside it too. Safe from any thread, before or after
+        the widget is shown."""
+        ...
     @property
     def text(self) -> str:
         """The current text, including the user's latest edits. Safe from any thread."""
@@ -116,7 +185,17 @@ class TextArea:
         placeholder_color: RGBA | None = None,
         background: RGBA | None = None,
         selection_color: RGBA | None = None,
+        enabled: bool = True,
     ) -> None: ...
+    @property
+    def enabled(self) -> bool:
+        """Whether this widget takes input (see `set_enabled`)."""
+        ...
+    def set_enabled(self, enabled: bool) -> None:
+        """Disable (dimmed; ignores clicks, focus, drags and shortcuts, still scrolls) or
+        re-enable. On a `Box`, everything inside it too. Safe from any thread, before or after
+        the widget is shown."""
+        ...
     @property
     def text(self) -> str:
         """The current text, including the user's latest edits. Safe from any thread."""
@@ -163,6 +242,8 @@ class Theme:
     scrollbar: RGBA
     scrim: RGBA
     drop_indicator: RGBA
+    hover: RGBA
+    disabled: RGBA
     font_family: str | None
     font_size_small: float
     font_size: float
@@ -201,7 +282,25 @@ class ListView:
         text_color: RGBA | None = None,
         background: RGBA | None = None,
         selection_color: RGBA | None = None,
+        enabled: bool = True,
     ) -> None: ...
+    @property
+    def enabled(self) -> bool:
+        """Whether this widget takes input (see `set_enabled`)."""
+        ...
+    def set_enabled(self, enabled: bool) -> None:
+        """Disable (dimmed; ignores clicks, focus, drags and shortcuts, still scrolls) or
+        re-enable. On a `Box`, everything inside it too. Safe from any thread, before or after
+        the widget is shown."""
+        ...
+    def set_drag_source(self, tag: str | None, data: Callable[[int], bytes | str | None] | None = None) -> None:
+        """Drag this widget's content, tagged `tag`. `data(index)` builds the payload for the dragged row (default: the row index as text). Returning `None` cancels the
+        drag; `tag=None` stops dragging."""
+        ...
+    def set_drop_target(self, accept: str | Sequence[str] | None, on_drop: Callable[[str, bytes, int], None] | None) -> None:
+        """Accept drops whose tag is in `accept` (`None`: any). `on_drop(tag, data, index)`: `index` is the gap the drop lands in (insert before that row; `len` appends). `on_drop=None` stops
+        accepting drops."""
+        ...
     def set_items(self, items: Sequence[str]) -> None:
         """Replace the rows (clears the selection). Works before attaching."""
     def select(self, index: int | None) -> None:
@@ -209,6 +308,105 @@ class ListView:
     @property
     def selected(self) -> int | None: ...
     def __len__(self) -> int: ...
+
+class Table:
+    """A virtualized multi-column table: only rows in view are drawn, so it handles millions.
+    Sticky header; click or arrow keys select (`on_select(row)`), double-click or Enter
+    activates (`on_activate(row)`)."""
+    def __init__(
+        self,
+        columns: dict[str, Sequence[Any]] | Sequence[tuple[str, Sequence[Any]]],
+        on_select: Callable[[int], None] | None = None,
+        on_activate: Callable[[int], None] | None = None,
+        row_height: float = 24.0,
+        header_height: float = 28.0,
+        column_widths: Sequence[float] | None = None,
+        font_size: FontSize | None = None,
+        flex_grow: float = 1.0,
+        width: float | None = None,
+        height: float | None = None,
+        text_color: RGBA | None = None,
+        header_color: RGBA | None = None,
+        background: RGBA | None = None,
+        selection_color: RGBA | None = None,
+        grid_color: RGBA | None = None,
+        enabled: bool = True,
+    ) -> None: ...
+    @property
+    def enabled(self) -> bool:
+        """Whether this widget takes input (see `set_enabled`)."""
+        ...
+    def set_enabled(self, enabled: bool) -> None:
+        """Disable (dimmed; ignores clicks, focus, drags and shortcuts, still scrolls) or
+        re-enable. On a `Box`, everything inside it too. Safe from any thread, before or after
+        the widget is shown."""
+        ...
+    def set_columns(
+        self,
+        columns: dict[str, Sequence[Any]] | Sequence[tuple[str, Sequence[Any]]],
+        column_widths: Sequence[float] | None = None,
+    ) -> None:
+        """Replace the columns (clears the selection, scrolls to the origin)."""
+        ...
+    def select(self, index: int | None) -> None: ...
+    @property
+    def selected(self) -> int | None: ...
+    def __len__(self) -> int: ...
+
+class TreeNode:
+    """One node of a `TreeView`: a label plus optional nested children."""
+    def __init__(self, label: str, children: Sequence[TreeNode] | None = None) -> None: ...
+    @property
+    def label(self) -> str: ...
+
+class TreeView:
+    """A virtualized tree of `TreeNode`s: only expanded rows in view are drawn. Click the gutter
+    to expand/collapse; click a label to select (`on_select(path)`), double-click or Enter to
+    activate (`on_activate(path)`). Paths are lists of child indices from the roots."""
+    def __init__(
+        self,
+        nodes: Sequence[TreeNode],
+        on_select: Callable[[list[int]], None] | None = None,
+        on_activate: Callable[[list[int]], None] | None = None,
+        row_height: float = 24.0,
+        font_size: FontSize | None = None,
+        flex_grow: float = 1.0,
+        width: float | None = None,
+        height: float | None = None,
+        text_color: RGBA | None = None,
+        background: RGBA | None = None,
+        selection_color: RGBA | None = None,
+        enabled: bool = True,
+    ) -> None: ...
+    @property
+    def enabled(self) -> bool:
+        """Whether this widget takes input (see `set_enabled`)."""
+        ...
+    def set_enabled(self, enabled: bool) -> None:
+        """Disable (dimmed; ignores clicks, focus, drags and shortcuts, still scrolls) or
+        re-enable. On a `Box`, everything inside it too. Safe from any thread, before or after
+        the widget is shown."""
+        ...
+    def set_drag_source(self, tag: str | None, data: Callable[[list[int]], bytes | str | None] | None = None) -> None:
+        """Drag this widget's content, tagged `tag`. `data(path)` builds the payload for the dragged node (default: the path as `"0/2/1"`). Returning `None` cancels the
+        drag; `tag=None` stops dragging."""
+        ...
+    def set_drop_target(self, accept: str | Sequence[str] | None, on_drop: Callable[[str, bytes, list[int], str], None] | None) -> None:
+        """Accept drops whose tag is in `accept` (`None`: any). `on_drop(tag, data, path, place)`: `place` is `"before"`, `"inside"` or `"after"` the node at `path`. `on_drop=None` stops
+        accepting drops."""
+        ...
+    def set_nodes(self, nodes: Sequence[TreeNode]) -> None: ...
+    def select(self, path: Sequence[int] | None) -> None: ...
+    def set_expanded(self, path: Sequence[int], expanded: bool) -> None: ...
+    def label(self, path: Sequence[int]) -> str: ...
+    def set_label(self, path: Sequence[int], label: str) -> None: ...
+    def move_node(self, source: Sequence[int], target: Sequence[int], place: str = "inside") -> None:
+        """Move the node at `source` "before", "inside" or "after" the node at `target`, keeping
+        every node's expand state and the selection (unlike `set_nodes`). `ValueError` if a path
+        doesn't resolve or `target` is `source` or inside it."""
+        ...
+    @property
+    def selected(self) -> list[int] | None: ...
 
 class Popup:
     """An overlay shown on demand: a menu, dropdown list, tooltip or dialog. Not placed in the
@@ -249,7 +447,17 @@ class Checkbox:
         box_color: RGBA | None = None,
         check_color: RGBA | None = None,
         tooltip: str | None = None,
+        enabled: bool = True,
     ) -> None: ...
+    @property
+    def enabled(self) -> bool:
+        """Whether this widget takes input (see `set_enabled`)."""
+        ...
+    def set_enabled(self, enabled: bool) -> None:
+        """Disable (dimmed; ignores clicks, focus, drags and shortcuts, still scrolls) or
+        re-enable. On a `Box`, everything inside it too. Safe from any thread, before or after
+        the widget is shown."""
+        ...
     @property
     def checked(self) -> bool: ...
     def set_checked(self, checked: bool) -> None: ...
@@ -267,7 +475,17 @@ class Radio:
         text_color: RGBA | None = None,
         box_color: RGBA | None = None,
         dot_color: RGBA | None = None,
+        enabled: bool = True,
     ) -> None: ...
+    @property
+    def enabled(self) -> bool:
+        """Whether this widget takes input (see `set_enabled`)."""
+        ...
+    def set_enabled(self, enabled: bool) -> None:
+        """Disable (dimmed; ignores clicks, focus, drags and shortcuts, still scrolls) or
+        re-enable. On a `Box`, everything inside it too. Safe from any thread, before or after
+        the widget is shown."""
+        ...
     @property
     def group(self) -> int: ...
     @property
@@ -284,7 +502,17 @@ class Toggle:
         track_on: RGBA | None = None,
         thumb_color: RGBA | None = None,
         tooltip: str | None = None,
+        enabled: bool = True,
     ) -> None: ...
+    @property
+    def enabled(self) -> bool:
+        """Whether this widget takes input (see `set_enabled`)."""
+        ...
+    def set_enabled(self, enabled: bool) -> None:
+        """Disable (dimmed; ignores clicks, focus, drags and shortcuts, still scrolls) or
+        re-enable. On a `Box`, everything inside it too. Safe from any thread, before or after
+        the widget is shown."""
+        ...
     @property
     def checked(self) -> bool: ...
     def set_checked(self, checked: bool) -> None: ...
@@ -425,7 +653,17 @@ class SpinBox:
         text_color: RGBA | None = None,
         background: RGBA | None = None,
         button_color: RGBA | None = None,
+        enabled: bool = True,
     ) -> None: ...
+    @property
+    def enabled(self) -> bool:
+        """Whether this widget takes input (see `set_enabled`)."""
+        ...
+    def set_enabled(self, enabled: bool) -> None:
+        """Disable (dimmed; ignores clicks, focus, drags and shortcuts, still scrolls) or
+        re-enable. On a `Box`, everything inside it too. Safe from any thread, before or after
+        the widget is shown."""
+        ...
     @property
     def value(self) -> float: ...
     def set_value(self, value: float) -> None: ...
@@ -444,7 +682,17 @@ class NumericScrub:
         width: float | None = None,
         text_color: RGBA | None = None,
         background: RGBA | None = None,
+        enabled: bool = True,
     ) -> None: ...
+    @property
+    def enabled(self) -> bool:
+        """Whether this widget takes input (see `set_enabled`)."""
+        ...
+    def set_enabled(self, enabled: bool) -> None:
+        """Disable (dimmed; ignores clicks, focus, drags and shortcuts, still scrolls) or
+        re-enable. On a `Box`, everything inside it too. Safe from any thread, before or after
+        the widget is shown."""
+        ...
     @property
     def value(self) -> float: ...
     def set_value(self, value: float) -> None: ...
@@ -480,7 +728,17 @@ class ComboBox:
         placeholder_color: RGBA | None = None,
         background: RGBA | None = None,
         border: RGBA | None = None,
+        enabled: bool = True,
     ) -> None: ...
+    @property
+    def enabled(self) -> bool:
+        """Whether this widget takes input (see `set_enabled`)."""
+        ...
+    def set_enabled(self, enabled: bool) -> None:
+        """Disable (dimmed; ignores clicks, focus, drags and shortcuts, still scrolls) or
+        re-enable. On a `Box`, everything inside it too. Safe from any thread, before or after
+        the widget is shown."""
+        ...
     def set_items(self, items: Sequence[str]) -> None:
         """Replace the rows (clears the selection). Works before attaching."""
     def select(self, index: int | None) -> None:
@@ -498,8 +756,16 @@ class Image:
         fit: str = "stretch",
         on_pointer: Callable[[int, float, float, float, float, float, float], None] | None = None,
     ) -> None: ...
+    def set_file_drop(self, on_drop: Callable[[list[str], float, float], None] | None) -> None:
+        """Call `on_drop(paths, x, y)` when files are dropped on this widget from the OS. `None`
+        stops it."""
+        ...
     def set_image(self, data: Any) -> None:
         """Submit a (H, W, 3|4) uint8 array."""
+        ...
+    def load(self, path: str | os.PathLike[str]) -> None:
+        """Show a PNG or JPEG file (chosen by content, not extension). Raises `OSError` if it
+        can't be read, `ValueError` if it isn't a supported image."""
         ...
 
 class Grid:
@@ -564,7 +830,25 @@ class Box:
         visible: bool = True,
         context_menu: Any = None,
         accelerators: Sequence[tuple[str, Callable[[], None]]] | None = None,
+        enabled: bool = True,
     ) -> None: ...
+    @property
+    def enabled(self) -> bool:
+        """Whether this widget takes input (see `set_enabled`)."""
+        ...
+    def set_enabled(self, enabled: bool) -> None:
+        """Disable (dimmed; ignores clicks, focus, drags and shortcuts, still scrolls) or
+        re-enable. On a `Box`, everything inside it too. Safe from any thread, before or after
+        the widget is shown."""
+        ...
+    def set_drag_source(self, tag: str | None, data: Callable[[], bytes | str | None] | None = None) -> None:
+        """Drag this widget's content, tagged `tag`. `data()` builds the payload (default: empty). Returning `None` cancels the
+        drag; `tag=None` stops dragging."""
+        ...
+    def set_drop_target(self, accept: str | Sequence[str] | None, on_drop: Callable[[str, bytes, float, float], None] | None) -> None:
+        """Accept drops whose tag is in `accept` (`None`: any). `on_drop(tag, data, x, y)`: the point in this box's coordinates. `on_drop=None` stops
+        accepting drops."""
+        ...
     def set_display(self, visible: bool) -> None:
         """Show or hide this box (`Display::None` when hidden)."""
         ...

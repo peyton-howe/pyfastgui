@@ -1,6 +1,9 @@
 mod backend;
 mod charts;
+mod cuda;
 mod dialogs;
+mod image_file;
+mod interaction;
 mod plots;
 mod tier4;
 mod theme;
@@ -8,17 +11,11 @@ mod widgets;
 
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
-#[cfg(not(target_os = "macos"))]
-use std::sync::Arc;
 
 use std::sync::atomic::AtomicU64;
 
 use backend::{Command, CommandDispatch, EventWaker, RenderThreadHandles};
 use fastgui_core::{command_channel, CommandReceiver, CpuFrame, FrameSlot, PixelFormat, Readback};
-#[cfg(not(target_os = "macos"))]
-use fastgui_core::oneshot_channel;
-#[cfg(not(target_os = "macos"))]
-use fastgui_interop_cuda::{CudaContext, CudaStream, ExternalMemory, ExternalSemaphore};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -32,22 +29,22 @@ pub(crate) fn next_viewport_id() -> u64 {
     NEXT_VIEWPORT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn cuda_err(err: fastgui_interop_cuda::CudaError) -> PyErr {
-    PyRuntimeError::new_err(err.to_string())
-}
-
-/// A GPU-displayed image, fed either CPU-side pixel data (`submit_frame`) or, once attached to
-/// a `Window` via `set_viewport`, a CUDA-writable surface (`create_cuda_surface`).
+/// A GPU-displayed image, fed CPU-side pixel data (`submit_frame`) or CUDA arrays
+/// (`submit_cuda`, or the zero-copy `create_cuda_surface`).
 #[pyclass]
 pub(crate) struct Viewport {
     viewport_id: u64,
     frame_slot: FrameSlot<CpuFrame>,
     // Set by `Window.set_viewport` / `set_content` as soon as this viewport is attached to a
-    // window, so `submit_frame` can wake the idle event loop and `create_cuda_surface` can
-    // reach the right render thread.
+    // window, so `submit_frame` can wake the idle event loop and the CUDA paths can reach the
+    // right render thread.
     dispatch: Mutex<Option<CommandDispatch>>,
     fit: fastgui_core::widget::LayerFit,
+    cuda: Mutex<cuda::CudaState>,
+    /// The viewport's node in its window once shown, for live `set_file_drop` changes.
+    id: widgets::IdCell,
+    sender: widgets::SenderCell,
+    interaction: interaction::Interaction,
 }
 
 #[pymethods]
@@ -66,6 +63,10 @@ impl Viewport {
             frame_slot: FrameSlot::new(),
             dispatch: Mutex::new(None),
             fit,
+            cuda: Mutex::new(cuda::CudaState::default()),
+            id: std::sync::Arc::new(Mutex::new(None)),
+            sender: std::sync::Arc::new(Mutex::new(None)),
+            interaction: interaction::Interaction::new(true),
         })
     }
 
@@ -118,121 +119,75 @@ impl Viewport {
             out
         };
 
-        self.frame_slot.submit(CpuFrame { width, height, format: PixelFormat::Rgba8, data: rgba });
-        if let Some(dispatch) = self.dispatch.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-            dispatch.waker.wake();
+        self.push_cpu_frame(CpuFrame { width, height, format: PixelFormat::Rgba8, data: rgba });
+        Ok(())
+    }
+
+    /// Submit a CUDA array as the viewport's next frame: anything with
+    /// `__cuda_array_interface__` (torch, cupy, numba, jax), shaped `(height, width, 4)` uint8
+    /// with contiguous pixels (rows may be padded). Host arrays go to `submit_frame`.
+    ///
+    /// `stream` is the CUDA stream the array was written on (an int handle, `torch.cuda.Stream`,
+    /// cupy stream, or `__cuda_stream__` object); by default the one the array reports. fastgui
+    /// copies after the work already queued on it, and that stream waits for the copy before
+    /// running anything enqueued later, so reusing the array right away is safe. Nothing waits
+    /// for the display.
+    ///
+    /// Where the window's GPU can share memory with CUDA (Windows, Vulkan, NVIDIA) this is one
+    /// GPU-to-GPU copy. Elsewhere — macOS, Linux for now, a window on a non-NVIDIA GPU, before
+    /// `window.run()` — it falls back to a copy through host memory; `cuda_status` says which.
+    ///
+    /// Safe to call from any thread; only the newest frame is shown. **Unverified on NVIDIA
+    /// hardware.**
+    #[pyo3(signature = (array, stream = None))]
+    fn submit_cuda(&self, py: Python<'_>, array: &Bound<'_, PyAny>, stream: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let Some(image) = cuda::parse_cuda_array(array)? else {
+            return self.submit_frame(array);
+        };
+        let stream = stream.filter(|s| !s.is_none()).map(cuda::parse_stream).transpose()?;
+        let dispatch = self.dispatch.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let submitted = cuda::submit(
+            py,
+            &self.cuda,
+            dispatch.as_ref(),
+            self.viewport_id,
+            image.on_stream(stream),
+            array.clone().unbind(),
+            || drop(self.frame_slot.take_latest()),
+        )?;
+        if let cuda::Submitted::Host(frame) = submitted {
+            self.push_cpu_frame(frame);
         }
         Ok(())
     }
 
-    /// Allocate a `width`x`height` RGBA8 texture that a CUDA kernel can write into directly
-    /// (zero-copy — the same GPU memory Vulkan samples from), and return a `CudaSurface`
-    /// exposing its raw device pointer. Must be called after `window.set_viewport(viewport)`,
-    /// once `window.run()` has started (from a callback or another thread). Called before
-    /// `run()`, it raises `RuntimeError` after a ~2s grace period rather than blocking forever.
-    /// On Linux it raises `RuntimeError` (interop not implemented there yet).
-    ///
-    /// **Unverified**: written against the CUDA driver API and Vulkan external-memory specs,
-    /// but never run against a real CUDA-capable GPU during development. See
-    /// `fastgui_interop_cuda`'s crate docs (in the Rust source) for the full caveat.
-    ///
-    /// Not available on macOS — see the `#[cfg(target_os = "macos")]` override below.
-    #[cfg(not(target_os = "macos"))]
-    fn create_cuda_surface(&self, py: Python<'_>, width: u32, height: u32) -> PyResult<CudaSurface> {
-        let dispatch = self
-            .dispatch
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-            .ok_or_else(|| {
-                PyRuntimeError::new_err(
-                    "call window.set_viewport(viewport) or window.set_content(...) before viewport.create_cuda_surface()",
-                )
-            })?;
-
-        // The render thread only exists once `window.run()` has started, and `run()` blocks, so
-        // a call before it used to wait forever, usually on the very thread that was about to
-        // call `run()`. A background thread started just before `run()` (as in
-        // `examples/cuda_viewport.py`) is fine, so give startup a short grace period, then
-        // fail instead of hanging.
-        const STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-        let started = py.detach(|| {
-            let deadline = std::time::Instant::now() + STARTUP_GRACE;
-            while !dispatch.waker.is_bound() {
-                if std::time::Instant::now() >= deadline {
-                    return false;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            true
-        });
-        if !started {
-            return Err(PyRuntimeError::new_err(
-                "the render thread isn't running yet: viewport.create_cuda_surface() needs a \
-                 running window. window.run() starts the render thread and blocks, so call this \
-                 from a widget callback or another thread once run() is going",
-            ));
-        }
-
-        let (respond, response) = oneshot_channel();
-        dispatch
-            .send(Command::CreateCudaSurface {
-                viewport_id: self.viewport_id,
-                width,
-                height,
-                respond,
-            })
-            .map_err(|_| PyRuntimeError::new_err("window has already closed"))?;
-
-        // Backstop for a render thread that's alive but never gets to the command (e.g. it's
-        // shutting down): creating the surface takes milliseconds, so this is generous.
-        const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-        let handles = py
-            .detach(|| response.recv_timeout(RESPONSE_TIMEOUT))
-            .map_err(|err| {
-                if err.is_timeout() {
-                    PyRuntimeError::new_err(format!(
-                        "timed out after {}s waiting for the render thread to create the CUDA surface",
-                        RESPONSE_TIMEOUT.as_secs()
-                    ))
-                } else {
-                    PyRuntimeError::new_err("window closed before creating the CUDA surface")
-                }
-            })?
-            .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
-
-        py.detach(|| {
-            let ctx = CudaContext::new().map_err(cuda_err)?;
-            let memory = ExternalMemory::import_win32(&ctx, handles.memory_win32_handle, handles.memory_size)
-                .map_err(cuda_err)?;
-            let device_ptr = memory.device_ptr();
-            let semaphore = ExternalSemaphore::import_win32_timeline(&ctx, handles.semaphore_win32_handle)
-                .map_err(cuda_err)?;
-            let stream = CudaStream::new(&ctx).map_err(cuda_err)?;
-
-            Ok(CudaSurface {
-                _context: ctx,
-                _memory: memory,
-                inner: Mutex::new(CudaSurfaceInner { semaphore, stream, next_value: 0 }),
-                device_ptr,
-                pitch: handles.row_pitch,
-                width: handles.width,
-                height: handles.height,
-                target_value: handles.target_value,
-            })
-        })
+    /// Call `on_drop(paths, x, y)` when files are dropped on this viewport from the OS (`paths`
+    /// is a list of strings; `x, y` the point in the viewport's coordinates). `None` stops it.
+    #[pyo3(signature = (on_drop))]
+    fn set_file_drop(&self, on_drop: Option<Py<PyAny>>) -> PyResult<()> {
+        self.interaction.set_file_drop(on_drop, &self.id, &self.sender)
     }
 
-    /// Apple hasn't shipped an NVIDIA GPU since ~2019, so there is no zero-copy CUDA<->Metal
-    /// surface to allocate here — see `fastgui_render_mtl::Command`'s doc comment for the same
-    /// reasoning one layer down. Use `Viewport.submit_frame()` (CPU copy) instead.
-    #[cfg(target_os = "macos")]
-    fn create_cuda_surface(&self, _py: Python<'_>, _width: u32, _height: u32) -> PyResult<CudaSurface> {
-        Err(PyRuntimeError::new_err(
-            "CUDA interop is not supported on macOS -- Apple has not shipped an NVIDIA GPU \
-             since ~2019, so there is no zero-copy CUDA<->Metal path. Use \
-             Viewport.submit_frame() (CPU copy) instead.",
-        ))
+    /// How the last `submit_cuda` reached the screen: `"interop"` (GPU-to-GPU), `"host copy:
+    /// <reason>"`, or `"unused"`.
+    #[getter]
+    fn cuda_status(&self) -> String {
+        self.cuda.lock().unwrap_or_else(|p| p.into_inner()).status()
+    }
+
+    /// Allocate a `width`x`height` RGBA8 surface CUDA writes into directly (no copy on the CUDA
+    /// side) and return it as a `CudaSurface`; write frames with `with surface.frame(stream) as
+    /// f:`. Must be called after `window.set_viewport(viewport)`, once `window.run()` has started
+    /// (from a callback or another thread); before that it raises `RuntimeError` after a ~2s
+    /// grace period. Also raises where interop isn't available (macOS, Linux for now, a window on
+    /// a non-NVIDIA GPU); `submit_cuda` works everywhere.
+    ///
+    /// **Unverified on NVIDIA hardware.**
+    fn create_cuda_surface(&self, py: Python<'_>, width: u32, height: u32) -> PyResult<cuda::CudaSurface> {
+        let dispatch = self.dispatch.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        cuda::create_surface(py, &self.cuda, dispatch, self.viewport_id, width, height, || {
+            drop(self.frame_slot.take_latest())
+        })
     }
 }
 
@@ -242,88 +197,23 @@ impl Viewport {
     }
 
     pub(crate) fn describe_widget(&self) -> widgets::DescribedWidget {
-        widgets::described_viewport(self.viewport_id, self.frame_slot.clone(), self.fit)
+        widgets::described_viewport(
+            self.viewport_id,
+            self.frame_slot.clone(),
+            self.fit,
+            self.id.clone(),
+            self.sender.clone(),
+            self.interaction.spec(),
+        )
+    }
+
+    fn push_cpu_frame(&self, frame: CpuFrame) {
+        self.frame_slot.submit(frame);
+        if let Some(dispatch) = self.dispatch.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            dispatch.waker.wake();
+        }
     }
 }
-
-#[cfg(not(target_os = "macos"))]
-struct CudaSurfaceInner {
-    semaphore: ExternalSemaphore,
-    stream: CudaStream,
-    next_value: u64,
-}
-
-/// A CUDA-writable GPU surface backing a `Viewport`, returned by `Viewport.create_cuda_surface`.
-/// Write into `device_ptr` (e.g. via cupy, numba, a raw ctypes CUDA kernel launch — anything
-/// that accepts a raw CUDA device pointer) respecting `pitch`-byte rows, then call
-/// `signal_ready()` once a frame is complete.
-///
-/// **Unverified** — see `Viewport.create_cuda_surface`.
-///
-/// Not available on macOS — see the stub definition below.
-#[cfg(not(target_os = "macos"))]
-#[pyclass]
-struct CudaSurface {
-    _context: CudaContext,
-    _memory: ExternalMemory,
-    inner: Mutex<CudaSurfaceInner>,
-    device_ptr: u64,
-    pitch: u64,
-    width: u32,
-    height: u32,
-    target_value: Arc<std::sync::atomic::AtomicU64>,
-}
-
-#[cfg(not(target_os = "macos"))]
-#[pymethods]
-impl CudaSurface {
-    #[getter]
-    fn device_ptr(&self) -> u64 {
-        self.device_ptr
-    }
-
-    #[getter]
-    fn pitch(&self) -> u64 {
-        self.pitch
-    }
-
-    #[getter]
-    fn width(&self) -> u32 {
-        self.width
-    }
-
-    #[getter]
-    fn height(&self) -> u32 {
-        self.height
-    }
-
-    /// Tell the render thread a frame is ready: signals the shared timeline semaphore (waiting
-    /// for CUDA to confirm it actually completed) and only then publishes the new value for
-    /// the render thread to wait on before its next sample. Safe to call from any thread, but
-    /// calls serialize against each other (they share one CUDA stream).
-    fn signal_ready(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| {
-            let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            inner.next_value += 1;
-            let value = inner.next_value;
-            inner.semaphore.signal(&inner.stream, value).map_err(cuda_err)?;
-            inner.stream.synchronize().map_err(cuda_err)?;
-            self.target_value.store(value, Ordering::Release);
-            Ok(())
-        })
-    }
-}
-
-/// Never constructed — `Viewport::create_cuda_surface` always errors before reaching one on
-/// macOS (see its `#[cfg(target_os = "macos")]` override). Exists only so this type name and
-/// `_fastgui`'s `m.add_class::<CudaSurface>()` registration stay the same across platforms.
-#[cfg(target_os = "macos")]
-#[pyclass]
-struct CudaSurface;
-
-#[cfg(target_os = "macos")]
-#[pymethods]
-impl CudaSurface {}
 
 /// A top-level application window. `run()` opens it and blocks the calling thread, rendering
 /// until the user closes it.
@@ -649,7 +539,8 @@ fn rebind_floating_panels(window: &Bound<'_, Window>, content: Option<&Bound<'_,
 fn _fastgui(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Window>()?;
     m.add_class::<Viewport>()?;
-    m.add_class::<CudaSurface>()?;
+    m.add_class::<cuda::CudaSurface>()?;
+    m.add_class::<cuda::CudaFrame>()?;
     widgets::register(m)?;
     plots::register(m)?;
     charts::register(m)?;

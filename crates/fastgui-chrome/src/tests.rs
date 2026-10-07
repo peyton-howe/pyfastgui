@@ -2,6 +2,7 @@ use fastgui_core::taffy::prelude::*;
 use fastgui_core::widget::WidgetId;
 
 use super::*;
+use fastgui_core::widget::DropZone;
 
 /// Blitting a cached run must draw what the old per-pixel `fill_rect` path did. At a
 /// whole-pixel origin that path's anti-aliasing covers exactly one pixel per glyph pixel, so the
@@ -168,6 +169,7 @@ fn check_matches_full(
 ) -> Option<Option<Vec<PixelRect>>> {
     let (w, h) = size;
     tree.compute_layout(w as f32 / scale, h as f32 / scale);
+    let drop = drop.map(|(r, z)| z.preview_rect(r));
     let (incremental, damage) = match chrome.rasterize(tree, w, h, drop, scale) {
         Some(frame) => (frame.data.to_vec(), Some(frame.damage.map(<[PixelRect]>::to_vec))),
         None => (chrome.frame.as_ref().unwrap().data().to_vec(), None),
@@ -262,6 +264,7 @@ fn check_gpu_matches_cpu(
 ) -> bool {
     let (w, h) = size;
     tree.compute_layout(w as f32 / scale, h as f32 / scale);
+    let drop = drop.map(|(r, z)| z.preview_rect(r));
     let emitted = match gpu.build_quads(tree, w, h, drop, scale) {
         Some(frame) => {
             let atlas_size = atlas_side(atlas);
@@ -1087,4 +1090,176 @@ fn form_controls_rasterize_without_panicking() {
     let drawn = frame.data.chunks_exact(4).filter(|px| px != &[0, 0, 0, 0]).count();
     assert!(drawn > 500, "expected painted chrome, only {drawn} non-zero pixels");
     let _ = CHECK_SIZE; // keep the shared constant import intentional
+}
+
+/// A box holding a button and a label, for hover / disabled state tests.
+fn stateful_tree() -> (WidgetTree, WidgetId, WidgetId, WidgetId) {
+    let mut tree = WidgetTree::new();
+    let root = tree.root();
+    let container = tree.new_node(
+        Style {
+            flex_direction: FlexDirection::Row,
+            size: Size { width: Dimension::length(220.0), height: Dimension::length(60.0) },
+            ..Default::default()
+        },
+        WidgetKind::Container { background: Color([0.15, 0.15, 0.18, 1.0]), region_id: None },
+    );
+    let button = tree.new_node(
+        Style { size: Size { width: Dimension::length(80.0), height: Dimension::length(30.0) }, ..Default::default() },
+        WidgetKind::Button {
+            text: "Go".into(),
+            font_size: 14.0,
+            text_color: Color([1.0; 4]),
+            background: Color([0.2, 0.3, 0.8, 1.0]),
+            flat: false,
+            on_click: None,
+        },
+    );
+    let label = tree.new_node(
+        Style { size: Size { width: Dimension::length(80.0), height: Dimension::length(30.0) }, ..Default::default() },
+        WidgetKind::Label { text: "hi".into(), font_size: 14.0, color: Color([1.0; 4]) },
+    );
+    tree.add_child(root, container);
+    tree.add_child(container, button);
+    tree.add_child(container, label);
+    tree.compute_layout(240.0, 80.0);
+    (tree, container, button, label)
+}
+
+fn quads_colored(chrome: &ChromeRenderer, color: Color) -> Vec<usize> {
+    chrome.gpu.quads.iter().enumerate().filter(|(_, q)| q.color == color.0).map(|(i, _)| i).collect()
+}
+
+#[test]
+fn hover_draws_one_state_layer_on_hoverable_widgets_only() {
+    let theme = fastgui_core::theme::chrome_theme();
+    let (mut tree, _, button, label) = stateful_tree();
+    let mut chrome = ChromeRenderer::new();
+    chrome.build_quads(&tree, 240, 80, None, 1.0).expect("first frame");
+    assert!(quads_colored(&chrome, theme.hover).is_empty());
+
+    tree.set_hovered(Some(button));
+    chrome.build_quads(&tree, 240, 80, None, 1.0).expect("hover rebuilds");
+    assert_eq!(quads_colored(&chrome, theme.hover).len(), 1, "one state layer over the button");
+
+    tree.set_hovered(Some(label));
+    chrome.build_quads(&tree, 240, 80, None, 1.0).expect("hover moved");
+    assert!(quads_colored(&chrome, theme.hover).is_empty(), "labels aren't hoverable");
+
+    tree.set_hovered(Some(button));
+    tree.set_disabled(button, true);
+    chrome.build_quads(&tree, 240, 80, None, 1.0).expect("disabled rebuilds");
+    assert!(quads_colored(&chrome, theme.hover).is_empty(), "no hover on a disabled widget");
+}
+
+#[test]
+fn a_disabled_subtree_gets_one_veil_over_its_children() {
+    let theme = fastgui_core::theme::chrome_theme();
+    let (mut tree, container, button, _) = stateful_tree();
+    let mut chrome = ChromeRenderer::new();
+    chrome.build_quads(&tree, 240, 80, None, 1.0).expect("first frame");
+    let button_fill = quads_colored(&chrome, Color([0.2, 0.3, 0.8, 1.0]));
+    assert_eq!(button_fill.len(), 1);
+
+    tree.set_disabled(container, true);
+    chrome.build_quads(&tree, 240, 80, None, 1.0).expect("disable rebuilds");
+    let veils = quads_colored(&chrome, theme.disabled);
+    assert_eq!(veils.len(), 1, "the box and everything in it share one veil");
+    let button_fill = quads_colored(&chrome, Color([0.2, 0.3, 0.8, 1.0]));
+    assert!(veils[0] > button_fill[0], "drawn after (over) the children");
+
+    // A disabled child inside a disabled box doesn't add a second veil.
+    tree.set_disabled(button, true);
+    chrome.build_quads(&tree, 240, 80, None, 1.0);
+    assert_eq!(quads_colored(&chrome, theme.disabled).len(), 1);
+    tree.set_disabled(container, false);
+    chrome.build_quads(&tree, 240, 80, None, 1.0).expect("re-enable rebuilds");
+    assert_eq!(quads_colored(&chrome, theme.disabled).len(), 1, "now the button's own veil");
+}
+
+#[test]
+fn hover_and_disabled_match_between_gpu_and_cpu() {
+    let (mut tree, container, button, _) = stateful_tree();
+    let (mut gpu, mut cpu, mut atlas) = (ChromeRenderer::new(), ChromeRenderer::new(), Vec::new());
+    tree.set_hovered(Some(button));
+    check_gpu_matches_cpu(&mut gpu, &mut cpu, &mut atlas, &mut tree, (240, 80), None, 1.0);
+    tree.set_disabled(container, true);
+    check_gpu_matches_cpu(&mut gpu, &mut cpu, &mut atlas, &mut tree, (240, 80), None, 1.0);
+}
+
+#[test]
+fn hovered_menu_row_in_a_popup_gets_the_state_layer() {
+    use fastgui_core::widget::PopupAnchor;
+    let theme = fastgui_core::theme::chrome_theme();
+    let mut tree = WidgetTree::new();
+    let mut row = None;
+    tree.open_popup(
+        WidgetKind::Popup {
+            anchor: PopupAnchor::Center,
+            modal: false,
+            background: Color([0.16, 0.17, 0.20, 1.0]),
+            border: Color([0.3, 0.3, 0.4, 1.0]),
+            on_dismiss: None,
+            restore_focus: None,
+            click_through: false,
+            closes_on_anchor_click: true,
+            open: None,
+        },
+        |tree, popup| {
+            let button = tree.new_node(
+                Style { size: Size { width: Dimension::length(120.0), height: Dimension::length(24.0) }, ..Default::default() },
+                WidgetKind::Button {
+                    text: "Open".into(),
+                    font_size: 14.0,
+                    text_color: Color([1.0; 4]),
+                    background: Color::TRANSPARENT,
+                    flat: true,
+                    on_click: Some(std::sync::Arc::new(|| {})),
+                },
+            );
+            tree.add_child(popup, button);
+            row = Some(button);
+        },
+    );
+    tree.compute_layout(240.0, 130.0);
+    let row = row.unwrap();
+    let r = tree.absolute_rect(row).unwrap();
+    assert_eq!(tree.hit_test(r.x + 5.0, r.y + 5.0), Some(row), "the cursor finds the row itself");
+    tree.set_hovered(Some(row));
+    let mut chrome = ChromeRenderer::new();
+    chrome.build_quads(&tree, 240, 130, None, 1.0).expect("frame");
+    assert_eq!(quads_colored(&chrome, theme.hover).len(), 1);
+}
+
+#[test]
+fn hovered_list_rows_get_the_state_layer() {
+    let theme = fastgui_core::theme::chrome_theme();
+    let mut tree = WidgetTree::new();
+    let root = tree.root();
+    let list = tree.new_node(
+        Style { size: Size { width: Dimension::length(150.0), height: Dimension::length(100.0) }, ..Default::default() },
+        WidgetKind::ListView {
+            items: (0..4).map(|i| format!("item {i}")).collect(),
+            row_height: 20.0,
+            font_size: 14.0,
+            scroll: 0.0,
+            selected: None,
+            text_color: Color([1.0; 4]),
+            background: Color([0.16, 0.17, 0.2, 1.0]),
+            selection_color: Color([0.2, 0.4, 0.8, 0.6]),
+            on_select: None,
+            on_activate: None,
+            mirror: None,
+        },
+    );
+    tree.add_child(root, list);
+    tree.compute_layout(200.0, 120.0);
+    let mut chrome = ChromeRenderer::new();
+    chrome.build_quads(&tree, 200, 120, None, 1.0).expect("first frame");
+    assert!(quads_colored(&chrome, theme.hover).is_empty());
+    tree.set_hovered_at(Some(list), 20.0, 45.0);
+    chrome.build_quads(&tree, 200, 120, None, 1.0).expect("row hover rebuilds");
+    let hover = quads_colored(&chrome, theme.hover);
+    assert_eq!(hover.len(), 1, "one row tinted");
+    assert_eq!(chrome.gpu.quads[hover[0]].rect[1], 40.0, "row 2's top edge");
 }

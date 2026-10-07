@@ -84,8 +84,12 @@ theme! {
     scrollbar,
     /// Dims the window behind a modal popup.
     scrim,
-    /// Dock drag-and-drop preview.
+    /// Dock and widget drag-and-drop preview.
     drop_indicator,
+    /// Translucent state layer over a hovered control.
+    hover,
+    /// Translucent veil over a disabled widget (usually the background color, part opaque).
+    disabled,
 }
 
 const DARK: Theme = Theme {
@@ -105,6 +109,8 @@ const DARK: Theme = Theme {
     scrollbar: (1.0, 1.0, 1.0, 0.35),
     scrim: (0.0, 0.0, 0.0, 0.45),
     drop_indicator: (0.40, 0.65, 1.00, 0.35),
+    hover: (1.0, 1.0, 1.0, 0.08),
+    disabled: (0.10, 0.11, 0.13, 0.55),
     font_family: None,
     font_size_small: 14.0,
     font_size: 16.0,
@@ -131,6 +137,8 @@ const LIGHT: Theme = Theme {
     scrollbar: (0.0, 0.0, 0.0, 0.30),
     scrim: (0.0, 0.0, 0.0, 0.30),
     drop_indicator: (0.20, 0.45, 0.90, 0.30),
+    hover: (0.0, 0.0, 0.0, 0.06),
+    disabled: (0.94, 0.95, 0.96, 0.60),
     ..DARK
 };
 
@@ -150,7 +158,8 @@ pub(crate) fn install(theme: Theme) {
         scrim: color(theme.scrim),
         drop_indicator: color(theme.drop_indicator),
         scrollbar: color(theme.scrollbar),
-        hover: color(theme.surface_active),
+        hover: color(theme.hover),
+        disabled: color(theme.disabled),
         surface_alt: color(theme.surface_alt),
         text: color(theme.text),
         border: color(theme.border),

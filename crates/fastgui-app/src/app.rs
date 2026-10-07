@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use fastgui_chrome::ChromeRenderer;
 use fastgui_core::theme::chrome_theme;
 use fastgui_core::widget::{
-    Color, DropZone, LayerFit, PointerCallback, PopupAnchor, PopupPress, PopupSide, Rect, WidgetId,
+    Color, LayerFit, PointerCallback, PopupAnchor, PopupPress, PopupSide, Rect, WidgetId,
     WidgetKind, WidgetTree, SPLITTER_HIT_SLOP,
 };
 use winit::application::ApplicationHandler;
@@ -17,6 +17,7 @@ use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::cloak::set_cloaked;
+use crate::dnd::{past_drag_threshold, FileDrops, WidgetDrag};
 use crate::command::{Command, RenderThreadHandles};
 use crate::constants::*;
 use crate::coords::{remap_rect, scale_rect};
@@ -98,14 +99,14 @@ fn update_chrome<B: SurfaceBackend>(
     renderer: &mut B,
     tree: &WidgetTree,
     (width, height): (u32, u32),
-    drop_indicator: Option<(Rect, DropZone)>,
+    drop_preview: Option<Rect>,
     scale: f32,
 ) -> Result<(), B::Error> {
     if gpu_chrome() {
-        if let Some(quads) = chrome.build_quads(tree, width, height, drop_indicator, scale) {
+        if let Some(quads) = chrome.build_quads(tree, width, height, drop_preview, scale) {
             renderer.set_chrome_quads(&quads)?;
         }
-    } else if let Some(frame) = chrome.rasterize(tree, width, height, drop_indicator, scale) {
+    } else if let Some(frame) = chrome.rasterize(tree, width, height, drop_preview, scale) {
         renderer.set_chrome_frame(&frame)?;
     }
     Ok(())
@@ -191,6 +192,10 @@ struct App<B: SurfaceBackend> {
     /// A `Button` / `Checkbox` / `Radio` / `Toggle` pressed and not yet released; it activates
     /// if released over itself.
     pressed_button: Option<WidgetId>,
+    /// Widget drag-and-drop in the main window (`WidgetTree::set_drag_source`).
+    widget_drag: WidgetDrag,
+    /// OS files dropped on the main window this event burst, delivered in `about_to_wait`.
+    file_drops: FileDrops,
     /// Time and place of the last press on a `TextInput`, for double-click detection.
     last_click: Option<(Instant, (f32, f32))>,
     /// Whether the main window currently accepts IME input (a `TextInput` has focus).
@@ -478,19 +483,20 @@ impl<B: SurfaceBackend> App<B> {
 
         let size_changed = self.last_chrome_size != Some((self.width, self.height))
             || (self.last_raster_scale - self.scale_factor).abs() > 1e-6;
-        let dragging_panel = self.dragging_panel_title.is_some();
-        let chrome_dirty = self.widget_tree.is_dirty() || size_changed || dragging_panel;
+        // A drag in progress redraws its preview every frame.
+        let dragging = self.dragging_panel_title.is_some() || self.widget_drag.is_active();
+        let chrome_dirty = self.widget_tree.is_dirty() || size_changed || dragging;
         // Only with a renderer to take the result: chrome keeps the frame it rasterized and
         // later sends just what changed, so a frame nobody uploaded would be lost for good.
+        let drop_preview = self.drop_preview();
         if let (true, Some(renderer)) = (chrome_dirty, &mut self.renderer) {
             self.widget_tree.compute_layout_measured(self.width as f32, self.height as f32, &mut self.chrome);
-            let drop_indicator = self.hover_region.map(|(_, rect, zone)| (rect, zone));
             update_chrome(
                 &mut self.chrome,
                 renderer,
                 &self.widget_tree,
                 (self.physical_width, self.physical_height),
-                drop_indicator,
+                drop_preview,
                 self.scale_factor as f32,
             )?;
             self.widget_tree.clear_dirty();
@@ -572,9 +578,9 @@ impl<B: SurfaceBackend> App<B> {
             return draws;
         }
         // Viewport layers are composited by the GPU *after* chrome, so they'd hide the drop
-        // preview chrome draws. While a drop zone is previewed, leave out any viewport it
-        // overlaps (its chrome placeholder shows instead) so the highlight is visible.
-        let preview = self.hover_region.map(|(_, rect, zone)| zone.preview_rect(rect));
+        // preview chrome draws. While a drop is previewed, leave out any viewport it overlaps
+        // (its chrome placeholder shows instead) so the highlight is visible.
+        let preview = self.drop_preview();
         for id in self.widget_tree.walk() {
             let layer_id = match self.widget_tree.kind(id) {
                 Some(WidgetKind::Viewport { viewport_id, .. }) => *viewport_id,
@@ -681,7 +687,7 @@ impl<B: SurfaceBackend> App<B> {
     /// Drive button/menu hover fills; redraw when the hovered widget changes.
     fn update_hovered_widget(&mut self) {
         let hit = self.widget_tree.hit_test(self.cursor.0, self.cursor.1);
-        if self.widget_tree.set_hovered(hit) {
+        if self.widget_tree.set_hovered_at(hit, self.cursor.0, self.cursor.1) {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
@@ -776,7 +782,7 @@ impl<B: SurfaceBackend> App<B> {
             floater.hover_since = Instant::now();
             floater.hover_action_done = None;
         }
-        if floater.widget_tree.set_hovered(hit) {
+        if floater.widget_tree.set_hovered_at(hit, floater.cursor.0, floater.cursor.1) {
             floater.window.request_redraw();
         }
     }
@@ -836,6 +842,9 @@ impl<B: SurfaceBackend> App<B> {
             return;
         }
         let Some(id) = self.widget_tree.hit_test(self.cursor.0, self.cursor.1) else { return };
+        if self.widget_tree.is_disabled(id) {
+            return;
+        }
         // Walk up so a Label inside a Box with a context menu still finds it.
         let mut node = Some(id);
         while let Some(current) = node {
@@ -868,10 +877,19 @@ impl<B: SurfaceBackend> App<B> {
         // `SPLITTER_HIT_SLOP` of a splitter grabs it before the title bar/content under the
         // cursor gets a chance to start a panel drag.
         if let Some(bar) = self.widget_tree.splitter_at(self.cursor.0, self.cursor.1, SPLITTER_HIT_SLOP) {
-            self.dragging_splitter = Some(bar);
+            if !self.widget_tree.is_disabled(bar) {
+                self.dragging_splitter = Some(bar);
+            }
             return;
         }
         let hit = self.widget_tree.hit_test(self.cursor.0, self.cursor.1);
+        // A disabled widget swallows the press: no focus change, no activation, no drag.
+        if hit.is_some_and(|id| self.widget_tree.is_disabled(id)) {
+            return;
+        }
+        // Arms a widget drag if the press is on a drag source; it only starts once the cursor
+        // moves past the drag threshold, so the press below still selects / activates as usual.
+        self.widget_drag = WidgetDrag::press(&self.widget_tree, self.cursor);
         // Clicking a focusable widget focuses it; clicking anything else clears focus — except
         // flat buttons (menu titles/rows, toolbar chrome), which leave focus where it was so
         // e.g. Edit > Copy still acts on the focused text field.
@@ -1060,12 +1078,17 @@ impl<B: SurfaceBackend> App<B> {
             return;
         }
         if let Some(bar) = floater.widget_tree.splitter_at(cursor.0, cursor.1, SPLITTER_HIT_SLOP) {
-            if let Some(floater) = self.floating.get_mut(&window_id) {
-                floater.dragging_splitter = Some(bar);
+            if !floater.widget_tree.is_disabled(bar) {
+                if let Some(floater) = self.floating.get_mut(&window_id) {
+                    floater.dragging_splitter = Some(bar);
+                }
             }
             return;
         }
         let hit = floater.widget_tree.hit_test(cursor.0, cursor.1);
+        if hit.is_some_and(|id| floater.widget_tree.is_disabled(id)) {
+            return;
+        }
         let Some(floater) = self.floating.get_mut(&window_id) else { return };
         if !is_flat_button(&floater.widget_tree, hit) {
             floater.widget_tree.set_focus(hit);
@@ -1316,10 +1339,7 @@ impl<B: SurfaceBackend> App<B> {
         // The top `OUTER_EDGE_MARGIN` of the window lies entirely inside the top row's title
         // bars, so otherwise a click that jittered a pixel, or a drag released back on its own
         // title bar, committed a whole-window Top drop.
-        let moved_enough = self.dock_tear_press_cursor.is_none_or(|press| {
-            let (dx, dy) = (self.cursor.0 - press.0, self.cursor.1 - press.1);
-            dx * dx + dy * dy >= TEAR_GHOST_THRESHOLD * TEAR_GHOST_THRESHOLD
-        });
+        let moved_enough = self.dock_tear_press_cursor.is_none_or(|press| past_drag_threshold(press, self.cursor));
         let over_self = self
             .widget_tree
             .find_region_at(self.cursor.0, self.cursor.1)
@@ -1507,9 +1527,7 @@ impl<B: SurfaceBackend> App<B> {
         }
         if self.tear_ghost.is_none() {
             let Some(press) = self.dock_tear_press_cursor else { return };
-            let dx = self.cursor.0 - press.0;
-            let dy = self.cursor.1 - press.1;
-            if dx * dx + dy * dy < TEAR_GHOST_THRESHOLD * TEAR_GHOST_THRESHOLD {
+            if !past_drag_threshold(press, self.cursor) {
                 return;
             }
             // A new drag replaces any ghost still covering a previous tear-off's floater.
@@ -1810,8 +1828,39 @@ impl<B: SurfaceBackend> App<B> {
         }
     }
 
+    /// The rect chrome highlights for the drag in progress: a dock zone or a widget drop.
+    fn drop_preview(&self) -> Option<Rect> {
+        self.hover_region.map(|(_, rect, zone)| zone.preview_rect(rect)).or_else(|| self.widget_drag.preview())
+    }
+
+    /// Hand files dropped since the last call to the file-drop target under the cursor.
+    fn deliver_file_drops(&mut self) {
+        if self.file_drops.is_empty() {
+            return;
+        }
+        let cursor = self
+            .window
+            .as_ref()
+            .and_then(|window| crate::dnd::os_cursor(window, self.scale_factor))
+            .unwrap_or(self.cursor);
+        let delivered = forms::with_tree(&mut self.widget_tree, |tree| self.file_drops.flush(tree, cursor));
+        if delivered && self.widget_tree.is_dirty() {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
     fn update_cursor_icon(&mut self) {
         let Some(window) = &self.window else { return };
+        if self.widget_drag.is_active() {
+            window.set_cursor(if self.widget_drag.has_target() {
+                winit::window::CursorIcon::Grabbing
+            } else {
+                winit::window::CursorIcon::NotAllowed
+            });
+            return;
+        }
         // Title bars keep the plain arrow, hovered or dragged, like native title bars on every
         // platform. Returning early keeps a panel drag from flickering to a splitter cursor.
         if self.dragging_panel_title.is_some() || self.dragging_floating_panel.is_some() {
@@ -2142,13 +2191,19 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                 let previous = self.cursor;
                 self.cursor = (logical.x as f32, logical.y as f32);
                 let (dx, dy) = (self.cursor.0 - previous.0, self.cursor.1 - previous.1);
-                let dragging = self.dragging_slider.is_some()
+                let other_drag = self.dragging_slider.is_some()
                     || self.dragging_splitter.is_some()
                     || self.dragging_panel_title.is_some()
                     || self.dragging_text.is_some()
                     || self.dragging_scrub.is_some()
                     || self.dragging_scrollbar.is_some()
                     || self.dragging_pointer.is_some();
+                if self.widget_drag.moved(&self.widget_tree, self.cursor, other_drag) {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                let dragging = other_drag || self.widget_drag.is_active();
                 if let Some(id) = self.dragging_pointer {
                     if let Some(rect) = self.widget_tree.absolute_rect(id) {
                         if let Some(WidgetKind::Image { on_pointer: Some(cb), .. }) = self.widget_tree.kind(id) {
@@ -2216,8 +2271,17 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                         || self.dragging_text.is_some()
                         || self.dragging_scrub.is_some()
                         || self.dragging_scrollbar.is_some()
-                        || self.dragging_pointer.is_some();
-                    let pressed = self.pressed_button.take();
+                        || self.dragging_pointer.is_some()
+                        || self.widget_drag.is_active();
+                    // A widget drag ends here: it delivers its drop (if over a target), and the
+                    // press that started it doesn't also count as a click.
+                    let widget_dragged = self.widget_drag.is_active();
+                    let drop = self.widget_drag.release(&self.widget_tree);
+                    self.widget_drag = WidgetDrag::Idle;
+                    let pressed = self.pressed_button.take().filter(|_| !widget_dragged);
+                    if let Some((on_drop, event)) = drop {
+                        forms::with_tree(&mut self.widget_tree, |_| on_drop(event));
+                    }
                     if let Some(id) = self.dragging_pointer.take() {
                         if let Some(rect) = self.widget_tree.absolute_rect(id) {
                             if let Some(WidgetKind::Image { on_pointer: Some(cb), .. }) = self.widget_tree.kind(id) {
@@ -2257,6 +2321,18 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
             }
             WindowEvent::CursorLeft { .. } => self.clear_hover(),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && self.widget_drag.is_active()
+                    && event.logical_key == Key::Named(winit::keyboard::NamedKey::Escape) =>
+            {
+                self.widget_drag.cancel();
+                self.update_cursor_icon();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::DroppedFile(path) => self.file_drops.push(path),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let plain = event.key_without_modifiers();
                 let press = key_press(&event, &plain, self.modifiers);
@@ -2277,6 +2353,8 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                     emit_pointer(&cb, 0, dx, dy, self.cursor, rect);
                     self.render_now(event_loop);
                 } else if self.widget_tree.scroll_at(self.cursor.0, self.cursor.1, dx, dy) {
+                    // A different row is under the (unmoved) cursor now.
+                    self.update_hovered_widget();
                     self.render_now(event_loop);
                 }
             }
@@ -2306,6 +2384,7 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.deliver_file_drops();
         self.maybe_run_hover_action();
         self.maybe_run_floating_hover_actions();
         self.maybe_open_tooltip();
@@ -2595,6 +2674,9 @@ fn image_pointer(tree: &WidgetTree, x: f32, y: f32) -> Option<(WidgetId, Pointer
     let mut node = tree.hit_test(x, y);
     while let Some(id) = node {
         if let Some(WidgetKind::Image { on_pointer: Some(cb), .. }) = tree.kind(id) {
+            if tree.is_disabled(id) {
+                return None;
+            }
             if let Some(rect) = tree.absolute_rect(id) {
                 if rect.width > 0.0 && rect.height > 0.0 {
                     return Some((id, cb.clone(), rect));
@@ -2737,6 +2819,8 @@ pub fn run<B: SurfaceBackend>(
         dragging_scrollbar: None,
         dragging_pointer: None,
         pressed_button: None,
+        widget_drag: WidgetDrag::Idle,
+        file_drops: FileDrops::default(),
         last_click: None,
         ime_allowed: false,
         dragging_panel_title: None,

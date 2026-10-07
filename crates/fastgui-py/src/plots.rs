@@ -38,8 +38,9 @@ fn parse_range(range: Option<(f64, f64)>) -> PyResult<Option<(f64, f64)>> {
     }
 }
 
-/// `__cuda_array_interface__` (`<f4` / `<f8`, C-contiguous) copied with `cuMemcpyDtoH`.
-/// Dtype and stride checks fail before any driver call. macOS has no CUDA interop.
+/// `__cuda_array_interface__` (`<f4` / `<f8`, C-contiguous) copied to the host after the
+/// array's stream (`fastgui_interop_cuda::copy_to_host`). Dtype and stride checks fail before any
+/// driver call. macOS has no CUDA.
 /// Unverified against a real NVIDIA driver — same caveat as the rest of `fastgui-interop-cuda`.
 fn cuda_array(obj: &Bound<'_, PyAny>) -> PyResult<Option<(Vec<f64>, Vec<usize>)>> {
     if !obj.hasattr("__cuda_array_interface__").unwrap_or(false) {
@@ -96,13 +97,11 @@ fn cuda_array(obj: &Bound<'_, PyAny>) -> PyResult<Option<(Vec<f64>, Vec<usize>)>
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let ctx = fastgui_interop_cuda::CudaContext::new().map_err(|err| {
-            PyRuntimeError::new_err(format!("CUDA device array ingest failed: {err}"))
-        })?;
+        let stream = crate::cuda::cai_stream(&iface)?;
         let mut bytes = vec![0u8; nbytes];
-        ctx.copy_device_to_host(ptr, &mut bytes).map_err(|err| {
-            PyRuntimeError::new_err(format!("CUDA device array ingest failed: {err}"))
-        })?;
+        obj.py()
+            .detach(|| fastgui_interop_cuda::copy_to_host(ptr, &mut bytes, stream))
+            .map_err(|err| PyRuntimeError::new_err(format!("CUDA device array ingest failed: {err}")))?;
         let values = if elem == 4 {
             bytes
                 .chunks_exact(4)
