@@ -90,14 +90,16 @@ fn cuda_array(obj: &Bound<'_, PyAny>) -> PyResult<Option<(Vec<f64>, Vec<usize>)>
     }
     let data = iface.get_item("data")?;
     let ptr = data.get_item(0)?.extract::<u64>()?;
+    // Stream shape is checked before the platform refusal and before any driver call, so a bad
+    // stream is a TypeError on macOS too.
+    let stream = crate::cuda::cai_stream(&iface)?;
     #[cfg(target_os = "macos")]
     {
-        let _ = ptr;
+        let _ = (ptr, stream);
         return Err(PyRuntimeError::new_err("CUDA arrays are not available on macOS"));
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let stream = crate::cuda::cai_stream(&iface)?;
         let mut bytes = vec![0u8; nbytes];
         obj.py()
             .detach(|| fastgui_interop_cuda::copy_to_host(ptr, &mut bytes, stream))

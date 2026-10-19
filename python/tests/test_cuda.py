@@ -6,6 +6,7 @@ fallthrough. Past validation, a fake pointer goes to the host-copy path, which n
 on a machine without one that has to be a clean RuntimeError, not a crash.
 """
 
+import sys
 import unittest
 
 import numpy as np
@@ -137,6 +138,7 @@ class PlotCudaIngestTests(unittest.TestCase):
 
         return FakeFloats()
 
+    @unittest.skipIf(sys.platform == "darwin", "plot CUDA ingest is refused before the driver on macOS")
     @unittest.skipIf(driver_available(), "a CUDA driver is installed")
     def test_valid_array_reaches_the_driver(self) -> None:
         with self.assertRaises(RuntimeError) as ctx:
