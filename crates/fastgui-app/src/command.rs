@@ -39,14 +39,25 @@ pub enum Command {
     },
 }
 
+struct EventLoopBinding {
+    proxy: EventLoopProxy<()>,
+    /// `run()` calls `bind` on the thread that then blocks in the event loop, which is also
+    /// the thread that drains the command queue. A request/response sent from that thread
+    /// waits for a drain that cannot happen until the caller returns.
+    thread: std::thread::ThreadId,
+}
+
 #[derive(Clone, Default)]
 pub struct EventWaker {
-    proxy: Arc<Mutex<Option<EventLoopProxy<()>>>>,
+    binding: Arc<Mutex<Option<EventLoopBinding>>>,
 }
 
 impl EventWaker {
     pub fn bind(&self, proxy: EventLoopProxy<()>) {
-        *self.proxy.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(proxy);
+        *self.binding.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EventLoopBinding {
+            proxy,
+            thread: std::thread::current().id(),
+        });
     }
 
     /// Whether `run()` has created the render thread's event loop (and so something will
@@ -54,11 +65,27 @@ impl EventWaker {
     /// nothing to answer it until `run()` starts, and the caller is usually the same thread
     /// that would call `run()`, so it must fail fast instead of blocking.
     pub fn is_bound(&self) -> bool {
-        self.proxy.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some()
+        self.binding.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some()
+    }
+
+    /// Whether the caller is the thread that drains commands. Waiting for a reply on that
+    /// thread deadlocks: the drain cannot run until the caller returns.
+    pub fn on_event_loop_thread(&self) -> bool {
+        self.binding
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|binding| binding.thread == std::thread::current().id())
     }
 
     pub fn wake(&self) {
-        if let Some(proxy) = self.proxy.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() {
+        let proxy = self
+            .binding
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|binding| binding.proxy.clone());
+        if let Some(proxy) = proxy {
             let _ = proxy.send_event(());
         }
     }

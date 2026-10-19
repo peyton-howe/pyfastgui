@@ -190,7 +190,7 @@ impl super::ChromeRenderer {
         tree: &fastgui_core::widget::WidgetTree,
         width: u32,
         height: u32,
-        drop_indicator: Option<(super::WidgetRect, fastgui_core::widget::DropZone)>,
+        drop_preview: Option<super::WidgetRect>,
         scale: f32,
     ) -> Option<ChromeQuads<'_>> {
         let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
@@ -198,7 +198,7 @@ impl super::ChromeRenderer {
         let window = PixelRect { x: 0, y: 0, width, height };
 
         self.text_cache.generation += 1;
-        let items = self.build_items(tree, drop_indicator, scale, window);
+        let items = self.build_items(tree, drop_preview, scale, window);
         self.text_cache.evict();
 
         let gpu = &mut self.gpu;

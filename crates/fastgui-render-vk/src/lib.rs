@@ -2,6 +2,8 @@
 
 mod app;
 mod cuda_texture;
+#[cfg(all(test, windows))]
+mod cuda_test;
 mod error;
 mod pipeline;
 mod quad;

@@ -10,10 +10,19 @@ name = "_fastgui"
 crate-type = ["cdylib"]
 
 [dependencies]
+fastgui-app = { path = "../fastgui-app" }
 fastgui-core = { path = "../fastgui-core" }
 fastgui-interop-cuda = { path = "../fastgui-interop-cuda" }
+png = "0.17"
 pyo3 = { version = "0.29", features = ["extension-module"] }
 rfd = "0.15"
+zune-jpeg = "0.5.15"
+
+[features]
+# Stable-ABI build for GIL CPython (one `cp311-abi3` wheel covers 3.11+). Off by default so the
+# free-threaded build stays version-specific (`cp314t`): abi3t needs CPython 3.15+. The floor is
+# 3.11 because `PyBuffer` (Viewport.submit_frame, Image) is only in the limited API from 3.11.
+abi3 = ["pyo3/abi3-py311"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 fastgui-render-mtl = { path = "../fastgui-render-mtl" }

@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::{self, CStr};
-use std::sync::atomic::Ordering;
 
 use ash::{
     ext::debug_utils,
@@ -12,7 +11,7 @@ use fastgui_app::ViewportDraw;
 use fastgui_core::{ChromeFrame, ChromeQuads, CpuFrame, PixelRect};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
-use crate::cuda_texture::{CudaExportHandles, CudaSharedTexture};
+use crate::cuda_texture::{CudaExportHandles, CudaLayer};
 use crate::error::VkRendererError as Error;
 use crate::pipeline::ViewportPipeline;
 use crate::quad::{QuadChrome, QuadPipeline};
@@ -22,7 +21,7 @@ const FRAMES_IN_FLIGHT: usize = 2;
 
 enum GpuImage {
     Cpu(ViewportTexture),
-    Cuda(CudaSharedTexture),
+    Cuda(CudaLayer),
 }
 
 struct SampledLayer {
@@ -68,6 +67,9 @@ pub struct VulkanRenderer {
     // (both widely supported on Windows, but not guaranteed) — `create_cuda_surface` reports a
     // clear error instead of the device just failing to come up at all for everyone.
     cuda_interop: Option<CudaInteropLoaders>,
+    queue_family_index: u32,
+    /// `VkPhysicalDeviceIDProperties::deviceUUID`, handed to CUDA to find the same GPU.
+    device_uuid: [u8; 16],
 }
 
 struct CudaInteropLoaders {
@@ -209,6 +211,10 @@ impl VulkanRenderer {
                 .ok_or(Error::NoSuitablePhysicalDevice)?;
 
             let memory_properties = instance.get_physical_device_memory_properties(pdevice);
+            let mut id_properties = vk::PhysicalDeviceIDProperties::default();
+            let mut properties2 = vk::PhysicalDeviceProperties2::default().push_next(&mut id_properties);
+            instance.get_physical_device_properties2(pdevice, &mut properties2);
+            let device_uuid = id_properties.device_uuid;
 
             let available_device_extensions =
                 instance.enumerate_device_extension_properties(pdevice)?;
@@ -342,6 +348,8 @@ impl VulkanRenderer {
                 chrome: None,
                 layers: HashMap::new(),
                 cuda_interop,
+                queue_family_index,
+                device_uuid,
             };
 
             renderer.recreate_swapchain(width, height)?;
@@ -565,11 +573,12 @@ impl VulkanRenderer {
                 self.destroy_layer(old);
             }
             let loaders = self.cuda_interop.as_ref().expect("checked above");
-            let (texture, handles) = CudaSharedTexture::new(
+            let (texture, handles) = CudaLayer::new(
                 &self.device,
                 &loaders.external_memory_win32,
                 &loaders.external_semaphore_win32,
                 &self.memory_properties,
+                self.device_uuid,
                 width,
                 height,
             )?;
@@ -678,15 +687,28 @@ impl VulkanRenderer {
             // writes to the shader stage that samples them. `old_layout` starts at
             // `PREINITIALIZED` on first use and is `GENERAL` (a no-op layout-wise, but still a
             // real synchronization barrier) every frame after.
-            //
-            // CUDA-shared texture: no per-frame barrier at all needed here — cross-device
-            // visibility is what the timeline-semaphore wait below is *for*. Just the one-time
-            // UNDEFINED -> GENERAL transition every device-local image needs before its first
-            // use, since (unlike the CPU path) there's no HOST_VISIBLE memory to justify
-            // starting at PREINITIALIZED.
             let mut wait_semaphores = vec![self.image_available[self.frame]];
             let mut wait_stages = vec![vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let mut wait_values = vec![0u64];
+
+            // CUDA layers: copy the newest published slot into the sampled image, once CUDA's
+            // `ready` signal says it is written. Only for layers drawn this frame; a hidden
+            // layer's frame waits (or is replaced by a newer one) until it is shown.
+            let mut pickups = Vec::new();
+            for draw in viewports {
+                if let Some(SampledLayer { image: GpuImage::Cuda(layer), .. }) =
+                    self.layers.get_mut(&draw.viewport_id)
+                {
+                    if let Some((semaphore, value)) =
+                        layer.record_pickup(&self.device, cmd, self.queue_family_index)
+                    {
+                        wait_semaphores.push(semaphore);
+                        wait_stages.push(vk::PipelineStageFlags::TRANSFER);
+                        wait_values.push(value);
+                        pickups.push(draw.viewport_id);
+                    }
+                }
+            }
 
             if draw_chrome {
                 barriers.extend(self.quad_chrome.atlas_barrier(color_subresource));
@@ -695,9 +717,6 @@ impl VulkanRenderer {
                         &mut layer.image,
                         color_subresource,
                         &mut barriers,
-                        &mut wait_semaphores,
-                        &mut wait_stages,
-                        &mut wait_values,
                     );
                 }
             }
@@ -707,9 +726,6 @@ impl VulkanRenderer {
                         &mut layer.image,
                         color_subresource,
                         &mut barriers,
-                        &mut wait_semaphores,
-                        &mut wait_stages,
-                        &mut wait_values,
                     );
                 }
             }
@@ -769,9 +785,12 @@ impl VulkanRenderer {
             }
             for draw in viewports {
                 let Some(layer) = self.layers.get(&draw.viewport_id) else { continue };
+                if matches!(&layer.image, GpuImage::Cuda(cuda) if !cuda.has_content() && !pickups.contains(&draw.viewport_id)) {
+                    continue;
+                }
                 let (cw, ch) = match &layer.image {
                     GpuImage::Cpu(texture) => (texture.width, texture.height),
-                    GpuImage::Cuda(_) => (0, 0),
+                    GpuImage::Cuda(cuda) => cuda.size(),
                 };
                 let draw = draw.letterboxed(cw, ch);
                 let Some(([x, y, width, height], [sx, sy, sw, sh])) =
@@ -811,24 +830,43 @@ impl VulkanRenderer {
                 &[to_present],
             );
 
-            self.device.end_command_buffer(cmd)?;
-
-            let signal_semaphores = [self.render_finished[image_index as usize]];
+            // Every pickup's slot must be handed back however this ends, or its producer stalls.
+            let mut signal_semaphores = vec![self.render_finished[image_index as usize]];
+            let mut signal_values = vec![0u64];
+            for id in &pickups {
+                if let Some(SampledLayer { image: GpuImage::Cuda(layer), .. }) = self.layers.get(id) {
+                    if let Some((semaphore, value)) = layer.release_signal() {
+                        signal_semaphores.push(semaphore);
+                        signal_values.push(value);
+                    }
+                }
+            }
             let cmds = [cmd];
-            let mut timeline_info =
-                vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&wait_values);
+            let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
+                .wait_semaphore_values(&wait_values)
+                .signal_semaphore_values(&signal_values);
             let submit_info = vk::SubmitInfo::default()
                 .wait_semaphores(&wait_semaphores)
                 .wait_dst_stage_mask(&wait_stages)
                 .command_buffers(&cmds)
                 .signal_semaphores(&signal_semaphores)
                 .push_next(&mut timeline_info);
-            self.device.queue_submit(self.queue, &[submit_info], fence)?;
+            let submitted = self
+                .device
+                .end_command_buffer(cmd)
+                .and_then(|()| self.device.queue_submit(self.queue, &[submit_info], fence));
+            for id in &pickups {
+                if let Some(SampledLayer { image: GpuImage::Cuda(layer), .. }) = self.layers.get_mut(id) {
+                    layer.finish_submit(submitted.is_ok());
+                }
+            }
+            submitted?;
+            let signal_semaphores = &signal_semaphores[..1];
 
             let swapchains = [self.swapchain];
             let image_indices = [image_index];
             let present_info = vk::PresentInfoKHR::default()
-                .wait_semaphores(&signal_semaphores)
+                .wait_semaphores(signal_semaphores)
                 .swapchains(&swapchains)
                 .image_indices(&image_indices);
 
@@ -872,9 +910,6 @@ fn sync_sampled_image(
     image: &mut GpuImage,
     color_subresource: vk::ImageSubresourceRange,
     barriers: &mut Vec<vk::ImageMemoryBarrier<'_>>,
-    wait_semaphores: &mut Vec<vk::Semaphore>,
-    wait_stages: &mut Vec<vk::PipelineStageFlags>,
-    wait_values: &mut Vec<u64>,
 ) {
     match image {
         GpuImage::Cpu(texture) => {
@@ -891,28 +926,8 @@ fn sync_sampled_image(
             );
             texture.current_layout = vk::ImageLayout::GENERAL;
         }
-        GpuImage::Cuda(texture) => {
-            if texture.current_layout == vk::ImageLayout::UNDEFINED {
-                barriers.push(
-                    vk::ImageMemoryBarrier::default()
-                        .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::GENERAL)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(texture.image)
-                        .subresource_range(color_subresource)
-                        .dst_access_mask(vk::AccessFlags::SHADER_READ),
-                );
-                texture.current_layout = vk::ImageLayout::GENERAL;
-            }
-            let target = texture.target_value.load(Ordering::Acquire);
-            if target > texture.last_waited_value {
-                wait_semaphores.push(texture.semaphore);
-                wait_stages.push(vk::PipelineStageFlags::FRAGMENT_SHADER);
-                wait_values.push(target);
-                texture.last_waited_value = target;
-            }
-        }
+        // Synchronized by its own pickup barriers (`CudaLayer::record_pickup`).
+        GpuImage::Cuda(_) => {}
     }
 }
 

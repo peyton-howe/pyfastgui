@@ -1,16 +1,51 @@
 [build-system]
-requires = ["maturin>=1.7,<2.0"]
+requires = ["maturin>=1.9,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "fastgui"
+# Distribution name is `pyfastgui` (`fastgui` on PyPI is an unrelated project); the import name
+# stays `fastgui`.
+name = "pyfastgui"
 version = "0.0.1"
 description = "Lightweight, GPU-native, no-GIL-safe Python GUI toolkit"
-requires-python = ">=3.10"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "Peyton Howe" }]
+# 3.11 is the floor of the abi3 wheel: PyBuffer is only in the limited API from 3.11.
+requires-python = ">=3.11"
+keywords = ["gui", "gpu", "vulkan", "metal", "free-threading", "widgets"]
 classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Free Threading :: 2 - Beta",
     "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: User Interfaces",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Typing :: Typed",
 ]
+
+[project.optional-dependencies]
+# Examples and tests feed numpy arrays; the toolkit itself only needs the buffer protocol.
+examples = ["numpy"]
+test = ["pytest", "numpy"]
+
+[project.urls]
+Homepage = "https://github.com/peyton-howe/pyfastgui"
+Repository = "https://github.com/peyton-howe/pyfastgui"
+Issues = "https://github.com/peyton-howe/pyfastgui/issues"
+Documentation = "https://github.com/peyton-howe/pyfastgui/blob/main/docs/ARCHITECTURE.md"
 
 [tool.maturin]
 manifest-path = "crates/fastgui-py/Cargo.toml"

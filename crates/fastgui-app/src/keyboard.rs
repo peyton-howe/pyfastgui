@@ -362,7 +362,7 @@ fn handle_menu_popup_keys(tree: &mut WidgetTree, press: &KeyPress<'_>) -> bool {
                     on_click: Some(_),
                     ..
                 })
-            )
+            ) && !tree.is_disabled(id)
         })
         .collect();
     if buttons.is_empty() {

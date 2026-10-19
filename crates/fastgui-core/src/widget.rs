@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use taffy::prelude::*;
 
+use crate::dnd::{DragOrigin, DragSource, DropHit, DropPosition, DropTarget, FileDropCallback, TreePlace, INSERT_LINE};
 use crate::text_edit::{TextEdit, TextMeasure};
 use crate::{FrameSlot, Readback};
 
@@ -406,6 +407,95 @@ impl TreeData {
     }
 
     /// Resolve a child-index path to a node id.
+    /// This tree with the node at `source` (and its subtree) moved before, inside (as the last
+    /// child), or after the node at `target`, plus `expanded` and `selected` carried over to the
+    /// new ids: every node keeps its own expand / selection state, and an `Inside` target is
+    /// expanded so the moved node shows. `None` when either path doesn't resolve or `target` is
+    /// `source` or inside it.
+    pub fn moved(
+        &self,
+        expanded: &HashSet<u32>,
+        selected: Option<u32>,
+        source: &[u32],
+        target: &[u32],
+        place: TreePlace,
+    ) -> Option<(TreeData, HashSet<u32>, Option<u32>)> {
+        struct Item {
+            label: String,
+            expanded: bool,
+            selected: bool,
+            target: bool,
+            children: Vec<Item>,
+        }
+        fn nest(data: &TreeData, id: u32, expanded: &HashSet<u32>, selected: Option<u32>, target: u32) -> Item {
+            let node = &data.nodes[id as usize];
+            Item {
+                label: node.label.clone(),
+                expanded: expanded.contains(&id),
+                selected: selected == Some(id),
+                target: id == target,
+                children: node.children.iter().map(|&c| nest(data, c, expanded, selected, target)).collect(),
+            }
+        }
+        /// The list holding the item at `path`, and its index there.
+        fn slot<'a>(items: &'a mut Vec<Item>, path: &[usize]) -> (&'a mut Vec<Item>, usize) {
+            let (&last, parents) = path.split_last().expect("non-empty path");
+            let mut list = items;
+            for &i in parents {
+                list = &mut list[i].children;
+            }
+            (list, last)
+        }
+        fn find_target(items: &[Item], prefix: &mut Vec<usize>) -> bool {
+            for (i, item) in items.iter().enumerate() {
+                prefix.push(i);
+                if item.target || find_target(&item.children, prefix) {
+                    return true;
+                }
+                prefix.pop();
+            }
+            false
+        }
+        fn flatten(items: &[Item]) -> Vec<TreeNodeData> {
+            items.iter().map(|item| TreeNodeData { label: item.label.clone(), children: flatten(&item.children) }).collect()
+        }
+        /// Preorder flags, matching `from_nested`'s id order.
+        fn preorder(items: &[Item], flags: &mut Vec<(bool, bool)>) {
+            for item in items {
+                flags.push((item.expanded, item.selected));
+                preorder(&item.children, flags);
+            }
+        }
+
+        self.id_at_path(source)?;
+        let target_id = self.id_at_path(target)?;
+        if target.starts_with(source) {
+            return None;
+        }
+        let mut items: Vec<Item> = self.roots.iter().map(|&r| nest(self, r, expanded, selected, target_id)).collect();
+        let source: Vec<usize> = source.iter().map(|&i| i as usize).collect();
+        let (list, index) = slot(&mut items, &source);
+        let moving = list.remove(index);
+        let mut at = Vec::new();
+        find_target(&items, &mut at);
+        let (list, index) = slot(&mut items, &at);
+        match place {
+            TreePlace::Before => list.insert(index, moving),
+            TreePlace::After => list.insert(index + 1, moving),
+            TreePlace::Inside => {
+                list[index].expanded = true;
+                list[index].children.push(moving);
+            }
+        }
+
+        let roots = flatten(&items);
+        let mut flags = Vec::new();
+        preorder(&items, &mut flags);
+        let expanded = flags.iter().enumerate().filter(|(_, f)| f.0).map(|(i, _)| i as u32).collect();
+        let selected = flags.iter().position(|f| f.1).map(|i| i as u32);
+        Some((TreeData::from_nested(&roots), expanded, selected))
+    }
+
     pub fn id_at_path(&self, path: &[u32]) -> Option<u32> {
         let (&first, rest) = path.split_first()?;
         let mut id = *self.roots.get(first as usize)?;
@@ -868,11 +958,28 @@ impl WidgetKind {
                 | WidgetKind::ComboBox { .. }
         )
     }
+
+    /// Whether chrome draws a hover state layer over this widget while the cursor is on it:
+    /// controls you click as a whole. Lists, tables and trees are left out (a whole-widget
+    /// tint would read as a selection), as are text fields.
+    pub fn is_hoverable(&self) -> bool {
+        matches!(
+            self,
+            WidgetKind::Button { .. }
+                | WidgetKind::Slider { .. }
+                | WidgetKind::Checkbox { .. }
+                | WidgetKind::Radio { .. }
+                | WidgetKind::Toggle { .. }
+                | WidgetKind::SpinBox { .. }
+                | WidgetKind::NumericScrub { .. }
+                | WidgetKind::ComboBox { .. }
+        )
+    }
 }
 
 /// An axis-aligned rect in window (physical pixel) coordinates — a widget's absolute position
 /// after `compute_layout`, unlike taffy's own `Layout::location`, which is parent-relative.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
@@ -1036,6 +1143,15 @@ pub struct WidgetTree {
     accelerators: Vec<(Option<WidgetId>, Accel, ClickCallback)>,
     /// Widget under the cursor (for hover fills). Cleared on `reset`.
     hovered: Option<WidgetId>,
+    /// Row of `hovered` under the cursor when it's a `ListView` / `Table` / `TreeView` (a
+    /// `TreeView` row is its index among the visible rows).
+    hovered_row: Option<usize>,
+    /// Widgets set disabled (`set_disabled`); their whole subtree is disabled with them.
+    disabled: HashSet<WidgetId>,
+    /// Drag-and-drop side tables (`set_drag_source`, `set_drop_target`, `set_file_drop`).
+    drag_sources: HashMap<WidgetId, DragSource>,
+    drop_targets: HashMap<WidgetId, DropTarget>,
+    file_drops: HashMap<WidgetId, FileDropCallback>,
 }
 
 /// Always fills the window: whatever `Window.set_content(widget)` was given becomes this
@@ -1068,6 +1184,11 @@ impl WidgetTree {
             hover_actions: HashMap::new(),
             accelerators: Vec::new(),
             hovered: None,
+            hovered_row: None,
+            disabled: HashSet::new(),
+            drag_sources: HashMap::new(),
+            drop_targets: HashMap::new(),
+            file_drops: HashMap::new(),
         }
     }
 
@@ -1111,6 +1232,11 @@ impl WidgetTree {
         self.hover_actions.clear();
         self.accelerators.clear();
         self.hovered = None;
+        self.hovered_row = None;
+        self.disabled.clear();
+        self.drag_sources.clear();
+        self.drop_targets.clear();
+        self.file_drops.clear();
         self.root = self.taffy.new_leaf(root_style()).expect("creating the root node cannot fail");
         self.kinds.insert(self.root, WidgetKind::Container { background: Color::TRANSPARENT, region_id: None });
         self.focused = None;
@@ -1870,7 +1996,7 @@ impl WidgetTree {
         self.add_child(root, id);
         build(self, id);
         if steal_focus {
-            let first = self.walk_from(id).find(|&n| self.kind(n).is_some_and(WidgetKind::is_focusable));
+            let first = self.walk_from(id).find(|&n| self.can_focus(n));
             self.focused = first;
         }
         id
@@ -1896,6 +2022,10 @@ impl WidgetTree {
             self.tooltips.remove(&node);
             self.context_menus.remove(&node);
             self.hover_actions.remove(&node);
+            self.disabled.remove(&node);
+            self.drag_sources.remove(&node);
+            self.drop_targets.remove(&node);
+            self.file_drops.remove(&node);
         }
         let _ = self.taffy.remove_child(self.root, id);
         remove_subtree(&mut self.taffy, id);
@@ -1940,14 +2070,49 @@ impl WidgetTree {
         self.hovered
     }
 
-    /// Update the hovered widget. Returns whether it changed (caller should redraw).
+    /// Update the hovered widget (keyboard menu navigation: no row). Returns whether it changed
+    /// (caller should redraw).
     pub fn set_hovered(&mut self, id: Option<WidgetId>) -> bool {
-        if self.hovered == id {
+        if self.hovered == id && self.hovered_row.is_none() {
             return false;
         }
         self.hovered = id;
+        self.hovered_row = None;
         self.mark_dirty();
         true
+    }
+
+    /// The cursor is at `(x, y)` over widget `id`: hover it, and the row under the cursor when
+    /// it's a list, table or tree. Returns whether either changed — moving within one row
+    /// doesn't rebuild chrome.
+    pub fn set_hovered_at(&mut self, id: Option<WidgetId>, x: f32, y: f32) -> bool {
+        let row = id.and_then(|id| self.row_at(id, x, y));
+        if self.hovered == id && self.hovered_row == row {
+            return false;
+        }
+        self.hovered = id;
+        self.hovered_row = row;
+        self.mark_dirty();
+        true
+    }
+
+    /// The hovered row of `id`, if `id` is the hovered list / table / tree.
+    pub fn hovered_row(&self, id: WidgetId) -> Option<usize> {
+        self.hovered_row.filter(|_| self.hovered == Some(id))
+    }
+
+    /// The row of list / table / tree `id` at `(x, y)`; `None` for other widgets.
+    fn row_at(&self, id: WidgetId, _x: f32, y: f32) -> Option<usize> {
+        match self.kind(id)? {
+            WidgetKind::ListView { .. } => self.list_row_at(id, y),
+            WidgetKind::Table { .. } => self.table_row_at(id, y),
+            WidgetKind::TreeView { row_height, scroll, .. } if *row_height > 0.0 => {
+                let rect = self.absolute_rect(id)?;
+                let row = ((y - rect.y + scroll) / row_height).floor();
+                (row >= 0.0 && (row as usize) < self.tree_visible_ids(id).len()).then_some(row as usize)
+            }
+            _ => None,
+        }
     }
 
     /// Set or clear the right-click handler for `id` (window coordinates).
@@ -1977,8 +2142,12 @@ impl WidgetTree {
         self.accelerators.push((Some(owner), accel, callback));
     }
 
+    /// Shortcuts whose owning widget (if any) isn't disabled.
     pub fn accelerators(&self) -> impl Iterator<Item = (&Accel, &ClickCallback)> {
-        self.accelerators.iter().map(|(_, accel, callback)| (accel, callback))
+        self.accelerators
+            .iter()
+            .filter(|(owner, _, _)| owner.is_none_or(|o| !self.is_disabled(o)))
+            .map(|(_, accel, callback)| (accel, callback))
     }
 
     /// Close the topmost popup as the user did (outside click, Escape): fires its `on_dismiss`.
@@ -2177,11 +2346,162 @@ impl WidgetTree {
         self.focused
     }
 
+    /// Focusable kind and not disabled.
+    fn can_focus(&self, id: WidgetId) -> bool {
+        self.kind(id).is_some_and(WidgetKind::is_focusable) && !self.is_disabled(id)
+    }
+
+    /// Disable (or re-enable) `id` and everything inside it: no presses, focus, drags, hover
+    /// actions, context menus or shortcuts, and chrome dims it. Scrolling still works. Focus
+    /// inside a subtree being disabled is dropped.
+    pub fn set_disabled(&mut self, id: WidgetId, disabled: bool) {
+        let changed = if disabled { self.disabled.insert(id) } else { self.disabled.remove(&id) };
+        if !changed {
+            return;
+        }
+        if disabled && self.focused.is_some_and(|f| self.is_disabled(f)) {
+            self.focused = None;
+        }
+        self.mark_dirty();
+    }
+
+    /// Whether `id` or any ancestor is disabled.
+    pub fn is_disabled(&self, id: WidgetId) -> bool {
+        if self.disabled.is_empty() {
+            return false;
+        }
+        let mut node = Some(id);
+        while let Some(current) = node {
+            if self.disabled.contains(&current) {
+                return true;
+            }
+            node = self.parent(current);
+        }
+        false
+    }
+
+    /// Whether `id` is the outermost disabled widget of its subtree (chrome veils each such
+    /// subtree once).
+    pub fn is_disabled_root(&self, id: WidgetId) -> bool {
+        self.disabled.contains(&id) && self.parent(id).is_none_or(|p| !self.is_disabled(p))
+    }
+
+    pub fn set_drag_source(&mut self, id: WidgetId, source: Option<DragSource>) {
+        match source {
+            Some(source) => self.drag_sources.insert(id, source),
+            None => self.drag_sources.remove(&id),
+        };
+    }
+
+    pub fn set_drop_target(&mut self, id: WidgetId, target: Option<DropTarget>) {
+        match target {
+            Some(target) => self.drop_targets.insert(id, target),
+            None => self.drop_targets.remove(&id),
+        };
+    }
+
+    pub fn set_file_drop(&mut self, id: WidgetId, callback: Option<FileDropCallback>) {
+        match callback {
+            Some(callback) => self.file_drops.insert(id, callback),
+            None => self.file_drops.remove(&id),
+        };
+    }
+
+    pub fn drop_target(&self, id: WidgetId) -> Option<&DropTarget> {
+        self.drop_targets.get(&id)
+    }
+
+    /// The nearest ancestor-or-self of `id` that `has` matches, unless that one is disabled.
+    fn nearest(&self, id: WidgetId, has: impl Fn(WidgetId) -> bool) -> Option<WidgetId> {
+        let mut node = Some(id);
+        while let Some(current) = node {
+            if has(current) {
+                return (!self.is_disabled(current)).then_some(current);
+            }
+            node = self.parent(current);
+        }
+        None
+    }
+
+    /// The drag a press at `(x, y)` would start: the source widget, where in it, and its source.
+    /// A press on a `TreeView`'s expand gutter or below a list's last row starts none.
+    pub fn drag_origin_at(&self, x: f32, y: f32) -> Option<(WidgetId, DragOrigin, &DragSource)> {
+        let hit = self.hit_test(x, y)?;
+        let id = self.nearest(hit, |id| self.drag_sources.contains_key(&id))?;
+        let origin = match self.kind(id)? {
+            WidgetKind::ListView { .. } => DragOrigin::Row(self.list_row_at(id, y)?),
+            WidgetKind::TreeView { data, .. } => {
+                let (node, in_gutter) = self.tree_hit(id, x, y)?;
+                if in_gutter {
+                    return None;
+                }
+                DragOrigin::Node(data.path_of(node))
+            }
+            _ => DragOrigin::Widget,
+        };
+        Some((id, origin, &self.drag_sources[&id]))
+    }
+
+    /// The drop target accepting `tag` under `(x, y)`, where the drop would land in it, and the
+    /// rect the drop preview should highlight. Disabled targets take nothing.
+    pub fn drop_target_at(&self, x: f32, y: f32, tag: &str) -> Option<DropHit> {
+        let hit = self.hit_test(x, y)?;
+        let target = self.nearest(hit, |id| self.drop_targets.get(&id).is_some_and(|t| t.accepts(tag)))?;
+        let rect = self.absolute_rect(target)?;
+        let clip = self.clip_rect(target).map_or(rect, |c| c.intersect(&rect));
+        let line = |y: f32| Rect { x: rect.x, y: y - INSERT_LINE / 2.0, width: rect.width, height: INSERT_LINE }.intersect(&clip);
+        let (position, preview) = match self.kind(target)? {
+            WidgetKind::ListView { items, row_height, scroll, .. } if *row_height > 0.0 => {
+                let gap = ((y - rect.y + scroll) / row_height).round().clamp(0.0, items.len() as f32) as usize;
+                (DropPosition::ListGap(gap), line(rect.y - scroll + gap as f32 * row_height))
+            }
+            WidgetKind::TreeView { data, expanded, row_height, scroll, .. } if *row_height > 0.0 => {
+                let visible = data.visible_ids(&expanded.lock().unwrap_or_else(|p| p.into_inner()));
+                if visible.is_empty() {
+                    return Some(DropHit { target, position: DropPosition::Widget { x: x - rect.x, y: y - rect.y }, preview: clip });
+                }
+                let fraction = (y - rect.y + scroll) / row_height;
+                let (row, place) = if fraction >= visible.len() as f32 {
+                    // Below the last row: after it.
+                    (visible.len() - 1, TreePlace::After)
+                } else {
+                    let row = fraction.floor().max(0.0) as usize;
+                    let within = fraction - row as f32;
+                    let place = if within < 0.25 {
+                        TreePlace::Before
+                    } else if within > 0.75 {
+                        TreePlace::After
+                    } else {
+                        TreePlace::Inside
+                    };
+                    (row, place)
+                };
+                let top = rect.y - scroll + row as f32 * row_height;
+                let preview = match place {
+                    TreePlace::Before => line(top),
+                    TreePlace::After => line(top + row_height),
+                    TreePlace::Inside => Rect { x: rect.x, y: top, width: rect.width, height: *row_height }.intersect(&clip),
+                };
+                (DropPosition::TreeNode { path: data.path_of(visible[row]), place }, preview)
+            }
+            _ => (DropPosition::Widget { x: x - rect.x, y: y - rect.y }, clip),
+        };
+        Some(DropHit { target, position, preview })
+    }
+
+    /// The file-drop handler for a drop at `(x, y)`, with the point in that widget's coordinates.
+    pub fn file_drop_at(&self, x: f32, y: f32) -> Option<(FileDropCallback, f32, f32)> {
+        let hit = self.hit_test(x, y)?;
+        let id = self.nearest(hit, |id| self.file_drops.contains_key(&id))?;
+        let rect = self.absolute_rect(id)?;
+        Some((self.file_drops[&id].clone(), x - rect.x, y - rect.y))
+    }
+
     /// Give `id` keyboard focus (`None` clears it). Ignores ids that aren't focusable, so a
     /// click on a label or background just clears focus. Marks dirty only on a change, since
     /// the focus ring is chrome.
     pub fn set_focus(&mut self, id: Option<WidgetId>) {
-        let id = id.filter(|&id| self.kind(id).is_some_and(WidgetKind::is_focusable));
+        let id = id.filter(|&id| self.can_focus(id));
         if id != self.focused {
             self.focused = id;
             self.dirty = true;
@@ -2196,7 +2516,7 @@ impl WidgetTree {
         let scope = self.topmost_popup().unwrap_or(self.root);
         let order: Vec<WidgetId> = self
             .walk_from(scope)
-            .filter(|&id| self.kind(id).is_some_and(WidgetKind::is_focusable))
+            .filter(|&id| self.can_focus(id))
             .filter(|&id| self.absolute_rect(id).is_some_and(|r| r.width > 0.0 && r.height > 0.0))
             .collect();
         if order.is_empty() {
@@ -3990,5 +4310,192 @@ mod tests {
         let s = Accel::parse("Ctrl+Shift+Enter").unwrap();
         assert!(s.primary && s.shift && s.key == AccelKey::Named(AccelNamed::Enter));
         assert!(Accel::parse("Ctrl+Bogus").is_none());
+    }
+
+    /// A 300×300 window with a 200×100 box holding two 60×20 buttons side by side.
+    fn box_with_buttons() -> (WidgetTree, WidgetId, WidgetId, WidgetId) {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let container = tree.new_node(
+            Style {
+                flex_direction: FlexDirection::Row,
+                size: Size { width: Dimension::length(200.0), height: Dimension::length(100.0) },
+                ..Default::default()
+            },
+            WidgetKind::Container { background: Color::TRANSPARENT, region_id: None },
+        );
+        tree.add_child(root, container);
+        let a = sized_button(&mut tree, 60.0, 20.0);
+        let b = sized_button(&mut tree, 60.0, 20.0);
+        tree.add_child(container, a);
+        tree.add_child(container, b);
+        tree.compute_layout(300.0, 300.0);
+        (tree, container, a, b)
+    }
+
+    #[test]
+    fn disabling_a_container_disables_its_subtree_for_focus() {
+        let (mut tree, container, a, b) = box_with_buttons();
+        tree.set_focus(Some(a));
+        assert_eq!(tree.focused(), Some(a));
+        tree.set_disabled(container, true);
+        assert!(tree.is_disabled(a) && tree.is_disabled(b), "inherited from the container");
+        assert!(tree.is_disabled_root(container) && !tree.is_disabled_root(a));
+        assert_eq!(tree.focused(), None, "focus inside a disabled subtree is dropped");
+        tree.set_focus(Some(b));
+        assert_eq!(tree.focused(), None, "disabled widgets can't take focus");
+        assert_eq!(tree.focus_next(false), None, "Tab skips them");
+
+        tree.set_disabled(container, false);
+        tree.set_disabled(a, true);
+        assert_eq!(tree.focus_next(false), Some(b), "Tab skips only the disabled button");
+        assert_eq!(tree.focus_next(false), Some(b), "and wraps past it");
+    }
+
+    #[test]
+    fn a_disabled_owner_mutes_its_shortcuts() {
+        let (mut tree, container, a, _) = box_with_buttons();
+        tree.register_accelerator(Accel::parse("Ctrl+S").unwrap(), Arc::new(|| {}));
+        tree.register_accelerator_for(a, Accel::parse("Ctrl+K").unwrap(), Arc::new(|| {}));
+        assert_eq!(tree.accelerators().count(), 2);
+        tree.set_disabled(container, true);
+        let left: Vec<_> = tree.accelerators().map(|(accel, _)| accel.clone()).collect();
+        assert_eq!(left, vec![Accel::parse("Ctrl+S").unwrap()]);
+    }
+
+    fn noop_drop() -> crate::dnd::DropTarget {
+        crate::dnd::DropTarget { accepts: vec!["row".into()], on_drop: Arc::new(|_| {}) }
+    }
+
+    fn noop_source() -> crate::dnd::DragSource {
+        crate::dnd::DragSource { tag: "row".into(), data: Arc::new(|_| Some(Vec::new())) }
+    }
+
+    #[test]
+    fn list_drops_land_in_the_nearest_gap() {
+        let (mut tree, list, _, _) = list_tree(3);
+        tree.set_drop_target(list, Some(noop_drop()));
+        let hit = tree.drop_target_at(10.0, 31.0, "row").unwrap();
+        assert_eq!(hit.target, list);
+        assert_eq!(hit.position, DropPosition::ListGap(2), "31 is nearer the gap at 40 than at 20");
+        assert_eq!(hit.preview, Rect { x: 0.0, y: 39.0, width: 150.0, height: INSERT_LINE });
+        assert_eq!(tree.drop_target_at(10.0, 8.0, "row").unwrap().position, DropPosition::ListGap(0));
+        assert_eq!(tree.drop_target_at(10.0, 95.0, "row").unwrap().position, DropPosition::ListGap(3), "past the end appends");
+        assert!(tree.drop_target_at(10.0, 31.0, "file").is_none(), "only accepted tags");
+        assert!(tree.drop_target_at(250.0, 31.0, "row").is_none(), "outside the list");
+        tree.set_disabled(list, true);
+        assert!(tree.drop_target_at(10.0, 31.0, "row").is_none(), "a disabled target takes nothing");
+    }
+
+    #[test]
+    fn list_drags_start_on_a_row() {
+        let (mut tree, list, _, _) = list_tree(3);
+        assert!(tree.drag_origin_at(10.0, 45.0).is_none(), "not a drag source yet");
+        tree.set_drag_source(list, Some(noop_source()));
+        let (id, origin, source) = tree.drag_origin_at(10.0, 45.0).unwrap();
+        assert_eq!((id, origin, source.tag.as_str()), (list, DragOrigin::Row(2), "row"));
+        assert!(tree.drag_origin_at(10.0, 70.0).is_none(), "below the last row");
+        tree.set_disabled(list, true);
+        assert!(tree.drag_origin_at(10.0, 45.0).is_none(), "a disabled source doesn't drag");
+    }
+
+    #[test]
+    fn tree_drops_go_before_inside_or_after_a_node() {
+        let mut tree = WidgetTree::new();
+        let root = tree.root();
+        let view = tree.new_node(
+            Style { size: Size { width: Dimension::length(200.0), height: Dimension::length(100.0) }, ..Default::default() },
+            WidgetKind::TreeView {
+                data: Arc::new(sample_tree_data()),
+                expanded: Arc::new(std::sync::Mutex::new(HashSet::new())),
+                row_height: 20.0,
+                font_size: 14.0,
+                scroll: 0.0,
+                selected: None,
+                text_color: Color::TRANSPARENT,
+                background: Color::TRANSPARENT,
+                selection_color: Color::TRANSPARENT,
+                on_select: None,
+                on_activate: None,
+                mirror: None,
+            },
+        );
+        tree.add_child(root, view);
+        tree.compute_layout(300.0, 300.0);
+        tree.set_drop_target(view, Some(noop_drop()));
+        // Collapsed: two rows, Sensors [0] at 0..20 and Logs [1] at 20..40.
+        let at = |tree: &WidgetTree, y| tree.drop_target_at(100.0, y, "row").unwrap();
+        let node = |path: &[u32], place| DropPosition::TreeNode { path: path.to_vec(), place };
+        assert_eq!(at(&tree, 2.0).position, node(&[0], TreePlace::Before));
+        assert_eq!(at(&tree, 10.0).position, node(&[0], TreePlace::Inside));
+        assert_eq!(at(&tree, 10.0).preview, Rect { x: 0.0, y: 0.0, width: 200.0, height: 20.0 });
+        assert_eq!(at(&tree, 18.0).position, node(&[0], TreePlace::After));
+        assert_eq!(at(&tree, 18.0).preview.y, 20.0 - INSERT_LINE / 2.0);
+        assert_eq!(at(&tree, 30.0).position, node(&[1], TreePlace::Inside));
+        assert_eq!(at(&tree, 80.0).position, node(&[1], TreePlace::After), "below the rows: after the last");
+
+        tree.set_drag_source(view, Some(noop_source()));
+        assert_eq!(tree.drag_origin_at(100.0, 25.0).unwrap().1, DragOrigin::Node(vec![1]));
+        assert!(tree.drag_origin_at(TREE_GUTTER / 2.0, 5.0).is_none(), "the expand gutter doesn't drag");
+    }
+
+    #[test]
+    fn file_drops_find_the_nearest_handler_with_local_coordinates() {
+        let (mut tree, container, a, _) = box_with_buttons();
+        let local = tree.absolute_rect(a).unwrap();
+        assert!(tree.file_drop_at(local.x + 5.0, local.y + 5.0).is_none());
+        tree.set_file_drop(container, Some(Arc::new(|_, _, _| {})));
+        let (_, x, y) = tree.file_drop_at(local.x + 5.0, local.y + 5.0).expect("the box takes it from its button");
+        let origin = tree.absolute_rect(container).unwrap();
+        assert_eq!((x, y), (local.x + 5.0 - origin.x, local.y + 5.0 - origin.y));
+        tree.reset();
+        assert!(tree.file_drop_at(5.0, 5.0).is_none(), "reset clears the handlers");
+    }
+
+    #[test]
+    fn row_hover_follows_the_cursor_without_rebuilding_within_a_row() {
+        let (mut tree, list, _, _) = list_tree(3);
+        assert!(tree.set_hovered_at(Some(list), 10.0, 25.0));
+        assert_eq!(tree.hovered_row(list), Some(1));
+        tree.clear_dirty();
+        assert!(!tree.set_hovered_at(Some(list), 40.0, 35.0), "same row: nothing to redraw");
+        assert!(!tree.is_dirty());
+        assert!(tree.set_hovered_at(Some(list), 10.0, 45.0));
+        assert_eq!(tree.hovered_row(list), Some(2));
+        assert!(tree.set_hovered_at(Some(list), 10.0, 75.0), "below the last row");
+        assert_eq!(tree.hovered_row(list), None);
+        tree.set_hovered_at(Some(list), 10.0, 5.0);
+        tree.set_hovered(Some(list));
+        assert_eq!(tree.hovered_row(list), None, "keyboard hover carries no row");
+    }
+
+    #[test]
+    fn moving_a_tree_node_keeps_expand_and_selection_state() {
+        let data = sample_tree_data(); // Sensors[Camera, IMU[accel, gyro]], Logs
+        let expanded: HashSet<u32> = [0, 2].into(); // Sensors and IMU open
+        let gyro = data.id_at_path(&[0, 1, 1]);
+        // Move IMU (open, with gyro selected inside) into Logs.
+        let (moved, expanded, selected) = data.moved(&expanded, gyro, &[0, 1], &[1], TreePlace::Inside).unwrap();
+        let label = |path: &[u32]| moved.nodes[moved.id_at_path(path).unwrap() as usize].label.clone();
+        assert_eq!(label(&[0]), "Sensors");
+        assert_eq!(label(&[0, 0]), "Camera");
+        assert_eq!(label(&[1]), "Logs");
+        assert_eq!(label(&[1, 0]), "IMU");
+        assert_eq!(label(&[1, 0, 1]), "gyro");
+        let id = |path: &[u32]| moved.id_at_path(path).unwrap();
+        assert!(expanded.contains(&id(&[0])), "Sensors stays open");
+        assert!(expanded.contains(&id(&[1, 0])), "IMU stays open where it landed");
+        assert!(expanded.contains(&id(&[1])), "Logs opens to show the dropped node");
+        assert_eq!(selected, Some(id(&[1, 0, 1])), "gyro stays selected");
+
+        // Before / after reorder siblings; a node can't go into its own subtree.
+        let none = HashSet::new();
+        let (before, _, _) = data.moved(&none, None, &[1], &[0], TreePlace::Before).unwrap();
+        assert_eq!(before.nodes[before.roots[0] as usize].label, "Logs");
+        let (after, _, _) = data.moved(&none, None, &[0, 0], &[0, 1], TreePlace::After).unwrap();
+        assert_eq!(after.nodes[after.id_at_path(&[0, 1]).unwrap() as usize].label, "Camera");
+        assert!(data.moved(&none, None, &[0], &[0, 1], TreePlace::Inside).is_none());
+        assert!(data.moved(&none, None, &[0], &[0], TreePlace::After).is_none());
+        assert!(data.moved(&none, None, &[9], &[0], TreePlace::After).is_none());
     }
 }

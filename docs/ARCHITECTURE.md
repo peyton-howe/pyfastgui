@@ -43,13 +43,15 @@ crates/
     src/pipeline.rs           ViewportPipeline: fullscreen-triangle shaders + descriptor set
     src/quad.rs               QuadPipeline + QuadChrome (atlas + instance buffers)
     src/texture.rs            ViewportTexture: host-visible LINEAR CPU-upload texture
-    src/cuda_texture.rs       CudaSharedTexture: exportable image + timeline semaphore (CUDA
-                              interop, see below); re-exports CudaExportHandles from fastgui-app
+    src/cuda_texture.rs       CudaLayer: exported slot buffer + ready/release timeline
+                              semaphores + sampled image (CUDA interop, see below)
+    src/cuda_test.rs          Headless GPU test of CudaLayer, with Vulkan standing in for CUDA
     shaders/                  viewport + quad .vert/.frag source + precompiled .spv (checked in,
                               so a plain build doesn't need the Vulkan SDK)
 
   fastgui-render-mtl/     The Metal GPU backend (macOS). Thin `run()` wrapper with Immediate
-                          resize. No CUDA — Viewport.create_cuda_surface raises in Python.
+                          resize. No CUDA interop — submit_cuda host-copies, create_cuda_surface
+                          raises.
     src/renderer.rs          MetalRenderer (+ SurfaceBackend impl): CAMetalLayer, chrome quads
                               or replaceRegion CPU chrome, viewport layers
     src/app.rs                run() → fastgui_app::run::<MetalRenderer>(…, Immediate)
@@ -65,18 +67,20 @@ crates/
     examples/chrome_bench.rs  Layout/build/copy timings for cpu and gpu paths: dock tree + table
     src/gpu.rs                Atlas packer + quad builder + CPU shader emulate for tests
 
-  fastgui-interop-cuda/   Raw CUDA driver API FFI (struct layouts transcribed from NVIDIA's own
-                          cuda-python bindings generator), dynamically loading nvcuda.dll via
-                          libloading so the crate builds and runs fine with no CUDA installed
-                          at all — it only fails at the call site, gracefully, if invoked
-                          without a working CUDA driver.
+  fastgui-interop-cuda/   Raw CUDA driver API FFI (layouts from NVIDIA's cuda-python bindings,
+                          offsets asserted against them) plus safe wrappers: primary contexts
+                          (push/pop, never clobbering the caller's), streams, event ordering,
+                          2D copies, host callbacks, external memory/semaphore import. Loads
+                          nvcuda.dll / libcuda.so.1 at runtime, so it builds and runs with no
+                          CUDA installed and fails cleanly at the call site.
 
   fastgui-py/             PyO3 bindings — the only crate that knows about Python.
     src/theme.rs              fg.Theme (named colors) + the process-wide current theme; pushes
                               chrome's own colors to fastgui-core::theme
     src/backend.rs            cfg-picks fastgui-render-mtl on macOS, fastgui-render-vk elsewhere
-    src/lib.rs                Window, Viewport, CudaSurface pyclasses (create_cuda_surface is a
-                              RuntimeError stub on macOS)
+    src/lib.rs                Window and Viewport pyclasses
+    src/cuda.rs               Viewport.submit_cuda / create_cuda_surface, CudaSurface, CudaFrame:
+                              __cuda_array_interface__ parsing, interop and host-copy paths
     src/widgets.rs             Label/Button/Slider/Box/Splitter/Panel/Tabs pyclasses, the
                               DescribedWidget tree-building/attach machinery
 
@@ -111,9 +115,9 @@ Three different primitives exist because three different delivery guarantees are
   should never queue up behind a slower consumer. Only the *latest* submitted frame matters;
   anything superseded before the render thread got to it is simply dropped.
 - **`oneshot_channel`** (`fastgui-core::queue`, a bounded-1 `crossbeam-channel`): for the rare
-  call that needs a synchronous reply from the render thread — currently only
-  `Viewport.create_cuda_surface()`, which must hand back a real device pointer the caller can
-  immediately write into. The calling thread sends a command carrying the sender half, then
+  call that needs a synchronous reply from the render thread — currently only creating a CUDA
+  layer (`Viewport.create_cuda_surface()`, or the first `submit_cuda()` at a new size), which
+  must hand back the exported handles before the caller can write anything. The calling thread sends a command carrying the sender half, then
   blocks on the receiver half via `Python::detach()` so it releases the GIL while waiting
   (letting other Python threads keep running, and avoiding a deadlock if the render thread
   itself needs the GIL to finish handling the command).
@@ -219,12 +223,33 @@ Layout and hit-testing stay in points; chrome is built at the window's backing s
 matches the Python window size. Viewport layers still use the fullscreen-triangle path
 (`gl_VertexIndex` / MSL `vertex_id`) on top of chrome.
 
-CUDA interop (`fastgui-interop-cuda`, `CudaSharedTexture`) is the one path that bypasses the CPU
-upload entirely: a device-local image is exported via `VK_KHR_external_memory_win32` and
-synchronized with a `VK_KHR_timeline_semaphore` exported via `VK_KHR_external_semaphore_win32`,
-so a CUDA kernel can write directly into memory Vulkan will display next frame. The Vulkan-side
-export path has been validated with zero validation errors on real (AMD) hardware; the CUDA-side
-import has never run against a real NVIDIA GPU and should be treated as unverified — see
+CUDA interop is the one path that bypasses the CPU upload. fastgui owns both halves, because
+only the render thread knows when Vulkan is done reading:
+
+- The render thread exports a **CUDA layer** (`fastgui-render-vk::cuda_texture::CudaLayer`):
+  three slots in one linear, device-local buffer (`VK_KHR_external_memory_win32`), a `ready`
+  timeline semaphore CUDA signals and a `release` one Vulkan signals
+  (`VK_KHR_external_semaphore_win32`), and an ordinary optimal-tiled image that is what gets
+  sampled. The Vulkan device's UUID goes along so the CUDA side picks the same GPU.
+- A **slot table** shared by both threads (`fastgui-app::cuda_handles::CudaLayerShared`)
+  decides who owns which slot: free → writing (producer) → published → copying (render thread)
+  → free. A newer publish replaces an unshown frame (latest wins, like `FrameSlot`). Every
+  semaphore value either side waits on has already been submitted, so a hidden window or an
+  idle producer can't deadlock the other.
+- **Producer** (`fastgui-py::cuda`, on the caller's thread): on fastgui's own non-blocking
+  stream, wait for the caller's stream (event), wait GPU-side for the slot's last `release`,
+  copy the array in (`cuMemcpy2DAsync`), signal `ready`, make the caller's stream wait for the
+  copy (so the array can be reused immediately), and publish from a `cuLaunchHostFunc`
+  callback once that has all run, waking the event loop. `CudaSurface.frame()` is the same
+  without the copy: the caller writes into the slot between `__enter__` and `__exit__`.
+- **Render thread** (`render_frame`): for each drawn CUDA layer with a published slot, wait on
+  `ready` at the transfer stage, acquire the slot from `VK_QUEUE_FAMILY_EXTERNAL`, copy it into
+  the image, release it back, and signal `release` with the frame's submission.
+
+Wherever interop isn't available (macOS, Linux until fd export lands, a window on a non-NVIDIA
+GPU, a floating panel, before `run()`), `submit_cuda` copies device→host on a stream ordered
+after the caller's and goes through `submit_frame`'s path. The Vulkan half is tested headless
+with validation layers (`cuda_test.rs`); the CUDA half has never run on an NVIDIA GPU — see
 README's known limitations.
 
 ## Adding a new widget

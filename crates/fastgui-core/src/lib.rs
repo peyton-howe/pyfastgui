@@ -7,6 +7,7 @@
 //! and `fastgui-render-vk` displays the result the same way it displays a CPU-uploaded
 //! `Viewport` frame. See ROADMAP.md for the milestone breakdown.
 
+pub mod dnd;
 mod frame;
 pub mod plot;
 mod queue;

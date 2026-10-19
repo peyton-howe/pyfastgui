@@ -17,8 +17,11 @@ pub struct ChromeTheme {
     pub scrim: Color,
     pub drop_indicator: Color,
     pub scrollbar: Color,
-    /// Hovered control fill (menu rows, flat buttons) — from Python `Theme.surface_active`.
+    /// State layer drawn over a hovered control (translucent; menu rows and flat buttons
+    /// included) — from Python `Theme.hover`.
     pub hover: Color,
+    /// Veil drawn over a disabled widget's subtree (translucent) — from Python `Theme.disabled`.
+    pub disabled: Color,
     /// Raised chrome (tooltips, popup chrome) — from Python `Theme.surface_alt`.
     pub surface_alt: Color,
     /// Primary chrome text — from Python `Theme.text`.
@@ -37,7 +40,8 @@ impl ChromeTheme {
         scrim: Color([0.0, 0.0, 0.0, 0.45]),
         drop_indicator: Color([0.40, 0.65, 1.0, 0.35]),
         scrollbar: Color([1.0, 1.0, 1.0, 0.35]),
-        hover: Color([0.22, 0.24, 0.28, 1.0]),
+        hover: Color([1.0, 1.0, 1.0, 0.08]),
+        disabled: Color([0.10, 0.11, 0.13, 0.55]),
         surface_alt: Color([0.16, 0.17, 0.20, 1.0]),
         text: Color([0.92, 0.93, 0.95, 1.0]),
         border: Color([0.32, 0.35, 0.42, 1.0]),

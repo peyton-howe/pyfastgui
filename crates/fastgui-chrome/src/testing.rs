@@ -151,13 +151,13 @@ pub fn check_gpu_backend<G>(
 
         let mut check = |tree: &mut WidgetTree, drop: Option<(fastgui_core::widget::Rect, DropZone)>, what: &str| {
             tree.compute_layout(w as f32 / scale, h as f32 / scale);
-            let frame = quads.build_quads(tree, w, h, drop, scale);
+            let frame = quads.build_quads(tree, w, h, drop.map(|(r, z)| z.preview_rect(r)), scale);
             if let Some(frame) = &frame {
                 thumb = frame.quads.iter().find(|q| q.kind == QUAD_CIRCLE || q.kind == QUAD_CIRCLE_CLIPPED).map(|q| q.rect);
             }
             let drawn = draw(&mut target, frame);
             cpu.invalidate();
-            let reference = cpu.rasterize(tree, w, h, drop, scale).expect("full repaint").data.to_vec();
+            let reference = cpu.rasterize(tree, w, h, drop.map(|(r, z)| z.preview_rect(r)), scale).expect("full repaint").data.to_vec();
             assert_matches(&drawn, &reference, w, thumb, &format!("scale {scale}, {what}"));
         };
 

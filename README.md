@@ -27,9 +27,11 @@ fastgui instead:
   panel) as a command sent across a channel to the render thread, rather than requiring the
   caller to be "on the UI thread" — the free-threaded Python build can call into fastgui from
   any thread without contention.
-- Supports zero-copy GPU interop on the Vulkan backend: a CUDA kernel can write directly into a
-  texture displayed next frame, with no CPU round-trip (see `Viewport.create_cuda_surface` —
-  currently unverified on real hardware, and not available on macOS; see below).
+- Takes CUDA arrays directly: `Viewport.submit_cuda(tensor)` accepts anything with
+  `__cuda_array_interface__` (torch, cupy, numba, jax), ordered against the caller's stream.
+  On Windows/Vulkan/NVIDIA it's one GPU-to-GPU copy (or none, via `create_cuda_surface`);
+  elsewhere it falls back to a copy through host memory. Currently unverified on NVIDIA
+  hardware; see below.
 
 ## Quickstart
 
@@ -66,7 +68,19 @@ python your_script.py
 
 ## Install
 
-fastgui isn't published yet — build it from source with [maturin](https://www.maturin.rs/):
+fastgui isn't on PyPI yet. Release wheels are built in CI
+([`.github/workflows/wheels.yml`](.github/workflows/wheels.yml)) for Windows x64, macOS arm64
+and manylinux x86_64. Each platform gets a `cp311-abi3` wheel for every GIL CPython 3.11+ and a
+`cp314t` wheel for free-threaded 3.14. Once 0.0.1 is published:
+
+```
+pip install pyfastgui
+```
+
+The distribution is named `pyfastgui` because `fastgui` on PyPI is an unrelated project. You
+still `import fastgui`.
+
+Until then, build it from source with [maturin](https://www.maturin.rs/):
 
 ```
 git clone <this repo>
@@ -77,7 +91,8 @@ pip install maturin numpy
 maturin develop --release
 ```
 
-Requires CPython 3.10+. For the **free-threaded** build you need **CPython 3.14t**: the pinned
+Requires CPython 3.11+ (3.11 is where the buffer protocol joined the stable ABI, which
+`Viewport.submit_frame` and `Image` need). For the **free-threaded** build you need **CPython 3.14t**: the pinned
 PyO3 (0.29) refuses to build against a 3.13t interpreter, so a `python3.13t` venv fails at
 `maturin develop`. Regular (GIL) 3.13 is fine.
 
@@ -98,6 +113,16 @@ venvs and rebuild into each; see the note in ROADMAP.md about `maturin develop` 
 target venv by naming convention (a folder literally named `.venv`), not by which venv's
 `maturin` binary you invoke — set `VIRTUAL_ENV` explicitly when targeting a differently-named venv.
 
+To build the same release wheels locally (into `dist/`):
+
+```
+maturin build --release --features abi3 --out dist      # cp311-abi3, any GIL CPython 3.11+
+maturin build --release -i python3.14t --out dist       # cp314t, free-threaded
+```
+
+The `abi3` cargo feature is off by default, so `maturin develop` and the free-threaded build
+stay version-specific.
+
 ## Examples
 
 All under [`python/examples/`](python/examples/), runnable directly once installed:
@@ -107,7 +132,7 @@ All under [`python/examples/`](python/examples/), runnable directly once install
 | [`basic_window.py`](python/examples/basic_window.py) | Minimal window bring-up. |
 | [`threaded_mutation.py`](python/examples/threaded_mutation.py) | Calling a `Window` mutator concurrently from several threads — no GIL, no crash. |
 | [`live_camera_feed.py`](python/examples/live_camera_feed.py) | Streaming numpy frames into a `Viewport` from a background thread. |
-| [`cuda_viewport.py`](python/examples/cuda_viewport.py) | GPU-to-GPU CUDA→Vulkan interop, zero CPU copy. **Unverified — no NVIDIA GPU has tested this path. Not available on macOS.** |
+| [`cuda_viewport.py`](python/examples/cuda_viewport.py) | cupy frames via `submit_cuda` (GPU-to-GPU where interop exists, host copy elsewhere), or `--surface` for zero-copy `create_cuda_surface`. **Unverified — no NVIDIA GPU has tested this path.** |
 | [`widgets_demo.py`](python/examples/widgets_demo.py) | `Box` layout, `Label`, `Button`, `Slider`, click/drag input. |
 | [`text_input_demo.py`](python/examples/text_input_demo.py) | `TextInput` fields, keyboard focus (Tab/Shift+Tab), selection, clipboard, undo, IME. |
 | [`list_demo.py`](python/examples/list_demo.py) | A virtualized `ListView` of 1,000,000 rows with live filtering, keyboard selection and activation. |
@@ -122,6 +147,7 @@ All under [`python/examples/`](python/examples/), runnable directly once install
 | [`inspector_demo.py`](python/examples/inspector_demo.py) | M7 7D: `PropertyInspector` (label + 7B editors) driven by a tree selection. |
 | [`plots_demo.py`](python/examples/plots_demo.py) | M7 7E: numpy-fed line, scatter, heatmap, histogram, bar, contour, 3D surface, 3D scatter, and mesh plots (CPU raster, GPU image layer). |
 | [`tier4_demo.py`](python/examples/tier4_demo.py) | M7 7E: `ImageViewer`, `LogView`, `CodeEditor`, `CommandPalette` (Ctrl+K), `Observable`, `Gauge`, `Timeline`, `NodeGraph`. |
+| [`interaction_demo.py`](python/examples/interaction_demo.py) | M7 7F: hover state layer, `set_enabled` on a control box, list reorder and tree reparent by drag-and-drop, a drop zone, and OS file drops on an `Image`. |
 | [`dock_layout.py`](python/examples/dock_layout.py) | A `DockArea` of resizable, titled `Panel`s with a live `Viewport` in the center. |
 | [`dock_rearrange_demo.py`](python/examples/dock_rearrange_demo.py) | Drag a panel's title bar to split or tab-merge regions, including dropping at the window's outer edge to span the whole dock area. |
 | [`tabs_demo.py`](python/examples/tabs_demo.py) | Multiple `Panel`s sharing one `DockArea` region via `Tabs`, switched by clicking a header segment. |
@@ -152,6 +178,14 @@ All under [`python/examples/`](python/examples/), runnable directly once install
   including growing an existing `Tabs` group, ungroup, whole-window edge drops, and re-docking
   a floating panel; see its docstring in
   [`python/fastgui/__init__.py`](python/fastgui/__init__.py) for the remaining gaps).
+- **States and drag-and-drop**: every control and `Box` takes `enabled=` / `set_enabled()`
+  (a disabled `Box` disables everything in it: dimmed, no clicks, focus, drags or shortcuts).
+  Hovered controls, and the row under the cursor in lists, tables, trees and combo-box
+  drop-downs, get the theme's `hover` state layer. `ListView`, `TreeView` and `Box` take
+  `set_drag_source(tag, data)` / `set_drop_target(accept, on_drop)` (payload: a string tag plus
+  bytes); `Viewport` and `Image` take `set_file_drop(on_drop)` for files dropped from the OS.
+  `Image.load(path)` shows a PNG or JPEG; `TreeView.move_node(source, target, place)` moves a
+  node keeping every node's expand state.
 - **Window**: `Window(title, width, height)` — `set_content(widget)`, `set_clear_color(...)`,
   `add_floating_panel(panel, x, y, width, height)`, `.run()` (blocks, owns the render loop).
 
@@ -173,30 +207,40 @@ CPU pixmap with `FASTGUI_CHROME=cpu`); `fastgui-py` is the PyO3 layer and picks 
 
 ## Known limitations
 
-- **CUDA interop is unverified on real hardware, and is Vulkan-only.** The Vulkan-side export
-  path (`VK_KHR_external_memory_win32` + `VK_KHR_timeline_semaphore`) has been validated with
-  zero Vulkan validation errors on real (AMD) hardware, but the CUDA-side import has never run
-  against an actual NVIDIA GPU. On macOS there is no CUDA↔Metal path;
-  `Viewport.create_cuda_surface` raises `RuntimeError`. Treat the CUDA API as unverified until
-  someone runs it on NVIDIA hardware.
+- **CUDA interop is unverified on NVIDIA hardware, and is Windows/Vulkan-only.** The Vulkan
+  half (exported slot buffer, timeline semaphores, the pickup copy) is tested headless with
+  zero validation errors on real (AMD) hardware, and the CUDA struct layouts are checked
+  against NVIDIA's own bindings, but the CUDA side has never run on an NVIDIA GPU.
+  `submit_cuda` falls back to a host copy wherever interop isn't available (macOS, Linux, a
+  window on a non-NVIDIA GPU, viewports in floating panels); `create_cuda_surface` raises
+  there instead. `Viewport.cuda_status` says which path is in use.
 - **Linux is less exercised than Windows and macOS.** It uses the same Vulkan backend as
   Windows. It has been tested on X11 (Xvfb + xfwm4) with Mesa llvmpipe (software Vulkan):
   every example, the docking/tab/splitter/floating interactions, and a free-threaded 3.14t
   build, all with zero validation errors. It hasn't been tested on Wayland or with a hardware
   GPU driver, and CUDA interop isn't implemented on Linux yet (`create_cuda_surface` raises
   `RuntimeError`).
+- **Wayland is untested.** winit picks Wayland when `WAYLAND_DISPLAY` is set; for 0.0.1 treat
+  that as unsupported and run under X11 or XWayland (unset `WAYLAND_DISPLAY`).
+- **Prebuilt wheels cover Windows x64, macOS arm64 and manylinux x86_64 only.** Intel Macs,
+  Linux aarch64 and Windows ARM build from source.
 - **Free-threaded Python means 3.14t.** PyO3 0.29 doesn't build for 3.13t (see
-  [Install](#install)).
-- **No text wrapping, scrolling, or keyboard input/focus handling** for any widget yet.
-- **`DockArea` / floating**: floating panels are real OS windows (move, resize, tear out by
-  dragging a docked panel outside the main window, re-dock by dropping onto the dock).
+  [Install](#install)). GIL builds need CPython 3.11+.
+- **Text editing gaps:** `TextArea` has no soft wrap, the caret doesn't blink, and clicking a
+  scrollbar track doesn't page. No bidi/RTL caret movement.
+- **Drag-and-drop is main-window only.** Widget drags work inside the main window, not in
+  floating panels or between windows. OS file drops land at the cursor on Windows; elsewhere
+  they land where the cursor last moved in the window. GPU `Viewport`/`Image` layers aren't
+  dimmed when disabled (they draw above chrome).
+- **No accessibility support.** Screen readers can't see fastgui widgets yet.
+- **`Viewport` and `Image` stretch by default**; pass `fit="contain"` to letterbox.
+- **`Table`** has no column resize or sort, and **`DockArea`** layouts aren't saved or restored.
 - **`Viewport.submit_frame` always copies** the numpy/buffer into an owned `Vec<u8>` before
   upload. Expected for the CPU path; a packed-RGBA camera feed will want a fewer-copy path later.
-- **Automated tests are still thin.** `cargo test --workspace` (works on every platform; the
-  Metal crate compiles to empty off macOS) covers `FrameSlot`, `DropZone` classification and
-  preview rects, splitter ratio layout and hit slop, the × hit rect, and `WidgetTree`
-  layout/hit-test; `python -m unittest tests.test_dock_area` (from `python/`)
-  covers `DockArea` tree surgery. There is no GPU/window integration suite yet.
+- **No GPU/window integration suite.** `cargo test --workspace` (works on every platform; the
+  Metal crate compiles to empty off macOS) covers the core primitives, layout and hit-testing,
+  and `python -m pytest python/tests` covers the Python API headlessly. Window rendering is
+  verified by running the examples.
 - **`.venv`/`env` are local, machine-specific dev environments**, not checked in — a fresh
   clone needs its own `python -m venv` plus the Rust and platform GPU toolchain described in
   [Install](#install) before anything builds.
