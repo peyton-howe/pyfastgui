@@ -10,9 +10,44 @@ Early sections below still describe the original Windows bring-up machine and pa
 (`c:\sandbox\fast-gui`, dual `.venv`/`env`) as historical context — treat them as "how it was
 built," not as the current clone layout.
 
-Read this whole file before starting M6 — especially **"How this project has been built"**
+Read this whole file before starting new work — especially **"How this project has been built"**
 near the bottom; the verification discipline described there caught real bugs that
 `cargo check` alone missed, twice.
+
+## Current status (2026-10-19)
+
+M0–M7 are implemented, including 7F hover, disabled, and drag-and-drop. M8's wheel
+workflow is green on `main` (`b3a3efb`, Actions run 39216349040): Windows x64, macOS
+arm64, and manylinux x86_64, each as `cp311-abi3` and `cp314t`, plus sdist and
+install-from-wheel smoke tests. The publish job did not run (it is tag-only). Nothing
+is on PyPI yet.
+
+**Next implementation:** Metal zero-copy from mtlpy. macOS is its own silo (no CUDA).
+`Texture.mtl_ptr` is already a public `id<MTLTexture>` on the same default `MTLDevice`
+fastgui creates. A viewport should retain that texture and sample it while drawing,
+instead of uploading CPU bytes. `readable=True` and a float format such as `rgba8Unorm`
+match the current shader. Ordering can start as a CPU `SharedEvent.wait` before submit,
+plus a completion signal when fastgui's command buffer finishes. Exposing
+`SharedEvent.mtl_ptr` (it exists on the raw binding, not the Python wrapper) lets
+fastgui wait on the GPU. Wrapping a fastgui-owned texture inside mtlpy is a later
+mtlpy change, not required for this direction.
+
+**Still open after that:**
+
+- Linux CUDA / Vulkan-only zero-copy: `create_cuda_surface` returns
+  `CudaInteropNotImplemented` off Windows. Export an opaque fd or a dma-buf
+  (`VK_KHR_external_memory_fd` / `VK_EXT_external_memory_dma_buf`) and sample it.
+  An RK3588 is this path without CUDA: import the camera or RGA dma-buf. Unified
+  DRAM does not make `submit_frame` zero-copy.
+- Run `python/examples/cuda_viewport.py` and `--surface` on an NVIDIA GPU. The
+  Windows Vulkan half is tested headless only.
+- M8 release gate past CI: one real window from the installed wheel on macOS and
+  Linux (smoke tests are headless), TestPyPI `0.0.1rc1`, then PyPI.
+- Accessibility (`accesskit`). HiDPI chrome already shipped with the shared app loop.
+- Follow-ups recorded under their milestones: text soft-wrap, caret blink, and RTL;
+  scrollbar-track paging; theme not applied to an already-open floater until rebuild;
+  menu and file-dialog gaps in 7C; table sort/resize/cell editing and typed columns;
+  tree visible-row cache and iterative flatten; drag-and-drop in floating windows.
 
 ## Environment (original Windows dev machine)
 
@@ -104,9 +139,10 @@ python/
     live_camera_feed.py    M2
     cuda_viewport.py       M3 (unverified — see caveat)
     widgets_demo.py        M4
-    dock_layout.py          M6 (rendering verified; drag NOT interactively verified — see M6 status)
-pyproject.toml            maturin backend config — minimal so far, no abi3/free-threaded
-                           wheel matrix yet (that's M6 work)
+    dock_layout.py          M6
+    interaction_demo.py    M7 7F
+pyproject.toml            maturin config: distribution name pyfastgui, abi3 feature off
+                           by default (CI passes it for the cp311-abi3 wheel). See 6B.
 README.md, docs/ARCHITECTURE.md   added in 6C — read these instead of re-deriving crate
                            layout/threading model from scratch each session; this doc stays
                            the place for milestone history and in-progress reasoning, those
@@ -1199,7 +1235,7 @@ Concrete and fully achievable/verifiable on this machine (at least the Windows l
   (a root `.gitignore` already exists in the git tree — extend it if wheel/build artifacts
   grow).
 
-**Done (2026-10-01, M8 packaging, branch `m8-release`)** except the CI run and the publish:
+**Done (packaging landed 2026-10-01; wheel CI green 2026-10-19).** Publish is still open:
 - **PyPI name:** `fastgui` is taken (an unrelated project by userElaina). The distribution is
   **`pyfastgui`**; the import name stays `fastgui`. `pyfastgui` was free on 2026-10-01.
 - **abi3 floor is 3.11, not 3.10:** `PyBuffer` (`Viewport.submit_frame`, `Image`) is only in
@@ -1212,14 +1248,16 @@ Concrete and fully achievable/verifiable on this machine (at least the Windows l
   {abi3, cp314t}, plus an sdist, a smoke job (install from `dist/` with `--no-index`, import,
   pytest on 3.11 / 3.14 / 3.14t per OS, run on a copy of the tests so `import fastgui` can't
   hit the source tree), and trusted publishing on `v*` tags (`rc` → TestPyPI, else PyPI).
-  **Not yet run on GitHub.** It still needs the `testpypi`/`pypi` environments and trusted
-  publishers set up.
+  The `testpypi` / `pypi` environments and trusted publishers are not set up yet.
 - **Verified locally (Windows, Vulkan):** both wheels plus the sdist build. Fresh scratch venvs
   installed from the wheels, run outside the repo, pass 76/76 tests on 3.14 and 3.14t (GIL
   stays disabled on 3.14t). `widgets_demo` and `menus_demo` open, render correctly
   (PrintWindow screenshots), and exit cleanly on WM_CLOSE with empty stderr, for both wheels.
-- **Remaining M8 gate:** green CI run; the plot demo from the wheel once 7E merges; one real-GPU
-  window from the wheel on macOS and Linux; TestPyPI `0.0.1rc1`; PyPI only after a three-OS
+- **CI (2026-10-19):** green on `main` for every wheel and smoke job (Windows, macOS arm64,
+  manylinux x86_64 × abi3 and cp314t, plus sdist). Publish stays skipped until a `v*` tag,
+  and the `testpypi` / `pypi` trusted-publisher environments are not set up.
+- **Remaining M8 gate:** one real window from the installed wheel on macOS and on Linux
+  (the smoke job is headless pytest); TestPyPI `0.0.1rc1`; PyPI only after a three-OS
   wheel install produces a window.
 
 ### 6C. Docs — done
@@ -1257,14 +1295,16 @@ Concrete and fully achievable/verifiable on this machine (at least the Windows l
   session or a different machine needs to redo the M0 toolchain setup (Rust, MSVC, Vulkan
   SDK, both venvs) before any of this builds.
 
-## M7 — Widget set: Qt parity and beyond (in progress — 7A done, see below)
+## M7 — Widget set: Qt parity and beyond (7A–7E and 7F.1/7F.2 done; follow-ups remain)
 
 Goal: match Qt's everyday widget coverage, then go past it where fastgui's architecture
 (GPU-native chrome, CUDA interop, no-GIL cross-thread mutation) gives a real advantage.
 
-**Current set:** `Box` (flex), `Label`, `Button`, `Slider`, `Splitter`, `Panel`, `Tabs`,
-`DockArea`, floating panels, `Viewport` (CPU/CUDA frames). See `WidgetKind` in
-`fastgui-core/src/widget.rs`.
+**Current set:** layout (`Box`, `Grid`, `Splitter`, `ScrollArea`, `Popup`), form controls
+(7B), app chrome (7C), `ListView` / `Table` / `TreeView` / `PropertyInspector` (7D),
+plots and the tier-4 widgets (7E), hover, disabled, and drag-and-drop (7F), plus
+`DockArea` and `Viewport` (CPU frames, and CUDA on Windows/Vulkan/NVIDIA). See
+`WidgetKind` in `fastgui-core/src/widget.rs` and `python/fastgui/__init__.pyi`.
 
 Order matters: most missing widgets are blocked on infrastructure, not on the widget code
 itself. Adding widgets before 7A lands means more `Slider`-style self-contained one-offs.
@@ -1480,8 +1520,10 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 ### 7F. Cross-cutting (plan early, don't bolt on)
 
 - **Accessibility** via `accesskit` (has a winit adapter). Qt has screen-reader support;
-  skipping this is where fastgui would fall short of it.
-- **HiDPI** scale factor applied to chrome.
+  skipping this is where fastgui would fall short of it. **Not started.**
+- **HiDPI** scale factor applied to chrome. **Done** with the shared app loop: layout and
+  hit-testing stay in logical points, and both backends render chrome at the window's
+  backing scale (see the HiDPI notes under M6).
 - **Drag-and-drop** between widgets and from the OS, generalizing the docking drag code.
   — **Done (7F.2, 2026-10-05, branch `m7-7f-hover-dnd`):** payload is a string tag plus bytes
   (`fastgui_core::dnd`). `WidgetTree` side tables for drag sources / drop targets / file-drop
@@ -1515,9 +1557,9 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 
 ### Suggested order
 
-7A.1–7A.2 (focus + text input) → 7A.3–7A.4 (scroll + popups) → 7B → 7C → GPU plotting (7E) →
-7D → rest of 7E. Keep 7F in mind throughout, especially focus traversal (it doubles as the
-accessibility tree's navigation order).
+7A–7E and 7F.1/7F.2 are done; this order is historical. Next is the Metal/mtlpy import in
+**Current status** above, then Linux dma-buf export. Accessibility still wants the focus
+order from 7A.1 as its navigation order.
 
 ## How this project has been built (read before continuing)
 

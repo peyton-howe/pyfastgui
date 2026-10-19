@@ -7,10 +7,11 @@ This repository is named `pyfastgui`. Designed from the ground up for CPython's 
 lock-free queue, so nothing about the API requires holding the GIL, and multiple threads can
 safely drive the UI at once.
 
-> **Status:** pre-alpha, actively developed, not yet published as a package. See
-> [ROADMAP.md](ROADMAP.md) for the full milestone-by-milestone history and current work.
-> Windows (Vulkan) and macOS (Metal) are the platforms exercised so far; Linux (Vulkan) has
-> been tested on X11 with Mesa llvmpipe — see [Known limitations](#known-limitations).
+> **Status:** pre-alpha. Widget milestones through drag-and-drop are implemented. Wheel CI
+> is green for Windows x64, macOS arm64, and manylinux x86_64 (`cp311-abi3` and `cp314t`);
+> the package is not on PyPI yet. See [ROADMAP.md](ROADMAP.md) for history and what is left.
+> Windows (Vulkan) and macOS (Metal) are the platforms exercised on a real window; Linux
+> (Vulkan) has been tested on X11 with Mesa llvmpipe — see [Known limitations](#known-limitations).
 
 ## Why
 
@@ -165,7 +166,13 @@ All under [`python/examples/`](python/examples/), runnable directly once install
   `CollapsibleSection`, `StackedWidget` (Python composition); `open_file_dialog` /
   `save_file_dialog` (native via `rfd`), `pick_color` (in-app); `tooltip=` / `context_menu=`;
   keyboard accelerators and arrow-key menu navigation.
-- **Data views**: `ListView` (virtualized: only visible rows are laid out and drawn).
+- **Data views**: `ListView`, `Table`, and `TreeView` (virtualized: only visible rows are
+  laid out and drawn), `PropertyInspector`. `TreeView.move_node` moves a subtree without
+  resetting expand state. `Table` cells are strings at the Python boundary.
+- **Plots and tier 4**: `PlotLine`, `PlotScatter`, `PlotHeatmap`, `PlotHistogram`,
+  `PlotBar`, `PlotContour`, `PlotSurface`, `PlotScatter3D`, `PlotMesh` (CPU raster into
+  the `Image` layer; wheel zoom, drag pan). `ImageViewer`, `LogView`, `CodeEditor`,
+  `CommandPalette`, `Gauge`, `Timeline`, `NodeGraph`, `Observable`.
 - **Theming**: `Theme` (`dark()`, `light()`, `replace(...)`), `set_theme` / `get_theme`,
   `Window.set_theme`. Colors, font sizes and the font family default to the current theme;
   `font_size="small"|"body"|"large"` and `gap=`/`padding="small"|"medium"|"large"`
@@ -222,8 +229,13 @@ CPU pixmap with `FASTGUI_CHROME=cpu`); `fastgui-py` is the PyO3 layer and picks 
   `RuntimeError`).
 - **Wayland is untested.** winit picks Wayland when `WAYLAND_DISPLAY` is set; for 0.0.1 treat
   that as unsupported and run under X11 or XWayland (unset `WAYLAND_DISPLAY`).
-- **Prebuilt wheels cover Windows x64, macOS arm64 and manylinux x86_64 only.** Intel Macs,
-  Linux aarch64 and Windows ARM build from source.
+- **Prebuilt wheels cover Windows x64, macOS arm64 and manylinux x86_64 only.** CI builds
+  and smoke-tests those six wheels on `main`. They are not published. Intel Macs, Linux
+  aarch64, and Windows ARM build from source.
+- **No Metal texture import.** A viewport cannot sample an `mtlpy` `Texture` (or any other
+  `MTLTexture`) in place. Frames still arrive as CPU bytes, or as CUDA arrays on
+  Windows/Vulkan/NVIDIA. mtlpy already exposes `Texture.mtl_ptr`; the viewport binding is
+  the next piece of work.
 - **Free-threaded Python means 3.14t.** PyO3 0.29 doesn't build for 3.13t (see
   [Install](#install)). GIL builds need CPython 3.11+.
 - **Text editing gaps:** `TextArea` has no soft wrap, the caret doesn't blink, and clicking a
@@ -239,8 +251,9 @@ CPU pixmap with `FASTGUI_CHROME=cpu`); `fastgui-py` is the PyO3 layer and picks 
   upload. Expected for the CPU path; a packed-RGBA camera feed will want a fewer-copy path later.
 - **No GPU/window integration suite.** `cargo test --workspace` (works on every platform; the
   Metal crate compiles to empty off macOS) covers the core primitives, layout and hit-testing,
-  and `python -m pytest python/tests` covers the Python API headlessly. Window rendering is
-  verified by running the examples.
+  and `python -m pytest python/tests` covers the Python API headlessly. The wheel smoke job
+  runs that pytest suite from the installed wheel. Opening a window is still verified by
+  running the examples.
 - **`.venv`/`env` are local, machine-specific dev environments**, not checked in — a fresh
   clone needs its own `python -m venv` plus the Rust and platform GPU toolchain described in
   [Install](#install) before anything builds.
