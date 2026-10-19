@@ -8,10 +8,11 @@ use ash::{
     vk, Device, Entry, Instance,
 };
 use fastgui_app::ViewportDraw;
-use fastgui_core::{ChromeFrame, ChromeQuads, CpuFrame, PixelRect};
+use fastgui_core::{ChromeFrame, ChromeQuads, CpuFrame, ImportedLayer, PixelRect};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
-use crate::cuda_texture::{CudaExportHandles, CudaLayer};
+use crate::cuda_texture::{CudaExportHandles, CudaExternal, CudaLayer};
+use crate::dmabuf::ImportedImage;
 use crate::error::VkRendererError as Error;
 use crate::pipeline::ViewportPipeline;
 use crate::quad::{QuadChrome, QuadPipeline};
@@ -22,6 +23,7 @@ const FRAMES_IN_FLIGHT: usize = 2;
 enum GpuImage {
     Cpu(ViewportTexture),
     Cuda(CudaLayer),
+    Imported(ImportedImage),
 }
 
 struct SampledLayer {
@@ -63,18 +65,25 @@ pub struct VulkanRenderer {
     quad_chrome: QuadChrome,
     /// GPU textures for in-tree `Viewport` widgets, keyed by the stable `viewport_id`.
     layers: HashMap<u64, SampledLayer>,
-    // `None` on GPUs/drivers without VK_KHR_external_memory_win32 + VK_KHR_external_semaphore_win32
-    // (both widely supported on Windows, but not guaranteed) — `create_cuda_surface` reports a
-    // clear error instead of the device just failing to come up at all for everyone.
+    // `None` when this device can't export memory CUDA can import (win32 on Windows, opaque fd
+    // on Linux). `create_cuda_surface` reports that instead of failing device creation.
     cuda_interop: Option<CudaInteropLoaders>,
+    /// `VK_EXT_external_memory_dma_buf` + `VK_KHR_external_memory_fd`, when the device has them.
+    dmabuf: Option<khr::external_memory_fd::Device>,
     queue_family_index: u32,
     /// `VkPhysicalDeviceIDProperties::deviceUUID`, handed to CUDA to find the same GPU.
     device_uuid: [u8; 16],
 }
 
-struct CudaInteropLoaders {
-    external_memory_win32: khr::external_memory_win32::Device,
-    external_semaphore_win32: khr::external_semaphore_win32::Device,
+enum CudaInteropLoaders {
+    Win32 {
+        external_memory_win32: khr::external_memory_win32::Device,
+        external_semaphore_win32: khr::external_semaphore_win32::Device,
+    },
+    OpaqueFd {
+        external_memory_fd: khr::external_memory_fd::Device,
+        external_semaphore_fd: khr::external_semaphore_fd::Device,
+    },
 }
 
 unsafe extern "system" fn debug_callback(
@@ -223,10 +232,19 @@ impl VulkanRenderer {
                     .iter()
                     .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == name)
             };
-            let cuda_interop_available = has_device_extension(khr::external_memory::NAME)
+            let cuda_win32 = cfg!(windows)
+                && has_device_extension(khr::external_memory::NAME)
                 && has_device_extension(khr::external_memory_win32::NAME)
                 && has_device_extension(khr::external_semaphore::NAME)
                 && has_device_extension(khr::external_semaphore_win32::NAME);
+            let cuda_fd = cfg!(target_os = "linux")
+                && has_device_extension(khr::external_memory::NAME)
+                && has_device_extension(khr::external_memory_fd::NAME)
+                && has_device_extension(khr::external_semaphore::NAME)
+                && has_device_extension(khr::external_semaphore_fd::NAME);
+            let dmabuf_import = has_device_extension(khr::external_memory::NAME)
+                && has_device_extension(khr::external_memory_fd::NAME)
+                && has_device_extension(ash::ext::external_memory_dma_buf::NAME);
 
             let mut device_extension_names_raw = vec![swapchain::NAME.as_ptr()];
             // Required on a portability driver whenever the device lists it.
@@ -234,13 +252,28 @@ impl VulkanRenderer {
             if has_device_extension(portability_subset) {
                 device_extension_names_raw.push(portability_subset.as_ptr());
             }
-            if cuda_interop_available {
+            if cuda_win32 {
                 device_extension_names_raw.extend([
                     khr::external_memory::NAME.as_ptr(),
                     khr::external_memory_win32::NAME.as_ptr(),
                     khr::external_semaphore::NAME.as_ptr(),
                     khr::external_semaphore_win32::NAME.as_ptr(),
                 ]);
+            }
+            if cuda_fd || dmabuf_import {
+                device_extension_names_raw.extend([
+                    khr::external_memory::NAME.as_ptr(),
+                    khr::external_memory_fd::NAME.as_ptr(),
+                ]);
+            }
+            if cuda_fd {
+                device_extension_names_raw.extend([
+                    khr::external_semaphore::NAME.as_ptr(),
+                    khr::external_semaphore_fd::NAME.as_ptr(),
+                ]);
+            }
+            if dmabuf_import {
+                device_extension_names_raw.push(ash::ext::external_memory_dma_buf::NAME.as_ptr());
             }
 
             let queue_priorities = [1.0f32];
@@ -264,12 +297,20 @@ impl VulkanRenderer {
             let queue = device.get_device_queue(queue_family_index, 0);
             let swapchain_loader = swapchain::Device::new(&instance, &device);
 
-            let cuda_interop = cuda_interop_available.then(|| CudaInteropLoaders {
-                external_memory_win32: khr::external_memory_win32::Device::new(&instance, &device),
-                external_semaphore_win32: khr::external_semaphore_win32::Device::new(
-                    &instance, &device,
-                ),
-            });
+            let cuda_interop = if cuda_win32 {
+                Some(CudaInteropLoaders::Win32 {
+                    external_memory_win32: khr::external_memory_win32::Device::new(&instance, &device),
+                    external_semaphore_win32: khr::external_semaphore_win32::Device::new(&instance, &device),
+                })
+            } else if cuda_fd {
+                Some(CudaInteropLoaders::OpaqueFd {
+                    external_memory_fd: khr::external_memory_fd::Device::new(&instance, &device),
+                    external_semaphore_fd: khr::external_semaphore_fd::Device::new(&instance, &device),
+                })
+            } else {
+                None
+            };
+            let dmabuf = dmabuf_import.then(|| khr::external_memory_fd::Device::new(&instance, &device));
 
             // UNORM, deliberately not SRGB: an `_SRGB` surface format makes the GPU apply an
             // implicit linear->sRGB encoding curve to whatever the fragment shader outputs
@@ -348,6 +389,7 @@ impl VulkanRenderer {
                 chrome: None,
                 layers: HashMap::new(),
                 cuda_interop,
+                dmabuf,
                 queue_family_index,
                 device_uuid,
             };
@@ -517,7 +559,7 @@ impl VulkanRenderer {
                 Some(SampledLayer { image: GpuImage::Cpu(texture), .. }) => {
                     texture.width != width || texture.height != height
                 }
-                Some(SampledLayer { image: GpuImage::Cuda(_), .. }) | None => true,
+                Some(SampledLayer { image: GpuImage::Cuda(_) | GpuImage::Imported(_), .. }) | None => true,
             };
 
             if need_recreate {
@@ -556,27 +598,29 @@ impl VulkanRenderer {
         width: u32,
         height: u32,
     ) -> Result<CudaExportHandles, Error> {
-        // TODO(linux): export via VK_KHR_external_memory_fd / VK_KHR_external_semaphore_fd
-        // (OPAQUE_FD, or dma-buf) and import with cuImportExternalMemory's
-        // CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD. Untestable without an NVIDIA GPU, so until
-        // then fail with a clear message rather than the win32-extension error below, which
-        // reads like a driver problem.
-        if cfg!(not(windows)) {
-            return Err(Error::CudaInteropNotImplemented);
-        }
         if self.cuda_interop.is_none() {
-            return Err(Error::CudaInteropUnsupported);
+            return Err(if cfg!(any(windows, target_os = "linux")) {
+                Error::CudaInteropUnsupported
+            } else {
+                Error::CudaInteropNotImplemented
+            });
         }
         unsafe {
             self.device.device_wait_idle()?;
             if let Some(old) = self.layers.remove(&viewport_id) {
                 self.destroy_layer(old);
             }
-            let loaders = self.cuda_interop.as_ref().expect("checked above");
+            let external = match self.cuda_interop.as_ref().expect("checked above") {
+                CudaInteropLoaders::Win32 { external_memory_win32, external_semaphore_win32 } => {
+                    CudaExternal::Win32 { memory: external_memory_win32, semaphore: external_semaphore_win32 }
+                }
+                CudaInteropLoaders::OpaqueFd { external_memory_fd, external_semaphore_fd } => {
+                    CudaExternal::OpaqueFd { memory: external_memory_fd, semaphore: external_semaphore_fd }
+                }
+            };
             let (texture, handles) = CudaLayer::new(
                 &self.device,
-                &loaders.external_memory_win32,
-                &loaders.external_semaphore_win32,
+                external,
                 &self.memory_properties,
                 self.device_uuid,
                 width,
@@ -608,10 +652,48 @@ impl VulkanRenderer {
         }
     }
 
+    pub fn set_imported_layer(&mut self, viewport_id: u64, layer: ImportedLayer) -> Result<(), Error> {
+        let ImportedLayer::DmaBuf(buf) = layer else {
+            return Ok(());
+        };
+        let Some(memory_fd) = &self.dmabuf else {
+            return Ok(());
+        };
+        let imported = unsafe { crate::dmabuf::import(&self.device, memory_fd, &self.memory_properties, buf) };
+        let imported = match imported {
+            Ok(imported) => imported,
+            // A bad fd or stride must not tear down the window. The previous frame stays.
+            Err(_) => return Ok(()),
+        };
+        unsafe {
+            // Allocate before retiring the previous layer so a pool failure keeps the old frame
+            // and does not fail the window.
+            let descriptor_set = match self.viewport_pipeline.alloc_set(&self.device) {
+                Ok(set) => set,
+                Err(_) => {
+                    imported.destroy(&self.device);
+                    return Ok(());
+                }
+            };
+            if self.device.queue_wait_idle(self.queue).is_err() {
+                imported.destroy(&self.device);
+                self.viewport_pipeline.free_set(&self.device, descriptor_set);
+                return Ok(());
+            }
+            if let Some(old) = self.layers.remove(&viewport_id) {
+                self.destroy_layer(old);
+            }
+            self.viewport_pipeline.bind_texture(&self.device, descriptor_set, imported.view);
+            self.layers.insert(viewport_id, SampledLayer { image: GpuImage::Imported(imported), descriptor_set });
+        }
+        Ok(())
+    }
+
     unsafe fn destroy_layer(&mut self, layer: SampledLayer) {
         match layer.image {
             GpuImage::Cpu(texture) => texture.destroy(&self.device),
             GpuImage::Cuda(texture) => texture.destroy(&self.device),
+            GpuImage::Imported(texture) => texture.destroy(&self.device),
         }
         self.viewport_pipeline.free_set(&self.device, layer.descriptor_set);
     }
@@ -791,6 +873,7 @@ impl VulkanRenderer {
                 let (cw, ch) = match &layer.image {
                     GpuImage::Cpu(texture) => (texture.width, texture.height),
                     GpuImage::Cuda(cuda) => cuda.size(),
+                    GpuImage::Imported(imported) => (imported.width, imported.height),
                 };
                 let draw = draw.letterboxed(cw, ch);
                 let Some(([x, y, width, height], [sx, sy, sw, sh])) =
@@ -928,6 +1011,20 @@ fn sync_sampled_image(
         }
         // Synchronized by its own pickup barriers (`CudaLayer::record_pickup`).
         GpuImage::Cuda(_) => {}
+        GpuImage::Imported(texture) => {
+            barriers.push(
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(texture.current_layout)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(texture.image)
+                    .subresource_range(color_subresource)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ),
+            );
+            texture.current_layout = vk::ImageLayout::GENERAL;
+        }
     }
 }
 
@@ -1016,6 +1113,10 @@ impl fastgui_app::SurfaceBackend for VulkanRenderer {
 
     fn set_layer_frame(&mut self, viewport_id: u64, frame: CpuFrame) -> Result<(), Self::Error> {
         VulkanRenderer::set_layer_frame(self, viewport_id, frame)
+    }
+
+    fn set_imported_layer(&mut self, viewport_id: u64, layer: ImportedLayer) -> Result<(), Self::Error> {
+        VulkanRenderer::set_imported_layer(self, viewport_id, layer)
     }
 
     fn retain_layers(&mut self, live_ids: &[u64]) {

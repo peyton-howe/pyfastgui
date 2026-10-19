@@ -22,25 +22,30 @@ arm64, and manylinux x86_64, each as `cp311-abi3` and `cp314t`, plus sdist and
 install-from-wheel smoke tests. The publish job did not run (it is tag-only). Nothing
 is on PyPI yet.
 
-**Next implementation:** Metal zero-copy from mtlpy. macOS is its own silo (no CUDA).
-`Texture.mtl_ptr` is already a public `id<MTLTexture>` on the same default `MTLDevice`
-fastgui creates. A viewport should retain that texture and sample it while drawing,
-instead of uploading CPU bytes. `readable=True` and a float format such as `rgba8Unorm`
-match the current shader. Ordering can start as a CPU `SharedEvent.wait` before submit,
-plus a completion signal when fastgui's command buffer finishes. Exposing
-`SharedEvent.mtl_ptr` (it exists on the raw binding, not the Python wrapper) lets
-fastgui wait on the GPU. Wrapping a fastgui-owned texture inside mtlpy is a later
-mtlpy change, not required for this direction.
+**Zero-copy (in tree, not yet shown on the hardware it targets):**
 
-**Still open after that:**
+- macOS: `Viewport.submit_metal` / `Image.submit_metal` retain an `MTLTexture`
+  (`mtlpy` `Texture.mtl_ptr`, `readable=True`, a float format such as `rgba8Unorm`)
+  and sample it. Optional `MTLSharedEvent` pointers wait and signal once, on the
+  command buffer that first draws that submission. An import dropped before it is
+  sampled signals on the CPU so the producer is not stuck. Rust tests on this Mac
+  cover retain, integer/usage rejection, and that signal. A live mtlpy texture in
+  an open window is still unchecked. Wrapping a fastgui-owned texture inside mtlpy
+  is still a later mtlpy change. No CUDA on this silo.
+- Linux: `submit_dmabuf` duplicates the caller's fd and the Vulkan backend samples a
+  linear RGBA8 image (`VK_KHR_external_memory_fd` / `VK_EXT_external_memory_dma_buf`,
+  modifier 0). `create_cuda_surface` exports opaque fds when the device advertises
+  the fd memory and semaphore extensions. DRM modifiers and NV12 are not imported.
+  The producer is assumed finished before `submit_dmabuf` (no sync-file). Neither
+  path has run on NVIDIA or on an RK3588 dma-buf. A missing extension drops the
+  import and keeps the previous frame.
 
-- Linux CUDA / Vulkan-only zero-copy: `create_cuda_surface` returns
-  `CudaInteropNotImplemented` off Windows. Export an opaque fd or a dma-buf
-  (`VK_KHR_external_memory_fd` / `VK_EXT_external_memory_dma_buf`) and sample it.
-  An RK3588 is this path without CUDA: import the camera or RGA dma-buf. Unified
-  DRAM does not make `submit_frame` zero-copy.
-- Run `python/examples/cuda_viewport.py` and `--surface` on an NVIDIA GPU. The
-  Windows Vulkan half is tested headless only.
+**Still open:**
+
+- Prove the three paths on real hardware: an mtlpy texture in a Mac viewport;
+  `python/examples/cuda_viewport.py` and `--surface` on NVIDIA Windows and Linux;
+  a linear RGBA8 dma-buf on Linux (RK3588 included). Unified DRAM does not make
+  `submit_frame` zero-copy.
 - M8 release gate past CI: one real window from the installed wheel on macOS and
   Linux (smoke tests are headless), TestPyPI `0.0.1rc1`, then PyPI.
 - Accessibility (`accesskit`). HiDPI chrome already shipped with the shared app loop.
@@ -219,8 +224,9 @@ done reading), but users hand it CUDA arrays instead of writing into a raw point
   against cuda-bindings 13.4.3 (measured through its compiled structs); Python validation and
   fallback tests on 3.14 and 3.14t; live window fallback check. **Still never run on NVIDIA.**
   First thing to try there: `python/examples/cuda_viewport.py` and `--surface`.
-- Follow-ups: Linux opaque-fd export; DLPack input (JAX-only users); float/grayscale input needs
-  a conversion kernel; viewports in floating panels only get the host copy.
+- Follow-ups: Linux opaque-fd export and linear RGBA8 dma-buf import are implemented and
+  unverified on NVIDIA and on a real dma-buf; DLPack input (JAX-only users); float/grayscale
+  input needs a conversion kernel; viewports in floating panels only get the host copy.
 
 **M4 — Widget tree, layout, text rendering, input.** `fastgui_core::widget::WidgetTree` wraps
 `taffy::TaffyTree`; `WidgetKind` enum (`Container`/`Label`/`Button`/`Slider`); absolute-rect
@@ -1557,9 +1563,10 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 
 ### Suggested order
 
-7A–7E and 7F.1/7F.2 are done; this order is historical. Next is the Metal/mtlpy import in
-**Current status** above, then Linux dma-buf export. Accessibility still wants the focus
-order from 7A.1 as its navigation order.
+7A–7E and 7F.1/7F.2 are done; this order is historical. Metal import, Linux dma-buf import,
+and Linux opaque-fd CUDA export are in tree (see **Current status**). Next is proving those
+on real hardware, then the M8 window check and a first publish. Accessibility still wants
+the focus order from 7A.1 as its navigation order.
 
 ## How this project has been built (read before continuing)
 

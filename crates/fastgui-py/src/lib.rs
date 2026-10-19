@@ -2,8 +2,10 @@ mod backend;
 mod charts;
 mod cuda;
 mod dialogs;
+mod dmabuf;
 mod image_file;
 mod interaction;
+mod metal_import;
 mod plots;
 mod tier4;
 mod theme;
@@ -15,7 +17,7 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 
 use backend::{Command, CommandDispatch, EventWaker, RenderThreadHandles};
-use fastgui_core::{command_channel, CommandReceiver, CpuFrame, FrameSlot, PixelFormat, Readback};
+use fastgui_core::{command_channel, CommandReceiver, CpuFrame, FrameSlot, ImportedLayer, PixelFormat, Readback};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -30,12 +32,13 @@ pub(crate) fn next_viewport_id() -> u64 {
     NEXT_VIEWPORT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// A GPU-displayed image, fed CPU-side pixel data (`submit_frame`) or CUDA arrays
-/// (`submit_cuda`, or the zero-copy `create_cuda_surface`).
+/// A GPU-displayed image. CPU pixels go through `submit_frame`. Zero-copy paths are
+/// `submit_metal` (macOS), `submit_dmabuf` (Linux), and `create_cuda_surface` / `submit_cuda`.
 #[pyclass]
 pub(crate) struct Viewport {
     viewport_id: u64,
     frame_slot: FrameSlot<CpuFrame>,
+    imported: FrameSlot<ImportedLayer>,
     // Set by `Window.set_viewport` / `set_content` as soon as this viewport is attached to a
     // window, so `submit_frame` can wake the idle event loop and the CUDA paths can reach the
     // right render thread.
@@ -62,6 +65,7 @@ impl Viewport {
         Ok(Self {
             viewport_id: next_viewport_id(),
             frame_slot: FrameSlot::new(),
+            imported: FrameSlot::new(),
             dispatch: Mutex::new(None),
             fit,
             cuda: Mutex::new(cuda::CudaState::default()),
@@ -124,6 +128,45 @@ impl Viewport {
         Ok(())
     }
 
+    /// Sample an existing `MTLTexture` in place. `texture` is an integer pointer or any object
+    /// with `mtl_ptr` (an mtlpy `Texture`). fastgui retains it. The texture must be 2D, on the
+    /// system default Metal device, with `ShaderRead` (`readable=True`) and a float or unorm
+    /// format such as `rgba8Unorm`.
+    ///
+    /// `wait_event` / `signal_event` are `MTLSharedEvent` pointers (or objects with `mtl_ptr`),
+    /// or omitted. fastgui encodes the wait at the start of the command buffer that first draws
+    /// this submission and the signal at the end of that same buffer, once. A submission that is
+    /// replaced before it is drawn signals immediately so the producer is not left waiting.
+    ///
+    /// macOS only. Clears any pending CPU frame.
+    #[pyo3(signature = (texture, *, wait_event=None, wait_value=0, signal_event=None, signal_value=0))]
+    fn submit_metal(
+        &self,
+        texture: &Bound<'_, PyAny>,
+        wait_event: Option<&Bound<'_, PyAny>>,
+        wait_value: u64,
+        signal_event: Option<&Bound<'_, PyAny>>,
+        signal_value: u64,
+    ) -> PyResult<()> {
+        let layer = metal_import::prepare(texture, wait_event, wait_value, signal_event, signal_value)?;
+        self.imported.submit(layer);
+        self.frame_slot.clear();
+        self.wake();
+        Ok(())
+    }
+
+    /// Sample a linear RGBA8 dma-buf. `fd` is duplicated; the caller keeps and closes theirs.
+    /// `stride` 0 means tightly packed (`width * 4`). `modifier` must be 0 (no DRM modifier).
+    /// The producer must finish writing before this call. Linux only. Clears any pending CPU frame.
+    #[pyo3(signature = (fd, width, height, *, stride=0, modifier=0))]
+    fn submit_dmabuf(&self, fd: i32, width: u32, height: u32, stride: u32, modifier: u64) -> PyResult<()> {
+        let layer = dmabuf::prepare(fd, width, height, stride, modifier)?;
+        self.imported.submit(layer);
+        self.frame_slot.clear();
+        self.wake();
+        Ok(())
+    }
+
     /// Submit a CUDA array as the viewport's next frame: anything with
     /// `__cuda_array_interface__` (torch, cupy, numba, jax), shaped `(height, width, 4)` uint8
     /// with contiguous pixels (rows may be padded). Host arrays go to `submit_frame`.
@@ -134,8 +177,8 @@ impl Viewport {
     /// running anything enqueued later, so reusing the array right away is safe. Nothing waits
     /// for the display.
     ///
-    /// Where the window's GPU can share memory with CUDA (Windows, Vulkan, NVIDIA) this is one
-    /// GPU-to-GPU copy. Elsewhere — macOS, Linux for now, a window on a non-NVIDIA GPU, before
+    /// Where the window's GPU can share memory with CUDA (Windows or Linux, Vulkan, NVIDIA) this
+    /// is one GPU-to-GPU copy. Elsewhere — macOS, a window on a non-NVIDIA GPU, before
     /// `window.run()` — it falls back to a copy through host memory; `cuda_status` says which.
     ///
     /// Safe to call from any thread; only the newest frame is shown. **Unverified on NVIDIA
@@ -154,7 +197,10 @@ impl Viewport {
             self.viewport_id,
             image.on_stream(stream),
             array.clone().unbind(),
-            || drop(self.frame_slot.take_latest()),
+            || {
+                self.frame_slot.clear();
+                self.imported.clear();
+            },
         )?;
         if let cuda::Submitted::Host(frame) = submitted {
             self.push_cpu_frame(frame);
@@ -181,14 +227,15 @@ impl Viewport {
     /// f:`. Must be called after `window.set_viewport(viewport)`, once `window.run()` has started,
     /// from a thread other than the one `run()` blocks on. A widget callback runs on that thread
     /// and raises `RuntimeError` instead of waiting. Before `run()` it raises `RuntimeError`
-    /// after a ~2s grace period. Also raises where interop isn't available (macOS, Linux for now,
-    /// a window on a non-NVIDIA GPU); `submit_cuda` works everywhere.
+    /// after a ~2s grace period. Also raises where interop isn't available (macOS, or a device
+    /// without the export extensions); `submit_cuda` works everywhere. Linux exports opaque fds.
     ///
     /// **Unverified on NVIDIA hardware.**
     fn create_cuda_surface(&self, py: Python<'_>, width: u32, height: u32) -> PyResult<cuda::CudaSurface> {
         let dispatch = self.dispatch.lock().unwrap_or_else(|p| p.into_inner()).clone();
         cuda::create_surface(py, &self.cuda, dispatch, self.viewport_id, width, height, || {
-            drop(self.frame_slot.take_latest())
+            self.frame_slot.clear();
+            self.imported.clear();
         })
     }
 }
@@ -202,6 +249,7 @@ impl Viewport {
         widgets::described_viewport(
             self.viewport_id,
             self.frame_slot.clone(),
+            self.imported.clone(),
             self.fit,
             self.id.clone(),
             self.sender.clone(),
@@ -210,7 +258,12 @@ impl Viewport {
     }
 
     fn push_cpu_frame(&self, frame: CpuFrame) {
+        self.imported.clear();
         self.frame_slot.submit(frame);
+        self.wake();
+    }
+
+    fn wake(&self) {
         if let Some(dispatch) = self.dispatch.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
             dispatch.waker.wake();
         }

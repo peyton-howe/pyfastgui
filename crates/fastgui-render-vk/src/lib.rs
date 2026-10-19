@@ -2,6 +2,7 @@
 
 mod app;
 mod cuda_texture;
+mod dmabuf;
 #[cfg(all(test, windows))]
 mod cuda_test;
 mod error;

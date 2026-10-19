@@ -30,9 +30,9 @@ fastgui instead:
   any thread without contention.
 - Takes CUDA arrays directly: `Viewport.submit_cuda(tensor)` accepts anything with
   `__cuda_array_interface__` (torch, cupy, numba, jax), ordered against the caller's stream.
-  On Windows/Vulkan/NVIDIA it's one GPU-to-GPU copy (or none, via `create_cuda_surface`);
-  elsewhere it falls back to a copy through host memory. Currently unverified on NVIDIA
-  hardware; see below.
+  On Windows or Linux with Vulkan and NVIDIA it's one GPU-to-GPU copy (or none, via
+  `create_cuda_surface`; Linux exports opaque fds). Elsewhere it falls back to a copy
+  through host memory. Unverified on NVIDIA hardware; see below.
 
 ## Quickstart
 
@@ -178,8 +178,8 @@ All under [`python/examples/`](python/examples/), runnable directly once install
   `font_size="small"|"body"|"large"` and `gap=`/`padding="small"|"medium"|"large"`
   name theme tokens.
 - **Content**: `Label`, `Button`, `Slider`, `TextInput`, `TextArea`, `Checkbox`, `Radio`, `Toggle`,
-  `SpinBox`, `NumericScrub`, `ProgressBar`, `ComboBox`, `Image`, `Viewport` (arbitrary CPU/GPU
-  frame content).
+  `SpinBox`, `NumericScrub`, `ProgressBar`, `ComboBox`, `Image`, `Viewport` (CPU frames,
+  an `MTLTexture` via `submit_metal`, a linear dma-buf via `submit_dmabuf`, or CUDA).
 - **Docking**: `Panel` (titled, draggable container), `Tabs` (several `Panel`s sharing one
   region), `DockArea` (a split-tree of panels/tabs with full drag-to-rearrange — split, tab-merge
   including growing an existing `Tabs` group, ungroup, whole-window edge drops, and re-docking
@@ -214,28 +214,37 @@ CPU pixmap with `FASTGUI_CHROME=cpu`); `fastgui-py` is the PyO3 layer and picks 
 
 ## Known limitations
 
-- **CUDA interop is unverified on NVIDIA hardware, and is Windows/Vulkan-only.** The Vulkan
-  half (exported slot buffer, timeline semaphores, the pickup copy) is tested headless with
-  zero validation errors on real (AMD) hardware, and the CUDA struct layouts are checked
-  against NVIDIA's own bindings, but the CUDA side has never run on an NVIDIA GPU.
-  `submit_cuda` falls back to a host copy wherever interop isn't available (macOS, Linux, a
-  window on a non-NVIDIA GPU, viewports in floating panels); `create_cuda_surface` raises
-  there instead. `Viewport.cuda_status` says which path is in use.
+- **CUDA interop is unverified on NVIDIA hardware.** The Windows Vulkan half (exported slot
+  buffer, timeline semaphores, the pickup copy) is tested headless with zero validation
+  errors on real (AMD) hardware, and the CUDA struct layouts are checked against NVIDIA's
+  own bindings. Linux exports the same objects as opaque fds when the device advertises
+  `VK_KHR_external_memory_fd` and `VK_KHR_external_semaphore_fd`. The CUDA side has never
+  run on an NVIDIA GPU. `submit_cuda` falls back to a host copy on macOS, on a non-NVIDIA
+  window GPU, in floating panels, and before `run()`; `create_cuda_surface` raises there
+  instead. `Viewport.cuda_status` says which path is in use.
 - **Linux is less exercised than Windows and macOS.** It uses the same Vulkan backend as
   Windows. It has been tested on X11 (Xvfb + xfwm4) with Mesa llvmpipe (software Vulkan):
   every example, the docking/tab/splitter/floating interactions, and a free-threaded 3.14t
   build, all with zero validation errors. It hasn't been tested on Wayland or with a hardware
-  GPU driver, and CUDA interop isn't implemented on Linux yet (`create_cuda_surface` raises
-  `RuntimeError`).
+  GPU driver. Opaque-fd CUDA export and `submit_dmabuf` compile in that backend and are
+  unverified against a real dma-buf or an NVIDIA GPU.
 - **Wayland is untested.** winit picks Wayland when `WAYLAND_DISPLAY` is set; for 0.0.1 treat
   that as unsupported and run under X11 or XWayland (unset `WAYLAND_DISPLAY`).
 - **Prebuilt wheels cover Windows x64, macOS arm64 and manylinux x86_64 only.** CI builds
   and smoke-tests those six wheels on `main`. They are not published. Intel Macs, Linux
   aarch64, and Windows ARM build from source.
-- **No Metal texture import.** A viewport cannot sample an `mtlpy` `Texture` (or any other
-  `MTLTexture`) in place. Frames still arrive as CPU bytes, or as CUDA arrays on
-  Windows/Vulkan/NVIDIA. mtlpy already exposes `Texture.mtl_ptr`; the viewport binding is
-  the next piece of work.
+- **Metal and dma-buf import are in tree and not yet shown in a live window.**
+  `Viewport.submit_metal` and `Image.submit_metal` (macOS) retain an `MTLTexture` — an
+  integer pointer or any object with `mtl_ptr`, such as an mtlpy `Texture` created with
+  `readable=True` in a float format such as `rgba8Unorm` — and sample it. Optional
+  `wait_event` / `signal_event` are `MTLSharedEvent` pointers; fastgui waits and signals
+  once, on the command buffer that first draws that submission. The texture has to be on
+  the system default `MTLDevice`. `submit_dmabuf` (Linux) duplicates the caller's fd and
+  samples a linear RGBA8 dma-buf (`modifier` must be 0; `stride` 0 means tightly packed).
+  The producer finishes writing before the call. DRM modifiers and NV12 are not imported.
+  Rust tests cover the Metal retain, format rejection, and signaling an import that is
+  dropped before it is drawn. Neither path has been driven from mtlpy or a real dma-buf
+  producer into an open window.
 - **Free-threaded Python means 3.14t.** PyO3 0.29 doesn't build for 3.13t (see
   [Install](#install)). GIL builds need CPython 3.11+.
 - **Text editing gaps:** `TextArea` has no soft wrap, the caret doesn't blink, and clicking a
@@ -248,7 +257,8 @@ CPU pixmap with `FASTGUI_CHROME=cpu`); `fastgui-py` is the PyO3 layer and picks 
 - **`Viewport` and `Image` stretch by default**; pass `fit="contain"` to letterbox.
 - **`Table`** has no column resize or sort, and **`DockArea`** layouts aren't saved or restored.
 - **`Viewport.submit_frame` always copies** the numpy/buffer into an owned `Vec<u8>` before
-  upload. Expected for the CPU path; a packed-RGBA camera feed will want a fewer-copy path later.
+  upload. That is the CPU path. Zero-copy is `submit_metal`, `submit_dmabuf`, or
+  `create_cuda_surface`.
 - **No GPU/window integration suite.** `cargo test --workspace` (works on every platform; the
   Metal crate compiles to empty off macOS) covers the core primitives, layout and hit-testing,
   and `python -m pytest python/tests` covers the Python API headlessly. The wheel smoke job

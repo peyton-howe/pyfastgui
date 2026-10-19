@@ -51,12 +51,40 @@ class Viewport:
         """Submit a (H, W, 3|4) uint8 frame. Copies into an owned buffer today; a packed-RGBA
         high-FPS path will want fewer copies later."""
         ...
+    def submit_metal(
+        self,
+        texture: int,
+        *,
+        wait_event: int | None = None,
+        wait_value: int = 0,
+        signal_event: int | None = None,
+        signal_value: int = 0,
+    ) -> None:
+        """Sample an MTLTexture in place (macOS). `texture` is a pointer or an object with
+        `mtl_ptr` (mtlpy `Texture`, `readable=True`, a float/unorm format such as rgba8Unorm).
+        `wait_event` and `signal_event` are MTLSharedEvent pointers; fastgui waits and signals
+        once, on the command buffer that first draws this submission. Clears a pending CPU frame.
+        Raises on other platforms."""
+        ...
+    def submit_dmabuf(
+        self,
+        fd: int,
+        width: int,
+        height: int,
+        *,
+        stride: int = 0,
+        modifier: int = 0,
+    ) -> None:
+        """Sample a linear RGBA8 dma-buf (Linux). `fd` is duplicated. `stride` 0 means
+        tightly packed. `modifier` must be 0. The producer finishes writing before this call.
+        Raises on other platforms."""
+        ...
     def submit_cuda(self, array: Any, stream: CudaStream | None = None) -> None:
         """Submit a CUDA array (anything with __cuda_array_interface__: torch, cupy, numba,
         jax) shaped (H, W, 4) uint8 with contiguous pixels. Copied after the work queued on
         `stream` (default: the array's own), and `stream` waits for the copy, so the array can
-        be reused right away. One GPU-to-GPU copy on Windows/Vulkan/NVIDIA; elsewhere (macOS,
-        Linux for now, a non-NVIDIA window GPU, before run()) a copy through host memory.
+        be reused right away. One GPU-to-GPU copy on Windows or Linux with Vulkan and NVIDIA;
+        elsewhere (macOS, a non-NVIDIA window GPU, before run()) a copy through host memory.
         Host arrays go to submit_frame. Unverified on NVIDIA hardware."""
         ...
     @property
@@ -65,10 +93,11 @@ class Viewport:
         "unused"."""
         ...
     def create_cuda_surface(self, width: int, height: int) -> CudaSurface:
-        """Zero-copy CUDA surface (Windows/Vulkan/NVIDIA). Call after set_viewport(), once
+        """Zero-copy CUDA surface (Windows or Linux, Vulkan, NVIDIA). Call after set_viewport(), once
         window.run() has started, from a thread other than the one run() blocks on. A widget
         callback is that thread and raises RuntimeError. Also raises if run() hasn't started
-        within ~2s, or where interop isn't available (submit_cuda works everywhere)."""
+        within ~2s, or where interop isn't available (macOS, or a device without the export
+        extensions; submit_cuda works everywhere). Linux exports opaque fds. Unverified on NVIDIA."""
         ...
 
 class Label:
@@ -762,6 +791,28 @@ class Image:
         ...
     def set_image(self, data: Any) -> None:
         """Submit a (H, W, 3|4) uint8 array."""
+        ...
+    def submit_metal(
+        self,
+        texture: int,
+        *,
+        wait_event: int | None = None,
+        wait_value: int = 0,
+        signal_event: int | None = None,
+        signal_value: int = 0,
+    ) -> None:
+        """Sample an MTLTexture in place. See `Viewport.submit_metal`."""
+        ...
+    def submit_dmabuf(
+        self,
+        fd: int,
+        width: int,
+        height: int,
+        *,
+        stride: int = 0,
+        modifier: int = 0,
+    ) -> None:
+        """Sample a linear RGBA8 dma-buf. See `Viewport.submit_dmabuf`."""
         ...
     def load(self, path: str | os.PathLike[str]) -> None:
         """Show a PNG or JPEG file (chosen by content, not extension). Raises `OSError` if it

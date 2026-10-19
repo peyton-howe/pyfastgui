@@ -29,8 +29,12 @@ pub const CUDA_SLOTS: usize = 3;
 /// Owns the exported NT handles and closes them on drop. CUDA's import does not take ownership
 /// of a handle, so dropping this right after importing is correct.
 pub struct CudaExportHandles {
-    /// Exported `VkDeviceMemory` holding all slots, `memory_size` bytes.
+    /// Exported `VkDeviceMemory` holding all slots, `memory_size` bytes. Windows NT handle.
+    /// Zero when the export is an fd.
     pub memory_win32_handle: isize,
+    /// Linux `OPAQUE_FD` for the same allocation. `-1` on Windows. CUDA's import consumes a
+    /// duplicate; this one is closed on drop.
+    pub memory_fd: i32,
     pub memory_size: u64,
     /// The allocation is a dedicated one: CUDA needs `CUDA_EXTERNAL_MEMORY_DEDICATED`.
     pub memory_dedicated: bool,
@@ -41,8 +45,10 @@ pub struct CudaExportHandles {
     pub height: u32,
     /// Timeline semaphore CUDA signals when a slot's frame is written.
     pub ready_win32_handle: isize,
+    pub ready_fd: i32,
     /// Timeline semaphore Vulkan signals when it has finished copying a slot out.
     pub release_win32_handle: isize,
+    pub release_fd: i32,
     /// `VkPhysicalDeviceIDProperties::deviceUUID`, to find the CUDA device on the same GPU.
     pub device_uuid: [u8; 16],
     pub shared: Arc<CudaLayerShared>,
@@ -58,7 +64,21 @@ impl Drop for CudaExportHandles {
                 unsafe { windows_sys::Win32::Foundation::CloseHandle(handle as _) };
             }
         }
+        #[cfg(unix)]
+        for fd in [self.memory_fd, self.ready_fd, self.release_fd] {
+            if fd >= 0 {
+                unsafe { close_fd(fd) };
+            }
+        }
     }
+}
+
+#[cfg(unix)]
+unsafe fn close_fd(fd: i32) {
+    extern "C" {
+        fn close(fd: i32) -> i32;
+    }
+    close(fd);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

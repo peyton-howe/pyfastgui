@@ -17,8 +17,8 @@ pub mod theme;
 pub mod widget;
 
 pub use frame::{
-    AtlasUpload, ChromeFrame, ChromeQuad, ChromeQuads, CpuFrame, FrameSlot, PixelFormat, PixelRect,
-    MAX_CPU_FRAME_EXTENT, QUAD_CIRCLE, QUAD_CIRCLE_CLIPPED, QUAD_SOLID, QUAD_SPRITE,
+    AtlasUpload, ChromeFrame, ChromeQuad, ChromeQuads, CpuFrame, DmaBufImport, FrameSlot, ImportedLayer,
+    PixelFormat, PixelRect, MAX_CPU_FRAME_EXTENT, QUAD_CIRCLE, QUAD_CIRCLE_CLIPPED, QUAD_SOLID, QUAD_SPRITE,
 };
 pub use plot::{
     axis_fraction, bin_counts, pan_range, pan_window, raster_bars, raster_contour, raster_gauge, raster_graph,

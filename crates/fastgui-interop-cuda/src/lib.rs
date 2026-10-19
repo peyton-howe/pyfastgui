@@ -1,7 +1,7 @@
-//! CUDA driver API interop for `fastgui`: imports the Vulkan-exported (win32) slot buffer and
-//! timeline semaphores of a CUDA `Viewport` layer, and the stream/event/copy plumbing that moves
-//! a CUDA array into it in order with the caller's own stream. See `fastgui_app::cuda_handles`
-//! for the protocol.
+//! CUDA driver API interop for `fastgui`: imports the Vulkan-exported slot buffer and timeline
+//! semaphores of a CUDA `Viewport` layer (Win32 handles on Windows, opaque fds on Linux), and
+//! the stream/event/copy plumbing that moves a CUDA array into it in order with the caller's
+//! own stream. See `fastgui_app::cuda_handles` for the protocol.
 //!
 //! # Verification status
 //!
@@ -22,11 +22,29 @@ mod driver;
 mod error;
 mod sys;
 
+#[cfg(unix)]
+use std::os::raw::c_int;
 use std::os::raw::c_void;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 pub use error::CudaError;
+
+fn dup_fd(fd: i32) -> Result<i32, CudaError> {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn dup(fd: c_int) -> c_int;
+        }
+        let owned = unsafe { dup(fd) };
+        if owned < 0 { Err(CudaError::DupFd) } else { Ok(owned) }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        Err(CudaError::DupFd)
+    }
+}
 
 use driver::{driver, CudaDriver};
 use sys::*;
@@ -409,6 +427,40 @@ impl ExternalMemory {
         }
     }
 
+    /// Import a POSIX opaque fd (`CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD`). CUDA takes ownership
+    /// of a duplicate of `fd`; the caller still closes `fd`.
+    pub fn import_fd(
+        ctx: &Arc<PrimaryContext>,
+        fd: i32,
+        size: u64,
+        dedicated: bool,
+    ) -> Result<Self, CudaError> {
+        let _current = ctx.enter()?;
+        let d = ctx.driver;
+        let owned = dup_fd(fd)?;
+        unsafe {
+            let desc = CudaExternalMemoryHandleDesc {
+                ty: CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
+                handle: CudaExternalMemoryHandle { fd: owned },
+                size,
+                flags: if dedicated { CUDA_EXTERNAL_MEMORY_DEDICATED } else { 0 },
+                reserved: [0; 16],
+            };
+            let mut handle: CUexternalMemory = std::ptr::null_mut();
+            // The driver takes ownership of `owned` whether or not this call succeeds.
+            if let Err(err) = d.check((d.import_external_memory)(&mut handle, &desc)) {
+                return Err(err);
+            }
+            let buffer_desc = CudaExternalMemoryBufferDesc { offset: 0, size, flags: 0, reserved: [0; 16] };
+            let mut device_ptr: CUdeviceptr = 0;
+            if let Err(err) = d.check((d.external_memory_get_mapped_buffer)(&mut device_ptr, handle, &buffer_desc)) {
+                let _ = (d.destroy_external_memory)(handle);
+                return Err(err);
+            }
+            Ok(Self { ctx: ctx.clone(), handle, device_ptr })
+        }
+    }
+
     /// Device pointer to the start of the allocation.
     pub fn device_ptr(&self) -> u64 {
         self.device_ptr
@@ -453,6 +505,27 @@ impl ExternalSemaphore {
             };
             let mut handle: CUexternalSemaphore = std::ptr::null_mut();
             d.check((d.import_external_semaphore)(&mut handle, &desc))?;
+            Ok(Self { ctx: ctx.clone(), handle })
+        }
+    }
+
+    /// Import a POSIX timeline-semaphore fd. CUDA takes ownership of a duplicate of `fd`.
+    pub fn import_fd_timeline(ctx: &Arc<PrimaryContext>, fd: i32) -> Result<Self, CudaError> {
+        let _current = ctx.enter()?;
+        let d = ctx.driver;
+        let owned = dup_fd(fd)?;
+        unsafe {
+            let desc = CudaExternalSemaphoreHandleDesc {
+                ty: CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD,
+                handle: CudaExternalSemaphoreHandle { fd: owned },
+                flags: 0,
+                reserved: [0; 16],
+            };
+            let mut handle: CUexternalSemaphore = std::ptr::null_mut();
+            // The driver takes ownership of `owned` whether or not this call succeeds.
+            if let Err(err) = d.check((d.import_external_semaphore)(&mut handle, &desc)) {
+                return Err(err);
+            }
             Ok(Self { ctx: ctx.clone(), handle })
         }
     }
