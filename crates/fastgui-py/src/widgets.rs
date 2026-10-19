@@ -3951,7 +3951,7 @@ impl BoxWidget {
     }
 
     /// Make this widget a drag source: dragging it carries `tag` and the bytes `data` returns
-    /// (called with the no arguments when the drag starts; `str` is sent as UTF-8, `None` cancels
+    /// (called with no arguments when the drag starts; `str` is sent as UTF-8, `None` cancels
     /// the drag). Without `data` the payload is empty bytes. `tag=None` stops dragging.
     #[pyo3(signature = (tag, data=None))]
     fn set_drag_source(&self, tag: Option<String>, data: Option<Py<PyAny>>) -> PyResult<()> {

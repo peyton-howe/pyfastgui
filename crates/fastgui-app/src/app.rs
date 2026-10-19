@@ -700,6 +700,10 @@ impl<B: SurfaceBackend> App<B> {
         if self.hover_action_done == Some(id) || self.hover_since.elapsed() < HOVER_ACTION_DELAY {
             return;
         }
+        if self.widget_tree.is_disabled(id) {
+            self.hover_action_done = Some(id);
+            return;
+        }
         let Some(callback) = self.widget_tree.hover_action(id).cloned() else { return };
         self.hover_action_done = Some(id);
         forms::with_tree(&mut self.widget_tree, |_| callback());
@@ -803,6 +807,10 @@ impl<B: SurfaceBackend> App<B> {
         for window_id in due {
             let Some(floater) = self.floating.get_mut(&window_id) else { continue };
             let Some(id) = floater.hover_id else { continue };
+            if floater.widget_tree.is_disabled(id) {
+                floater.hover_action_done = Some(id);
+                continue;
+            }
             let Some(callback) = floater.widget_tree.hover_action(id).cloned() else { continue };
             floater.hover_action_done = Some(id);
             forms::with_tree(&mut floater.widget_tree, |_| callback());
@@ -822,6 +830,9 @@ impl<B: SurfaceBackend> App<B> {
             return;
         }
         let Some(id) = floater.widget_tree.hit_test(x, y) else { return };
+        if floater.widget_tree.is_disabled(id) {
+            return;
+        }
         let mut node = Some(id);
         while let Some(current) = node {
             if let Some(callback) = floater.widget_tree.context_menu(current).cloned() {
@@ -2327,6 +2338,8 @@ impl<B: SurfaceBackend> ApplicationHandler for App<B> {
                     && event.logical_key == Key::Named(winit::keyboard::NamedKey::Escape) =>
             {
                 self.widget_drag.cancel();
+                // The press became a drag; a cancelled drag is not a click either.
+                self.pressed_button = None;
                 self.update_cursor_icon();
                 if let Some(window) = &self.window {
                     window.request_redraw();

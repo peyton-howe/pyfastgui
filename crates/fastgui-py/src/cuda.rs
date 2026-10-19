@@ -346,16 +346,22 @@ fn create_link(
     if !dispatch.waker.is_bound() {
         return Err(CreateError::NotRunning);
     }
+    // Widget callbacks run on the event-loop thread, which is the only thread that can build
+    // the layer. Waiting here freezes the window until the timeout.
+    if dispatch.waker.on_event_loop_thread() {
+        return Err(CreateError::OnEventLoop);
+    }
     let (respond, response) = oneshot_channel();
     dispatch
         .send(Command::CreateCudaSurface { viewport_id, width, height, respond })
         .map_err(|_| CreateError::WindowClosed)?;
     // Creating the layer takes milliseconds; this only guards against a render thread that is
-    // shutting down and never gets to the command.
+    // shutting down and never gets to the command. A timeout is transient: the caller must not
+    // remember it as "interop unavailable".
     const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
     let handles = py
         .detach(|| response.recv_timeout(RESPONSE_TIMEOUT))
-        .map_err(|err| if err.is_timeout() { CreateError::Unsupported("timed out waiting for the render thread".into()) } else { CreateError::WindowClosed })?
+        .map_err(|err| if err.is_timeout() { CreateError::TimedOut } else { CreateError::WindowClosed })?
         .map_err(CreateError::Unsupported)?;
     let waker = dispatch.waker.clone();
     py.detach(|| CudaLink::import(handles, waker)).map_err(CreateError::Unsupported)
@@ -365,6 +371,10 @@ enum CreateError {
     /// `window.run()` hasn't started yet.
     NotRunning,
     WindowClosed,
+    /// The caller is the event-loop thread, so it cannot wait for that thread to build the layer.
+    OnEventLoop,
+    /// The render thread did not answer in time. Not a permanent failure.
+    TimedOut,
     /// Interop can't work for this viewport (with the reason).
     Unsupported(String),
 }
@@ -456,6 +466,10 @@ pub(crate) fn submit(
                     }
                     Err(CreateError::NotRunning) => break "window.run() hasn't started yet".to_owned(),
                     Err(CreateError::WindowClosed) => return Err(PyRuntimeError::new_err("window has already closed")),
+                    Err(CreateError::OnEventLoop) => {
+                        break "can't create the CUDA layer on the window thread; call submit_cuda from another thread".to_owned()
+                    }
+                    Err(CreateError::TimedOut) => break "timed out waiting for the render thread".to_owned(),
                     Err(CreateError::Unsupported(reason)) => {
                         state.unavailable = Some(reason.clone());
                         break reason;
@@ -541,9 +555,9 @@ pub(crate) fn create_surface(
     if !started {
         return Err(PyRuntimeError::new_err(
             "the render thread isn't running yet: viewport.create_cuda_surface() needs a running \
-             window. window.run() starts the render thread and blocks, so call this from a widget \
-             callback or another thread once run() is going (or use submit_cuda, which works before \
-             run())",
+             window. window.run() starts the render thread and blocks, so call this from another \
+             thread once run() is going, not from a widget callback (or use submit_cuda, which \
+             works before run())",
         ));
     }
     let mut state = state.lock_py_attached(py).unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -553,6 +567,16 @@ pub(crate) fn create_surface(
         Ok(link) => Arc::new(link),
         Err(CreateError::NotRunning) => unreachable!("waited for the render thread above"),
         Err(CreateError::WindowClosed) => return Err(PyRuntimeError::new_err("window has already closed")),
+        Err(CreateError::OnEventLoop) => {
+            return Err(PyRuntimeError::new_err(
+                "create_cuda_surface can't run on the window thread: that thread builds the CUDA \
+                 layer, so waiting for it here would hang. Call it from another thread once \
+                 window.run() is going",
+            ))
+        }
+        Err(CreateError::TimedOut) => {
+            return Err(PyRuntimeError::new_err("timed out waiting for the render thread to create the CUDA surface"))
+        }
         Err(CreateError::Unsupported(reason)) => {
             return Err(PyRuntimeError::new_err(format!(
                 "can't create a CUDA surface: {reason}. Viewport.submit_cuda() still works (it \

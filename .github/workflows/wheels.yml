@@ -27,6 +27,11 @@ on:
 permissions:
   contents: read
 
+# One run per ref. A tag publish must finish; a superseded pull-request run can be cancelled.
+concurrency:
+  group: wheels-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   wheels:
     name: ${{ matrix.platform.name }} ${{ matrix.flavor.name }}
@@ -128,6 +133,28 @@ jobs:
         with:
           merge-multiple: true
           path: dist
+      - name: Require the tag to match the built distribution version
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob, os, sys
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          versions = set()
+          for path in glob.glob("dist/*"):
+              name = os.path.basename(path)
+              if not name.startswith("pyfastgui-"):
+                  continue
+              rest = name.removeprefix("pyfastgui-")
+              if name.endswith(".whl"):
+                  versions.add(rest.split("-", 1)[0])
+              elif name.endswith(".tar.gz"):
+                  versions.add(rest.removesuffix(".tar.gz"))
+          if versions != {tag}:
+              sys.exit(
+                  f"tag v{tag} does not match built distribution version(s) {sorted(versions)}. "
+                  "Set version in pyproject.toml to the tag, including an rc suffix, before publishing."
+              )
+          PY
       - uses: pypa/gh-action-pypi-publish@release/v1
         if: contains(github.ref_name, 'rc')
         with:

@@ -19,6 +19,7 @@ use fastgui_core::{command_channel, CommandReceiver, CpuFrame, FrameSlot, PixelF
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::sync::MutexExt;
 use pyo3::types::PyAny;
 
 const DEFAULT_CLEAR_COLOR: [f32; 4] = [0.06, 0.07, 0.09, 1.0];
@@ -171,16 +172,17 @@ impl Viewport {
     /// How the last `submit_cuda` reached the screen: `"interop"` (GPU-to-GPU), `"host copy:
     /// <reason>"`, or `"unused"`.
     #[getter]
-    fn cuda_status(&self) -> String {
-        self.cuda.lock().unwrap_or_else(|p| p.into_inner()).status()
+    fn cuda_status(&self, py: Python<'_>) -> String {
+        self.cuda.lock_py_attached(py).unwrap_or_else(|p| p.into_inner()).status()
     }
 
     /// Allocate a `width`x`height` RGBA8 surface CUDA writes into directly (no copy on the CUDA
     /// side) and return it as a `CudaSurface`; write frames with `with surface.frame(stream) as
-    /// f:`. Must be called after `window.set_viewport(viewport)`, once `window.run()` has started
-    /// (from a callback or another thread); before that it raises `RuntimeError` after a ~2s
-    /// grace period. Also raises where interop isn't available (macOS, Linux for now, a window on
-    /// a non-NVIDIA GPU); `submit_cuda` works everywhere.
+    /// f:`. Must be called after `window.set_viewport(viewport)`, once `window.run()` has started,
+    /// from a thread other than the one `run()` blocks on. A widget callback runs on that thread
+    /// and raises `RuntimeError` instead of waiting. Before `run()` it raises `RuntimeError`
+    /// after a ~2s grace period. Also raises where interop isn't available (macOS, Linux for now,
+    /// a window on a non-NVIDIA GPU); `submit_cuda` works everywhere.
     ///
     /// **Unverified on NVIDIA hardware.**
     fn create_cuda_surface(&self, py: Python<'_>, width: u32, height: u32) -> PyResult<cuda::CudaSurface> {

@@ -238,7 +238,7 @@ impl CudaLayer {
             .subresource_range(color_range());
         device.cmd_pipeline_barrier(
             cmd,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::TRANSFER,
             vk::DependencyFlags::empty(),
             &[],

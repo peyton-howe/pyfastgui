@@ -66,9 +66,9 @@ class Viewport:
         ...
     def create_cuda_surface(self, width: int, height: int) -> CudaSurface:
         """Zero-copy CUDA surface (Windows/Vulkan/NVIDIA). Call after set_viewport(), once
-        window.run() has started (from a callback or another thread); raises RuntimeError if
-        run() hasn't started within ~2s, or where interop isn't available (submit_cuda works
-        everywhere)."""
+        window.run() has started, from a thread other than the one run() blocks on. A widget
+        callback is that thread and raises RuntimeError. Also raises if run() hasn't started
+        within ~2s, or where interop isn't available (submit_cuda works everywhere)."""
         ...
 
 class Label:
