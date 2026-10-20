@@ -70,6 +70,8 @@ pub struct VulkanRenderer {
     cuda_interop: Option<CudaInteropLoaders>,
     /// `VK_EXT_external_memory_dma_buf` + `VK_KHR_external_memory_fd`, when the device has them.
     dmabuf: Option<khr::external_memory_fd::Device>,
+    /// Tiling used to import a modifier-0 RGBA8 dma-buf. `None` when that image is not importable.
+    dmabuf_tiling: Option<crate::dmabuf::ImportTiling>,
     queue_family_index: u32,
     /// `VkPhysicalDeviceIDProperties::deviceUUID`, handed to CUDA to find the same GPU.
     device_uuid: [u8; 16],
@@ -245,6 +247,12 @@ impl VulkanRenderer {
             let dmabuf_import = has_device_extension(khr::external_memory::NAME)
                 && has_device_extension(khr::external_memory_fd::NAME)
                 && has_device_extension(ash::ext::external_memory_dma_buf::NAME);
+            let drm_modifier_ext = has_device_extension(ash::ext::image_drm_format_modifier::NAME);
+            let dmabuf_tiling = if dmabuf_import {
+                crate::dmabuf::rgba8_import_tiling(&instance, pdevice, drm_modifier_ext)
+            } else {
+                None
+            };
 
             let mut device_extension_names_raw = vec![swapchain::NAME.as_ptr()];
             // Required on a portability driver whenever the device lists it.
@@ -274,6 +282,9 @@ impl VulkanRenderer {
             }
             if dmabuf_import {
                 device_extension_names_raw.push(ash::ext::external_memory_dma_buf::NAME.as_ptr());
+            }
+            if dmabuf_import && drm_modifier_ext {
+                device_extension_names_raw.push(ash::ext::image_drm_format_modifier::NAME.as_ptr());
             }
 
             let queue_priorities = [1.0f32];
@@ -390,6 +401,7 @@ impl VulkanRenderer {
                 layers: HashMap::new(),
                 cuda_interop,
                 dmabuf,
+                dmabuf_tiling,
                 queue_family_index,
                 device_uuid,
             };
@@ -659,7 +671,19 @@ impl VulkanRenderer {
         let Some(memory_fd) = &self.dmabuf else {
             return Ok(());
         };
-        let imported = unsafe { crate::dmabuf::import(&self.device, memory_fd, &self.memory_properties, buf) };
+        let Some(tiling) = self.dmabuf_tiling else {
+            return Ok(());
+        };
+        let imported = unsafe {
+            crate::dmabuf::import(
+                &self.device,
+                memory_fd,
+                &self.memory_properties,
+                buf,
+                vk::Format::R8G8B8A8_UNORM,
+                tiling,
+            )
+        };
         let imported = match imported {
             Ok(imported) => imported,
             // A bad fd or stride must not tear down the window. The previous frame stays.

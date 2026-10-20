@@ -1,17 +1,122 @@
 //! Import a linear RGBA8 dma-buf and sample it as a viewport image.
 //!
 //! The caller dups the fd into [`fastgui_core::DmaBufImport`]. `vkAllocateMemory` with
-//! `VkImportMemoryFdInfoKHR` consumes that fd. DRM modifiers and NV12 are not accepted: the
-//! image is `R8G8B8A8_UNORM`, linear, and the row stride must match the image's row pitch.
-//! The producer finishes writing before `submit_dmabuf`; there is no sync-file wait yet.
+//! `VkImportMemoryFdInfoKHR` consumes that fd. Non-zero DRM modifiers and NV12 are not
+//! accepted. The image is `R8G8B8A8_UNORM` with modifier 0. Drivers that reject
+//! `VK_IMAGE_TILING_LINEAR` for dma-buf, including Mali, are asked again with
+//! `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` and `DRM_FORMAT_MOD_LINEAR` (still modifier 0).
+//! The row stride must match the image's row pitch. The producer finishes writing before
+//! `submit_dmabuf`; there is no sync-file wait yet.
 
-use ash::{khr, vk, Device};
+use ash::{khr, vk, Device, Instance};
 use fastgui_core::DmaBufImport;
 
 use crate::error::VkRendererError as Error;
 use crate::texture::find_memory_type_index;
 
 const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+
+/// How a modifier-0 RGBA8 dma-buf is created. `DrmLinear` is still modifier 0; it is the
+/// explicit-layout tiling some drivers require instead of `VK_IMAGE_TILING_LINEAR`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImportTiling {
+    Linear,
+    DrmLinear,
+}
+
+/// `Some` when this device can import the linear RGBA8 image `submit_dmabuf` accepts.
+pub(crate) unsafe fn rgba8_import_tiling(
+    instance: &Instance,
+    pdevice: vk::PhysicalDevice,
+    drm_modifier_ext: bool,
+) -> Option<ImportTiling> {
+    if dma_external_features(instance, pdevice, FORMAT, vk::ImageTiling::LINEAR, None)
+        .is_ok_and(|features| features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE))
+    {
+        return Some(ImportTiling::Linear);
+    }
+    if drm_modifier_ext
+        && dma_external_features(
+            instance,
+            pdevice,
+            FORMAT,
+            vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT,
+            Some(0),
+        )
+        .is_ok_and(|features| features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE))
+    {
+        return Some(ImportTiling::DrmLinear);
+    }
+    None
+}
+
+pub(crate) unsafe fn dma_external_features(
+    instance: &Instance,
+    pdevice: vk::PhysicalDevice,
+    format: vk::Format,
+    tiling: vk::ImageTiling,
+    modifier: Option<u64>,
+) -> Result<vk::ExternalMemoryFeatureFlags, vk::Result> {
+    let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+        .drm_format_modifier(modifier.unwrap_or(0))
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let mut external_format = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let mut format_info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(format)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(tiling)
+        .usage(vk::ImageUsageFlags::SAMPLED)
+        .push_next(&mut external_format);
+    if modifier.is_some() {
+        format_info = format_info.push_next(&mut modifier_info);
+    }
+    let mut external_props = vk::ExternalImageFormatProperties::default();
+    let mut props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+    instance.get_physical_device_image_format_properties2(pdevice, &format_info, &mut props)?;
+    Ok(external_props.external_memory_properties.external_memory_features)
+}
+
+pub(crate) unsafe fn create_dma_image(
+    device: &Device,
+    format: vk::Format,
+    width: u32,
+    height: u32,
+    stride: u32,
+    tiling: ImportTiling,
+) -> Result<vk::Image, vk::Result> {
+    let mut external = vk::ExternalMemoryImageCreateInfo::default()
+        .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let byte_size = u64::from(stride) * u64::from(height);
+    let planes = [vk::SubresourceLayout {
+        offset: 0,
+        size: byte_size,
+        row_pitch: u64::from(stride),
+        array_pitch: byte_size,
+        depth_pitch: byte_size,
+    }];
+    let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+        .drm_format_modifier(0)
+        .plane_layouts(&planes);
+    let mut info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D { width, height, depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .usage(vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::PREINITIALIZED)
+        .push_next(&mut external);
+    info = match tiling {
+        ImportTiling::Linear => info.tiling(vk::ImageTiling::LINEAR),
+        ImportTiling::DrmLinear => info
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .push_next(&mut explicit),
+    };
+    device.create_image(&info, None)
+}
 
 pub struct ImportedImage {
     pub(crate) image: vk::Image,
@@ -35,6 +140,8 @@ pub unsafe fn import(
     memory_fd: &khr::external_memory_fd::Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,
     mut buf: DmaBufImport,
+    format: vk::Format,
+    tiling: ImportTiling,
 ) -> Result<ImportedImage, Error> {
     if buf.modifier != 0 {
         return Err(Error::DmaBufModifier);
@@ -48,23 +155,7 @@ pub unsafe fn import(
         buf.stride
     };
 
-    let mut external = vk::ExternalMemoryImageCreateInfo::default()
-        .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let image = device.create_image(
-        &vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(FORMAT)
-            .extent(vk::Extent3D { width: buf.width, height: buf.height, depth: 1 })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::LINEAR)
-            .usage(vk::ImageUsageFlags::SAMPLED)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::PREINITIALIZED)
-            .push_next(&mut external),
-        None,
-    )?;
+    let image = create_dma_image(device, format, buf.width, buf.height, stride, tiling)?;
     let layout = device.get_image_subresource_layout(
         image,
         vk::ImageSubresource::default().aspect_mask(vk::ImageAspectFlags::COLOR),
@@ -140,7 +231,7 @@ pub unsafe fn import(
         &vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(FORMAT)
+            .format(format)
             .subresource_range(
                 vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)

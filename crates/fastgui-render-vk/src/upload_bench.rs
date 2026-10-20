@@ -49,6 +49,15 @@ struct Bench {
     readback: Option<(vk::Buffer, vk::DeviceMemory, *mut u8)>,
     #[cfg(target_os = "linux")]
     memory_fd: Option<ash::khr::external_memory_fd::Device>,
+    #[cfg(target_os = "linux")]
+    drm_modifier: bool,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct DmaChoice {
+    format: vk::Format,
+    tiling: crate::dmabuf::ImportTiling,
+    label: &'static str,
 }
 
 impl Bench {
@@ -146,12 +155,18 @@ impl Bench {
             && has_dev(ash::khr::external_memory_fd::NAME)
             && has_dev(ash::ext::external_memory_dma_buf::NAME);
         #[cfg(target_os = "linux")]
+        let drm_modifier = dmabuf && has_dev(ash::ext::image_drm_format_modifier::NAME);
+        #[cfg(target_os = "linux")]
         if dmabuf {
             device_extension_names.extend([
                 ash::khr::external_memory::NAME.as_ptr(),
                 ash::khr::external_memory_fd::NAME.as_ptr(),
                 ash::ext::external_memory_dma_buf::NAME.as_ptr(),
             ]);
+        }
+        #[cfg(target_os = "linux")]
+        if drm_modifier {
+            device_extension_names.push(ash::ext::image_drm_format_modifier::NAME.as_ptr());
         }
 
         let priorities = [1.0];
@@ -241,6 +256,8 @@ impl Bench {
             readback,
             #[cfg(target_os = "linux")]
             memory_fd,
+            #[cfg(target_os = "linux")]
+            drm_modifier,
         })
     }
 
@@ -252,16 +269,22 @@ impl Bench {
         eprintln!("cpu copy+upload is a host to_vec plus the mapped linear write, and does not wait for the GPU");
         eprintln!("upload+sample adds a fullscreen sample and queue_wait_idle");
         eprintln!(
-            "dma-buf sample imports a linear RGBA8 buffer this process exported, then samples it"
+            "dma-buf sample imports a modifier-0 image this process exported, then samples it"
         );
+        let dma = self.choose_dmabuf();
         for (width, height) in SIZES {
-            if let Err(err) = self.time_size(width, height) {
+            if let Err(err) = self.time_size(width, height, dma.as_ref()) {
                 eprintln!("{width}x{height}: {err}");
             }
         }
     }
 
-    unsafe fn time_size(&self, width: u32, height: u32) -> Result<(), Error> {
+    unsafe fn time_size(
+        &self,
+        width: u32,
+        height: u32,
+        dma: Option<&DmaChoice>,
+    ) -> Result<(), Error> {
         let pixels = solid(width, height);
         let texture = ViewportTexture::new(&self.device, &self.memory_properties, width, height)?;
         let texture = OwnedTexture {
@@ -298,7 +321,7 @@ impl Bench {
         })?;
         self.check_readback(&pixels, target.image, width, height, "upload+sample");
 
-        self.time_dmabuf(width, height, &pixels, target.view, target.image);
+        self.time_dmabuf(width, height, &pixels, target.view, target.image, dma);
         Ok(())
     }
 
@@ -556,6 +579,7 @@ impl Bench {
         _pixels: &[u8],
         _view: vk::ImageView,
         _target: vk::Image,
+        _dma: Option<&DmaChoice>,
     ) {
         let why = if cfg!(windows) {
             "Windows has no dma-buf import"
@@ -573,6 +597,7 @@ impl Bench {
         pixels: &[u8],
         target_view: vk::ImageView,
         target: vk::Image,
+        choice: Option<&DmaChoice>,
     ) {
         let Some(loader) = &self.memory_fd else {
             eprintln!(
@@ -580,11 +605,11 @@ impl Bench {
             );
             return;
         };
-        if let Err(err) = self.dma_buf_exportable() {
-            eprintln!("{width}x{height} dma-buf sample: skipped ({err})");
+        let Some(choice) = choice else {
+            eprintln!("{width}x{height} dma-buf sample: skipped (no exportable and importable image)");
             return;
-        }
-        let imported = match self.export_linear(loader, width, height, pixels) {
+        };
+        let imported = match self.export_chosen(loader, width, height, pixels, choice) {
             Ok(imported) => imported,
             Err(err) => {
                 eprintln!("{width}x{height} dma-buf sample: skipped ({err})");
@@ -621,63 +646,150 @@ impl Bench {
         self.check_readback(pixels, target, width, height, "dma-buf sample");
     }
 
-    #[cfg(target_os = "linux")]
-    unsafe fn dma_buf_exportable(&self) -> Result<(), String> {
-        let mut external_format = vk::PhysicalDeviceExternalImageFormatInfo::default()
-            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
-            .format(FORMAT)
-            .ty(vk::ImageType::TYPE_2D)
-            .tiling(vk::ImageTiling::LINEAR)
-            .usage(vk::ImageUsageFlags::SAMPLED)
-            .push_next(&mut external_format);
-        let mut external_props = vk::ExternalImageFormatProperties::default();
-        let mut props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
-        self.instance
-            .get_physical_device_image_format_properties2(self.pdevice, &format_info, &mut props)
-            .map_err(|err| format!("linear RGBA8 dma-buf is not supported ({err})"))?;
-        let features = external_props
-            .external_memory_properties
-            .external_memory_features;
-        if !features.contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE)
-            || !features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
-        {
-            return Err("linear RGBA8 dma-buf is not both exportable and importable".into());
-        }
-        Ok(())
+    #[cfg(not(target_os = "linux"))]
+    fn choose_dmabuf(&self) -> Option<DmaChoice> {
+        None
     }
 
-    /// Export a linear sampled RGBA8 image as a dma-buf and import it through `dmabuf::import`.
+    /// Print the dma-buf images this device will export and import, and pick the first one
+    /// `submit_dmabuf` can sample. Modifier 0 with DRM-modifier tiling is still linear RGBA.
+    #[cfg(target_os = "linux")]
+    unsafe fn choose_dmabuf(&self) -> Option<DmaChoice> {
+        if self.memory_fd.is_none() {
+            eprintln!(
+                "dma-buf probe: device does not advertise VK_KHR_external_memory_fd and VK_EXT_external_memory_dma_buf"
+            );
+            return None;
+        }
+        if self.drm_modifier {
+            self.print_modifiers();
+        } else {
+            eprintln!("dma-buf probe: VK_EXT_image_drm_format_modifier is not advertised");
+        }
+        let mut chosen = None;
+        for candidate in self.dma_candidates() {
+            let features = crate::dmabuf::dma_external_features(
+                &self.instance,
+                self.pdevice,
+                candidate.format,
+                candidate.query_tiling,
+                candidate.modifier,
+            );
+            match features {
+                Ok(features) => {
+                    eprintln!("dma-buf probe: {}: {}", candidate.label, feature_text(features));
+                    let usable = features.contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE)
+                        && features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE);
+                    if usable && chosen.is_none() && candidate.selectable {
+                        chosen = Some(DmaChoice {
+                            format: candidate.format,
+                            tiling: candidate.tiling,
+                            label: candidate.label,
+                        });
+                    }
+                }
+                Err(err) => eprintln!("dma-buf probe: {}: {err}", candidate.label),
+            }
+        }
+        match &chosen {
+            Some(choice) => eprintln!("dma-buf sample uses {}", choice.label),
+            None => eprintln!("dma-buf sample: no probed image is both exportable and importable"),
+        }
+        chosen
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dma_candidates(&self) -> Vec<DmaProbe> {
+        use crate::dmabuf::ImportTiling;
+        let mut candidates = vec![
+            DmaProbe::new(
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageTiling::LINEAR,
+                None,
+                ImportTiling::Linear,
+                "R8G8B8A8_UNORM linear",
+                true,
+            ),
+            DmaProbe::new(
+                vk::Format::B8G8R8A8_UNORM,
+                vk::ImageTiling::LINEAR,
+                None,
+                ImportTiling::Linear,
+                "B8G8R8A8_UNORM linear",
+                true,
+            ),
+            DmaProbe::new(
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageTiling::OPTIMAL,
+                None,
+                ImportTiling::Linear,
+                "R8G8B8A8_UNORM optimal",
+                false,
+            ),
+        ];
+        if self.drm_modifier {
+            candidates.push(DmaProbe::new(
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT,
+                Some(0),
+                ImportTiling::DrmLinear,
+                "R8G8B8A8_UNORM drm modifier 0",
+                true,
+            ));
+            candidates.push(DmaProbe::new(
+                vk::Format::B8G8R8A8_UNORM,
+                vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT,
+                Some(0),
+                ImportTiling::DrmLinear,
+                "B8G8R8A8_UNORM drm modifier 0",
+                true,
+            ));
+        }
+        candidates
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe fn print_modifiers(&self) {
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let mut count_list = vk::DrmFormatModifierPropertiesListEXT::default();
+        let mut props = vk::FormatProperties2::default().push_next(&mut count_list);
+        self.instance
+            .get_physical_device_format_properties2(self.pdevice, format, &mut props);
+        let count = count_list.drm_format_modifier_count;
+        if count == 0 {
+            eprintln!("dma-buf modifiers for R8G8B8A8_UNORM: none");
+            return;
+        }
+        let mut modifiers = vec![vk::DrmFormatModifierPropertiesEXT::default(); count as usize];
+        let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+            .drm_format_modifier_properties(&mut modifiers);
+        let mut props = vk::FormatProperties2::default().push_next(&mut list);
+        self.instance
+            .get_physical_device_format_properties2(self.pdevice, format, &mut props);
+        eprintln!("dma-buf modifiers for R8G8B8A8_UNORM: {count}");
+        for modifier in modifiers.iter().take(12) {
+            let sampled = modifier
+                .drm_format_modifier_tiling_features
+                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE);
+            eprintln!(
+                "  modifier {:#x} planes {} sampled {sampled}",
+                modifier.drm_format_modifier, modifier.drm_format_modifier_plane_count
+            );
+        }
+    }
+
+    /// Export a sampled modifier-0 image as a dma-buf and import it through `dmabuf::import`.
     /// `vkAllocateMemory` on the import consumes the fd.
     #[cfg(target_os = "linux")]
-    unsafe fn export_linear(
+    unsafe fn export_chosen(
         &self,
         loader: &ash::khr::external_memory_fd::Device,
         width: u32,
         height: u32,
         pixels: &[u8],
+        choice: &DmaChoice,
     ) -> Result<OwnedImport, Error> {
-        let mut external = vk::ExternalMemoryImageCreateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let image = self.device.create_image(
-            &vk::ImageCreateInfo::default()
-                .image_type(vk::ImageType::TYPE_2D)
-                .format(FORMAT)
-                .extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                })
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::LINEAR)
-                .usage(vk::ImageUsageFlags::SAMPLED)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .initial_layout(vk::ImageLayout::PREINITIALIZED)
-                .push_next(&mut external),
-            None,
-        )?;
+        let image = self.create_export_image(choice, width, height)?;
         let mut export = Exported {
             device: self.device.clone(),
             image,
@@ -751,12 +863,99 @@ impl Bench {
             loader,
             &self.memory_properties,
             DmaBufImport::new(fd, width, height, stride, 0),
+            choice.format,
+            choice.tiling,
         )?;
         drop(export);
         Ok(OwnedImport {
             device: self.device.clone(),
             image: Some(imported),
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe fn create_export_image(
+        &self,
+        choice: &DmaChoice,
+        width: u32,
+        height: u32,
+    ) -> Result<vk::Image, Error> {
+        if choice.tiling == crate::dmabuf::ImportTiling::Linear {
+            return Ok(crate::dmabuf::create_dma_image(
+                &self.device,
+                choice.format,
+                width,
+                height,
+                0,
+                choice.tiling,
+            )?);
+        }
+        let packed = width.saturating_mul(4);
+        let mut strides = vec![packed];
+        for align in [64u32, 256] {
+            let aligned = packed.saturating_add(align - 1) & !(align - 1);
+            if !strides.contains(&aligned) {
+                strides.push(aligned);
+            }
+        }
+        let mut last = vk::Result::ERROR_UNKNOWN;
+        for stride in strides {
+            match crate::dmabuf::create_dma_image(
+                &self.device,
+                choice.format,
+                width,
+                height,
+                stride,
+                choice.tiling,
+            ) {
+                Ok(image) => return Ok(image),
+                Err(err) => last = err,
+            }
+        }
+        Err(last.into())
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct DmaProbe {
+    format: vk::Format,
+    query_tiling: vk::ImageTiling,
+    modifier: Option<u64>,
+    tiling: crate::dmabuf::ImportTiling,
+    label: &'static str,
+    selectable: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl DmaProbe {
+    fn new(
+        format: vk::Format,
+        query_tiling: vk::ImageTiling,
+        modifier: Option<u64>,
+        tiling: crate::dmabuf::ImportTiling,
+        label: &'static str,
+        selectable: bool,
+    ) -> Self {
+        Self { format, query_tiling, modifier, tiling, label, selectable }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn feature_text(flags: vk::ExternalMemoryFeatureFlags) -> String {
+    let mut parts = Vec::new();
+    if flags.contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE) {
+        parts.push("export");
+    }
+    if flags.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE) {
+        parts.push("import");
+    }
+    if flags.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY) {
+        parts.push("dedicated");
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(" ")
     }
 }
 
