@@ -44,8 +44,11 @@ is on PyPI yet.
 
 **Still open:**
 
-- Time the Vulkan CPU upload and a linear RGBA8 dma-buf sample on Windows and Linux
-  (RK3588 included). Unified DRAM does not make `submit_frame` zero-copy.
+- Run `cargo run -p fastgui-render-vk --release --example upload_bench` on Windows and
+  Linux (RK3588 included) and record the numbers. The bench is headless: host copy plus
+  linear upload, that upload plus an offscreen sample, and on Linux a sample of a linear
+  RGBA8 dma-buf. It skips when the device or the dma-buf extensions are missing. Those
+  times are not measured yet. Unified DRAM does not make `submit_frame` zero-copy.
 - Run `python/examples/cuda_viewport.py` and `--surface` on NVIDIA Windows and Linux.
 - M8 release gate past CI: one real window from the installed wheel on macOS and
   Linux (smoke tests are headless), TestPyPI `0.0.1rc1`, then PyPI.

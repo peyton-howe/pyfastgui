@@ -12,9 +12,11 @@ mod quad;
 mod quad_test;
 mod renderer;
 mod texture;
+mod upload_bench;
 
 pub use app::{run, RunError};
 pub use cuda_texture::CudaExportHandles;
 pub use error::VkRendererError;
 pub use fastgui_app::{Command, CommandDispatch, EventWaker, RenderThreadHandles};
 pub use renderer::VulkanRenderer;
+pub use upload_bench::run_upload_bench;

@@ -244,7 +244,17 @@ Measured on this Mac (Apple GPU, 2026-10-19), median of 40 frames after warmup:
 
 `python/examples/metal_import_bench.py` reprints the host-side rows.
 `cargo run -p fastgui-render-mtl --release --example import_bench` reprints the GPU rows.
-Vulkan upload and dma-buf sample times are not measured yet.
+
+Vulkan upload and dma-buf sample times are not measured yet. On Windows or Linux:
+
+```text
+cargo run -p fastgui-render-vk --release --example upload_bench
+```
+
+That is headless. It prints the same median-of-40 shape for a host copy plus the linear
+upload, that upload plus an offscreen sample, and (Linux only) a sample of a linear RGBA8
+dma-buf this process exported and imported. It skips, and still exits 0, when the machine
+has no Vulkan 1.3 device or the dma-buf extensions are missing. Windows has no dma-buf path.
 
 ## Known limitations
 
@@ -277,6 +287,8 @@ Vulkan upload and dma-buf sample times are not measured yet.
   that first draws the submission. See [Frame upload](#frame-upload). `submit_dmabuf`
   (Linux) duplicates the caller's fd and samples a linear RGBA8 dma-buf (`modifier` must
   be 0; `stride` 0 means tightly packed). The producer finishes writing before the call.
+  `cargo run -p fastgui-render-vk --release --example upload_bench` times the Vulkan CPU
+  upload and that dma-buf sample. It has not been run on Windows or Linux hardware yet.
   DRM modifiers and NV12 are not imported. A real dma-buf has not been timed.
 - **Free-threaded Python means 3.14t.** PyO3 0.29 doesn't build for 3.13t (see
   [Install](#install)). GIL builds need CPython 3.11+.
