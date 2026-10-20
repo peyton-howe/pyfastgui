@@ -212,6 +212,40 @@ and `fastgui-render-mtl` (macOS) implement `SurfaceBackend` and provide thin `ru
 CPU pixmap with `FASTGUI_CHROME=cpu`); `fastgui-py` is the PyO3 layer and picks the backend with
 `cfg(target_os = "macos")`.
 
+## Frame upload
+
+`submit_frame` copies a numpy array into a `Vec<u8>`. The render thread then writes those
+bytes into its own texture: `replaceRegion` on Metal, a copy into a host-visible linear
+image on Vulkan. That is the CPU path.
+
+On macOS the fast way to start from numpy is mtlpy, not `submit_frame`. Create the texture
+once with `empty_texture(..., readable=True, writable=False, private=True)` — shader-read
+only, private storage, which is the layout mtlpy documents for GPU sampling. Each frame,
+write into one reused `Buffer` and blit:
+
+```python
+stage.contents[:] = frame.reshape(-1)
+texture.upload_from_buffer(stage)
+viewport.submit_metal(texture)
+```
+
+`submit_metal` retains `Texture.mtl_ptr`. The viewport shader samples that object. When a
+compute kernel has already written the texture, skip the blit; fastgui does not copy the
+pixels.
+
+Measured on this Mac (Apple GPU, 2026-10-19), median of 40 frames after warmup:
+
+| | 1920×1080 | 3840×2160 |
+|---|---:|---:|
+| mtlpy reused buffer + `upload_from_buffer` | 0.38 ms | 0.88 ms |
+| `submit_frame` host copy + Metal `replaceRegion` | 1.01 ms | 3.40 ms |
+| `submit_metal` on a texture that is already resident | 0.14 ms | 0.23 ms |
+| Sample that imported texture, no upload | 0.26 ms | 0.39 ms |
+
+`python/examples/metal_import_bench.py` reprints the host-side rows.
+`cargo run -p fastgui-render-mtl --release --example import_bench` reprints the GPU rows.
+Vulkan upload and dma-buf sample times are not measured yet.
+
 ## Known limitations
 
 - **CUDA interop is unverified on NVIDIA hardware.** The Windows Vulkan half (exported slot
@@ -233,18 +267,17 @@ CPU pixmap with `FASTGUI_CHROME=cpu`); `fastgui-py` is the PyO3 layer and picks 
 - **Prebuilt wheels cover Windows x64, macOS arm64 and manylinux x86_64 only.** CI builds
   and smoke-tests those six wheels on `main`. They are not published. Intel Macs, Linux
   aarch64, and Windows ARM build from source.
-- **Metal and dma-buf import are in tree and not yet shown in a live window.**
-  `Viewport.submit_metal` and `Image.submit_metal` (macOS) retain an `MTLTexture` — an
-  integer pointer or any object with `mtl_ptr`, such as an mtlpy `Texture` created with
-  `readable=True` in a float format such as `rgba8Unorm` — and sample it. Optional
-  `wait_event` / `signal_event` are `MTLSharedEvent` pointers; fastgui waits and signals
-  once, on the command buffer that first draws that submission. The texture has to be on
-  the system default `MTLDevice`. `submit_dmabuf` (Linux) duplicates the caller's fd and
-  samples a linear RGBA8 dma-buf (`modifier` must be 0; `stride` 0 means tightly packed).
-  The producer finishes writing before the call. DRM modifiers and NV12 are not imported.
-  Rust tests cover the Metal retain, format rejection, and signaling an import that is
-  dropped before it is drawn. Neither path has been driven from mtlpy or a real dma-buf
-  producer into an open window.
+- **Metal import is measured on this Mac; dma-buf import is not measured yet.**
+  `Viewport.submit_metal` / `Image.submit_metal` retain an `MTLTexture` (an integer or any
+  object with `mtl_ptr`) and the viewport shader samples it. The fast mtlpy texture is
+  `empty_texture(..., readable=True, writable=False, private=True)` in a float format such
+  as `rgba8Unorm`, on the system default device. For a hot loop, reuse one `Buffer`
+  (`contents[:] = frame`, then `upload_from_buffer`) and call `submit_metal` with that
+  texture. Optional `MTLSharedEvent` pointers wait and signal once, on the command buffer
+  that first draws the submission. See [Frame upload](#frame-upload). `submit_dmabuf`
+  (Linux) duplicates the caller's fd and samples a linear RGBA8 dma-buf (`modifier` must
+  be 0; `stride` 0 means tightly packed). The producer finishes writing before the call.
+  DRM modifiers and NV12 are not imported. A real dma-buf has not been timed.
 - **Free-threaded Python means 3.14t.** PyO3 0.29 doesn't build for 3.13t (see
   [Install](#install)). GIL builds need CPython 3.11+.
 - **Text editing gaps:** `TextArea` has no soft wrap, the caret doesn't blink, and clicking a
@@ -258,7 +291,9 @@ CPU pixmap with `FASTGUI_CHROME=cpu`); `fastgui-py` is the PyO3 layer and picks 
 - **`Table`** has no column resize or sort, and **`DockArea`** layouts aren't saved or restored.
 - **`Viewport.submit_frame` always copies** the numpy/buffer into an owned `Vec<u8>` before
   upload. That is the CPU path. Zero-copy is `submit_metal`, `submit_dmabuf`, or
-  `create_cuda_surface`.
+  `create_cuda_surface`. From a numpy array, mtlpy's blit into a private texture is still
+  a copy, and on this Mac it is faster than `submit_frame` plus `replaceRegion`. See
+  [Frame upload](#frame-upload).
 - **No GPU/window integration suite.** `cargo test --workspace` (works on every platform; the
   Metal crate compiles to empty off macOS) covers the core primitives, layout and hit-testing,
   and `python -m pytest python/tests` covers the Python API headlessly. The wheel smoke job

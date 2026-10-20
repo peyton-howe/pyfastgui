@@ -24,14 +24,16 @@ is on PyPI yet.
 
 **Zero-copy (in tree, not yet shown on the hardware it targets):**
 
-- macOS: `Viewport.submit_metal` / `Image.submit_metal` retain an `MTLTexture`
-  (`mtlpy` `Texture.mtl_ptr`, `readable=True`, a float format such as `rgba8Unorm`)
-  and sample it. Optional `MTLSharedEvent` pointers wait and signal once, on the
-  command buffer that first draws that submission. An import dropped before it is
-  sampled signals on the CPU so the producer is not stuck. Rust tests on this Mac
-  cover retain, integer/usage rejection, and that signal. A live mtlpy texture in
-  an open window is still unchecked. Wrapping a fastgui-owned texture inside mtlpy
-  is still a later mtlpy change. No CUDA on this silo.
+- macOS: `Viewport.submit_metal` / `Image.submit_metal` retain an `MTLTexture` and
+  sample it. The fast mtlpy texture is `readable=True`, `writable=False`,
+  `private=True` (`rgba8Unorm`). A hot loop reuses one `Buffer` and
+  `upload_from_buffer`, then `submit_metal`. Offscreen readback of a private texture
+  matched. A window running `python/examples/metal_import_demo.py` stayed up and
+  closed cleanly. On this Mac (Apple GPU, 2026-10-19) the mtlpy blit was 0.38 ms at
+  1080p and 0.88 ms at 4K; `submit_frame` plus `replaceRegion` was 1.01 ms and
+  3.40 ms. Sampling an already-resident texture was 0.26 ms and 0.39 ms. See
+  README "Frame upload". Wrapping a fastgui-owned texture inside mtlpy is still a
+  later mtlpy change. No CUDA on this silo.
 - Linux: `submit_dmabuf` duplicates the caller's fd and the Vulkan backend samples a
   linear RGBA8 image (`VK_KHR_external_memory_fd` / `VK_EXT_external_memory_dma_buf`,
   modifier 0). `create_cuda_surface` exports opaque fds when the device advertises
@@ -42,10 +44,9 @@ is on PyPI yet.
 
 **Still open:**
 
-- Prove the three paths on real hardware: an mtlpy texture in a Mac viewport;
-  `python/examples/cuda_viewport.py` and `--surface` on NVIDIA Windows and Linux;
-  a linear RGBA8 dma-buf on Linux (RK3588 included). Unified DRAM does not make
-  `submit_frame` zero-copy.
+- Time the Vulkan CPU upload and a linear RGBA8 dma-buf sample on Windows and Linux
+  (RK3588 included). Unified DRAM does not make `submit_frame` zero-copy.
+- Run `python/examples/cuda_viewport.py` and `--surface` on NVIDIA Windows and Linux.
 - M8 release gate past CI: one real window from the installed wheel on macOS and
   Linux (smoke tests are headless), TestPyPI `0.0.1rc1`, then PyPI.
 - Accessibility (`accesskit`). HiDPI chrome already shipped with the shared app loop.
