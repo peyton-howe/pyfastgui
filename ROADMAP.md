@@ -39,19 +39,19 @@ is on PyPI yet.
   modifier 0). `create_cuda_surface` exports opaque fds when the device advertises
   the fd memory and semaphore extensions. DRM modifiers and NV12 are not imported.
   The producer is assumed finished before `submit_dmabuf` (no sync-file). On a
-  Mali-G610 MC4 the headless CPU upload was 2.08 ms at 1080p and 8.37 ms at 4K; the
-  offscreen sample of that upload was 3.25 ms and 11.85 ms, and the center pixel
-  matched. Linear RGBA8 dma-buf was not both exportable and importable, so that
-  sample was skipped. NVIDIA is still unverified. A missing extension drops the
-  import and keeps the previous frame.
+  Mali-G610 MC4, plain linear tiling is export-only. Import uses DRM-modifier tiling
+  with modifier 0. The headless CPU upload was 1.87 ms at 1080p and 7.79 ms at 4K;
+  the offscreen sample of that upload was 3.25 ms and 11.46 ms. Sampling the imported
+  dma-buf was 1.09 ms and 2.00 ms, and the center pixel matched. That buffer was
+  exported by the bench in-process, not by a camera. NVIDIA is still unverified. A
+  missing extension drops the import and keeps the previous frame.
 
 **Still open:**
 
 - Run `cargo run -p fastgui-render-vk --release --example upload_bench` on Windows and
-  record the numbers. The Mali-G610 CPU-upload rows are in README "Frame upload".
-  Unified DRAM does not make `submit_frame` zero-copy. A producer-provided dma-buf on
-  that Mali was not timed: the driver does not offer linear RGBA8 as both exportable
-  and importable.
+  record the numbers. The Mali-G610 rows are in README "Frame upload". Unified DRAM
+  does not make `submit_frame` zero-copy. A dma-buf from a camera or other producer is
+  still untimed. Non-zero DRM modifiers are not imported.
 - Run `python/examples/cuda_viewport.py` and `--surface` on NVIDIA Windows and Linux.
 - M8 release gate past CI: one real window from the installed wheel on macOS and
   Linux (smoke tests are headless), TestPyPI `0.0.1rc1`, then PyPI.

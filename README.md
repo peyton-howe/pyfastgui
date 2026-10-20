@@ -251,13 +251,16 @@ sampled center pixel matched.
 
 | | 1920×1080 | 3840×2160 |
 |---|---:|---:|
-| Host copy + linear upload, no GPU wait | 2.08 ms | 8.37 ms |
-| That upload plus an offscreen sample | 3.25 ms | 11.85 ms |
+| Host copy + linear upload, no GPU wait | 1.87 ms | 7.79 ms |
+| That upload plus an offscreen sample | 3.25 ms | 11.46 ms |
+| Sample an imported modifier-0 RGBA8 dma-buf | 1.09 ms | 2.00 ms |
 
-The dma-buf sample was skipped. The device advertises the dma-buf extensions, and linear
-RGBA8 is not both exportable and importable, which is the image `submit_dmabuf` imports.
-Windows has not been measured. The same command skips, and still exits 0, when the machine
-has no Vulkan 1.3 device. Windows has no dma-buf path.
+Plain `VK_IMAGE_TILING_LINEAR` on this Mali is export-only. `submit_dmabuf` imports modifier
+0 with `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` instead, which the driver marks exportable
+and importable. The dma-buf row is that image, exported and imported in this process. The
+center pixel matched. Non-zero modifiers are still not imported. Windows has not been
+measured. The same command skips, and still exits 0, when the machine has no Vulkan 1.3
+device. Windows has no dma-buf path.
 
 ## Known limitations
 
@@ -275,14 +278,14 @@ has no Vulkan 1.3 device. Windows has no dma-buf path.
   build, all with zero validation errors. A headless upload bench has run on a Mali-G610
   (see [Frame upload](#frame-upload)). It hasn't been tested on Wayland, and no hardware
   GPU has driven a real window. Opaque-fd CUDA export is unverified on NVIDIA. On the
-  Mali-G610, linear RGBA8 dma-buf was not both exportable and importable, so that sample
-  did not run.
+  Mali-G610, modifier-0 RGBA8 imports with DRM-modifier tiling; plain linear tiling is
+  export-only. That dma-buf sample ran headless and the center pixel matched.
 - **Wayland is untested.** winit picks Wayland when `WAYLAND_DISPLAY` is set; for 0.0.1 treat
   that as unsupported and run under X11 or XWayland (unset `WAYLAND_DISPLAY`).
 - **Prebuilt wheels cover Windows x64, macOS arm64 and manylinux x86_64 only.** CI builds
   and smoke-tests those six wheels on `main`. They are not published. Intel Macs, Linux
   aarch64, and Windows ARM build from source.
-- **Metal import is measured on this Mac. Vulkan CPU upload is measured on a Mali-G610. dma-buf import is not.**
+- **Metal import is measured on this Mac. Vulkan CPU upload and a modifier-0 dma-buf sample are measured on a Mali-G610.**
   `Viewport.submit_metal` / `Image.submit_metal` retain an `MTLTexture` (an integer or any
   object with `mtl_ptr`) and the viewport shader samples it. The fast mtlpy texture is
   `empty_texture(..., readable=True, writable=False, private=True)` in a float format such
@@ -292,10 +295,11 @@ has no Vulkan 1.3 device. Windows has no dma-buf path.
   that first draws the submission. See [Frame upload](#frame-upload). `submit_dmabuf`
   (Linux) duplicates the caller's fd and samples a linear RGBA8 dma-buf (`modifier` must
   be 0; `stride` 0 means tightly packed). The producer finishes writing before the call.
-  On a Mali-G610 MC4 the host copy plus linear upload was 2.08 ms at 1080p and 8.37 ms at
-  4K. The offscreen sample of that upload was 3.25 ms and 11.85 ms. Linear RGBA8 was not
-  both exportable and importable there, so the dma-buf sample did not run. Windows has
-  not been measured. DRM modifiers and NV12 are not imported.
+  On a Mali-G610 MC4 the host copy plus linear upload was 1.87 ms at 1080p and 7.79 ms at
+  4K. The offscreen sample of that upload was 3.25 ms and 11.46 ms. Plain linear tiling is
+  export-only there, so import uses DRM-modifier tiling with modifier 0. Sampling that
+  imported image was 1.09 ms and 2.00 ms, and the center pixel matched. Windows has not
+  been measured. Non-zero DRM modifiers and NV12 are not imported.
 - **Free-threaded Python means 3.14t.** PyO3 0.29 doesn't build for 3.13t (see
   [Install](#install)). GIL builds need CPython 3.11+.
 - **Text editing gaps:** `TextArea` has no soft wrap, the caret doesn't blink, and clicking a
