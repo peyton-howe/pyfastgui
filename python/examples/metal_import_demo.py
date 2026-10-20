@@ -31,9 +31,11 @@ def pattern() -> np.ndarray:
 
 def main() -> None:
     device = mtlpy.Device()
-    # Private storage is what a compute texture usually is. Upload blits into it.
+    # Documented fast sampled texture: shader-read only, private storage.
     texture = device.empty_texture((HEIGHT, WIDTH), "rgba8Unorm", readable=True, writable=False, private=True)
-    texture.upload(pattern())
+    stage = device.empty(HEIGHT * WIDTH * 4, np.uint8)
+    stage.contents[:] = pattern().reshape(-1)
+    texture.upload_from_buffer(stage)
     window = fg.Window(title="fastgui — Metal import", width=WIDTH, height=HEIGHT)
     viewport = fg.Viewport()
     window.set_viewport(viewport)
