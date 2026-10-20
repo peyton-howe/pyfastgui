@@ -441,4 +441,137 @@ mod tests {
         drop(owned);
         assert_eq!(unsafe { event.signaledValue() }, 2);
     }
+
+    /// A private texture cannot be read back with `getBytes`. Fill it with a blit, import the
+    /// pointer, and sample it. Matching pixels means the viewport shader read that texture.
+    #[test]
+    fn private_texture_is_sampled_in_place() {
+        use std::ffi::c_void;
+        use std::ptr::NonNull;
+
+        use objc2_metal::{
+            MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+            MTLLoadAction, MTLOrigin, MTLPrimitiveType, MTLRegion, MTLRenderCommandEncoder,
+            MTLRenderPassDescriptor, MTLResource, MTLResourceOptions, MTLScissorRect, MTLSize,
+            MTLStorageMode, MTLStoreAction, MTLTexture, MTLViewport,
+        };
+
+        use crate::pipeline::ViewportPipeline;
+
+        const N: usize = 8;
+        let device = device();
+        let mut rgba = Vec::with_capacity(N * N * 4);
+        for y in 0..N {
+            for x in 0..N {
+                rgba.extend_from_slice(&[
+                    if x < N / 2 { 255 } else { 0 },
+                    if y < N / 2 { 255 } else { 0 },
+                    if (x + y) % 2 == 0 { 255 } else { 0 },
+                    255,
+                ]);
+            }
+        }
+        let descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA8Unorm,
+                N,
+                N,
+                false,
+            )
+        };
+        descriptor.setUsage(MTLTextureUsage::ShaderRead);
+        descriptor.setStorageMode(MTLStorageMode::Private);
+        let source = device.newTextureWithDescriptor(&descriptor).expect("private texture");
+        assert_eq!(source.storageMode(), MTLStorageMode::Private);
+
+        let staging = unsafe {
+            device.newBufferWithBytes_length_options(
+                NonNull::new(rgba.as_ptr() as *mut c_void).unwrap(),
+                rgba.len(),
+                MTLResourceOptions::MTLResourceStorageModeShared,
+            )
+        }
+        .expect("staging buffer");
+        let queue = device.newCommandQueue().expect("queue");
+        let commands = queue.commandBuffer().expect("command buffer");
+        let blit = commands.blitCommandEncoder().expect("blit");
+        unsafe {
+            blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                &staging,
+                0,
+                N * 4,
+                N * N * 4,
+                MTLSize { width: N, height: N, depth: 1 },
+                &source,
+                0,
+                0,
+                MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+        }
+        blit.endEncoding();
+        commands.commit();
+        unsafe { commands.waitUntilCompleted() };
+
+        let layer = prepare_metal_import(ptr(&source), 0, 0, 0, 0).expect("import");
+        let ImportedLayer::Metal { retained, .. } = layer else { panic!("metal") };
+        let owned = retained.downcast::<OwnedMetalImport>().expect("owned");
+        assert_eq!(owned.texture.storageMode(), MTLStorageMode::Private);
+        assert!(std::ptr::eq(&*owned.texture, &*source));
+
+        let pipeline = ViewportPipeline::new(&device, MTLPixelFormat::BGRA8Unorm).expect("pipeline");
+        let target_desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::BGRA8Unorm,
+                N,
+                N,
+                false,
+            )
+        };
+        target_desc.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        target_desc.setStorageMode(MTLStorageMode::Shared);
+        let target = device.newTextureWithDescriptor(&target_desc).expect("target");
+        let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+        let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+        attachment.setTexture(Some(&target));
+        attachment.setLoadAction(MTLLoadAction::Clear);
+        attachment.setStoreAction(MTLStoreAction::Store);
+        let draw = queue.commandBuffer().expect("draw");
+        let encoder = draw.renderCommandEncoderWithDescriptor(&pass).expect("encoder");
+        encoder.setRenderPipelineState(pipeline.state());
+        encoder.setViewport(MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: N as f64,
+            height: N as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        encoder.setScissorRect(MTLScissorRect { x: 0, y: 0, width: N, height: N });
+        unsafe {
+            encoder.setFragmentTexture_atIndex(Some(&owned.texture), 0);
+            encoder.setFragmentSamplerState_atIndex(Some(pipeline.sampler()), 0);
+            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+        }
+        encoder.endEncoding();
+        draw.commit();
+        unsafe { draw.waitUntilCompleted() };
+
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize { width: N, height: N, depth: 1 },
+        };
+        let mut bgra = vec![0u8; N * N * 4];
+        unsafe {
+            target.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                NonNull::new(bgra.as_mut_ptr() as *mut c_void).unwrap(),
+                N * 4,
+                region,
+                0,
+            );
+        }
+        for (i, px) in rgba.chunks_exact(4).enumerate() {
+            let got = &bgra[i * 4..i * 4 + 4];
+            assert_eq!(got, &[px[2], px[1], px[0], px[3]], "pixel {i}");
+        }
+    }
 }

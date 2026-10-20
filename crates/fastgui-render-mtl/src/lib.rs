@@ -16,5 +16,6 @@ mod texture;
 pub use app::{run, RunError};
 pub use error::MtlRendererError;
 pub use import::prepare_metal_import;
+pub use renderer::run_import_window_bench;
 pub use fastgui_app::{Command, CommandDispatch, EventWaker, RenderThreadHandles};
 pub use renderer::MetalRenderer;
