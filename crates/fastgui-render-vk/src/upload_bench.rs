@@ -678,7 +678,7 @@ impl Bench {
                 .push_next(&mut external),
             None,
         )?;
-        let export = Exported {
+        let mut export = Exported {
             device: self.device.clone(),
             image,
             memory: vk::DeviceMemory::null(),
@@ -701,7 +701,8 @@ impl Bench {
             .push_next(&mut export_info)
             .push_next(&mut dedicated_info);
         let memory = self.device.allocate_memory(&alloc_info, None)?;
-        let export = Exported { memory, ..export };
+        // `Exported` implements `Drop`, so the memory field is filled in place.
+        export.memory = memory;
         self.device.bind_image_memory(image, memory, 0)?;
 
         let layout = self.device.get_image_subresource_layout(
