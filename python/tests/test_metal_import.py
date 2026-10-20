@@ -32,6 +32,26 @@ class SubmitMetalTests(unittest.TestCase):
             fg.Viewport().submit_metal(object())
 
 
+class MtlpySubmitTests(unittest.TestCase):
+    def test_mtlpy_texture_is_accepted(self):
+        try:
+            import mtlpy
+        except ImportError:
+            self.skipTest("mtlpy is not installed")
+        import numpy as np
+
+        image = np.zeros((4, 6, 4), np.uint8)
+        image[..., 0] = 255
+        image[..., 3] = 255
+        device = mtlpy.Device()
+        texture = device.texture(image, "rgba8Unorm")
+        fg.Viewport().submit_metal(texture)
+        fg.Image().submit_metal(texture.mtl_ptr)
+        private = device.empty_texture((4, 6), "rgba8Unorm", readable=True, writable=False, private=True)
+        private.upload(image)
+        fg.Viewport().submit_metal(private)
+
+
 class SubmitDmaBufTests(unittest.TestCase):
     def test_refused_off_linux_and_rejects_a_modifier(self):
         viewport = fg.Viewport()

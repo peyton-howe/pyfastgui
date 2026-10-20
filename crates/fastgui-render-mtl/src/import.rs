@@ -300,4 +300,145 @@ mod tests {
         drop(layer);
         assert_eq!(unsafe { event.signaledValue() }, 4);
     }
+
+    /// Fill an RGBA8 texture, import it, and draw it with the same viewport pipeline the window
+    /// uses. The GPU waits on the shared event, then signals it. A later drop must not signal again.
+    #[test]
+    fn imported_rgba8_is_sampled_and_the_shared_event_advances() {
+        use std::ffi::c_void;
+        use std::ptr::NonNull;
+        use std::thread;
+        use std::time::Duration;
+
+        use objc2_metal::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLLoadAction, MTLOrigin, MTLPrimitiveType,
+            MTLRegion, MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLScissorRect, MTLSize,
+            MTLStorageMode, MTLStoreAction, MTLTexture, MTLViewport,
+        };
+
+        use crate::pipeline::ViewportPipeline;
+
+        const N: usize = 8;
+        let device = device();
+        let descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA8Unorm,
+                N,
+                N,
+                false,
+            )
+        };
+        descriptor.setUsage(MTLTextureUsage::ShaderRead);
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        let source = device.newTextureWithDescriptor(&descriptor).expect("source");
+        let mut rgba = Vec::with_capacity(N * N * 4);
+        for y in 0..N {
+            for x in 0..N {
+                rgba.extend_from_slice(&[
+                    if x < N / 2 { 255 } else { 0 },
+                    if y < N / 2 { 255 } else { 0 },
+                    if (x + y) % 2 == 0 { 255 } else { 0 },
+                    255,
+                ]);
+            }
+        }
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+            size: MTLSize { width: N, height: N, depth: 1 },
+        };
+        unsafe {
+            source.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region,
+                0,
+                NonNull::new(rgba.as_ptr() as *mut c_void).unwrap(),
+                N * 4,
+            );
+        }
+
+        let event = device.newSharedEvent().expect("shared event");
+        let event_ptr = Retained::as_ptr(&event) as usize;
+        let layer = prepare_metal_import(ptr(&source), event_ptr, 1, event_ptr, 2).expect("import");
+        let ImportedLayer::Metal { retained, .. } = layer else { panic!("metal") };
+        let mut owned = retained.downcast::<OwnedMetalImport>().expect("owned");
+
+        let pipeline = ViewportPipeline::new(&device, MTLPixelFormat::BGRA8Unorm).expect("pipeline");
+        let target_desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::BGRA8Unorm,
+                N,
+                N,
+                false,
+            )
+        };
+        target_desc.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        target_desc.setStorageMode(MTLStorageMode::Shared);
+        let target = device.newTextureWithDescriptor(&target_desc).expect("target");
+
+        let queue = device.newCommandQueue().expect("queue");
+        let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+        let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+        attachment.setTexture(Some(&target));
+        attachment.setLoadAction(MTLLoadAction::Clear);
+        attachment.setStoreAction(MTLStoreAction::Store);
+        let commands = queue.commandBuffer().expect("command buffer");
+        let (wait_event, _) = owned.wait.clone().expect("wait");
+        let (signal_event, _) = owned.signal.clone().expect("signal");
+        commands.encodeWaitForEvent_value(&wait_event, 1);
+        let encoder = commands.renderCommandEncoderWithDescriptor(&pass).expect("encoder");
+        encoder.setRenderPipelineState(pipeline.state());
+        encoder.setViewport(MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: N as f64,
+            height: N as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        encoder.setScissorRect(MTLScissorRect { x: 0, y: 0, width: N, height: N });
+        unsafe {
+            encoder.setFragmentTexture_atIndex(Some(&owned.texture), 0);
+            encoder.setFragmentSamplerState_atIndex(Some(pipeline.sampler()), 0);
+            encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+        }
+        encoder.endEncoding();
+        commands.encodeSignalEvent_value(&signal_event, 2);
+        commands.commit();
+
+        // A second queue signals the wait. Until it is committed, the draw stays blocked and
+        // the shared event stays at 0. One queue cannot do both: the signal would sit behind
+        // the wait and never run.
+        let signaler = device.newCommandQueue().expect("signal queue");
+        let release = signaler.commandBuffer().expect("signal buffer");
+        release.encodeSignalEvent_value(&wait_event, 1);
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            unsafe { event.signaledValue() },
+            0,
+            "the draw signaled before its wait was released"
+        );
+        release.commit();
+        unsafe { commands.waitUntilCompleted() };
+        assert_eq!(unsafe { event.signaledValue() }, 2);
+
+        let mut bgra = vec![0u8; N * N * 4];
+        unsafe {
+            target.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                NonNull::new(bgra.as_mut_ptr() as *mut c_void).unwrap(),
+                N * 4,
+                region,
+                0,
+            );
+        }
+        for (i, px) in rgba.chunks_exact(4).enumerate() {
+            let got = &bgra[i * 4..i * 4 + 4];
+            let expect = [px[2], px[1], px[0], px[3]];
+            assert_eq!(got, &expect, "pixel {i}");
+        }
+
+        // This draw encoded the signal itself. Dropping the import afterwards must leave it.
+        owned.sync_pending = false;
+        owned.signal = Some((signal_event, 9));
+        drop(owned);
+        assert_eq!(unsafe { event.signaledValue() }, 2);
+    }
 }
