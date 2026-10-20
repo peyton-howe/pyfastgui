@@ -245,16 +245,19 @@ Measured on this Mac (Apple GPU, 2026-10-19), median of 40 frames after warmup:
 `python/examples/metal_import_bench.py` reprints the host-side rows.
 `cargo run -p fastgui-render-mtl --release --example import_bench` reprints the GPU rows.
 
-Vulkan upload and dma-buf sample times are not measured yet. On Windows or Linux:
+Measured on a Mali-G610 MC4 with `cargo run -p fastgui-render-vk --release --example upload_bench`,
+median of 40 frames after warmup. Headless, so this is not a vsync present. Readback of the
+sampled center pixel matched.
 
-```text
-cargo run -p fastgui-render-vk --release --example upload_bench
-```
+| | 1920×1080 | 3840×2160 |
+|---|---:|---:|
+| Host copy + linear upload, no GPU wait | 2.08 ms | 8.37 ms |
+| That upload plus an offscreen sample | 3.25 ms | 11.85 ms |
 
-That is headless. It prints the same median-of-40 shape for a host copy plus the linear
-upload, that upload plus an offscreen sample, and (Linux only) a sample of a linear RGBA8
-dma-buf this process exported and imported. It skips, and still exits 0, when the machine
-has no Vulkan 1.3 device or the dma-buf extensions are missing. Windows has no dma-buf path.
+The dma-buf sample was skipped. The device advertises the dma-buf extensions, and linear
+RGBA8 is not both exportable and importable, which is the image `submit_dmabuf` imports.
+Windows has not been measured. The same command skips, and still exits 0, when the machine
+has no Vulkan 1.3 device. Windows has no dma-buf path.
 
 ## Known limitations
 
@@ -269,15 +272,17 @@ has no Vulkan 1.3 device or the dma-buf extensions are missing. Windows has no d
 - **Linux is less exercised than Windows and macOS.** It uses the same Vulkan backend as
   Windows. It has been tested on X11 (Xvfb + xfwm4) with Mesa llvmpipe (software Vulkan):
   every example, the docking/tab/splitter/floating interactions, and a free-threaded 3.14t
-  build, all with zero validation errors. It hasn't been tested on Wayland or with a hardware
-  GPU driver. Opaque-fd CUDA export and `submit_dmabuf` compile in that backend and are
-  unverified against a real dma-buf or an NVIDIA GPU.
+  build, all with zero validation errors. A headless upload bench has run on a Mali-G610
+  (see [Frame upload](#frame-upload)). It hasn't been tested on Wayland, and no hardware
+  GPU has driven a real window. Opaque-fd CUDA export is unverified on NVIDIA. On the
+  Mali-G610, linear RGBA8 dma-buf was not both exportable and importable, so that sample
+  did not run.
 - **Wayland is untested.** winit picks Wayland when `WAYLAND_DISPLAY` is set; for 0.0.1 treat
   that as unsupported and run under X11 or XWayland (unset `WAYLAND_DISPLAY`).
 - **Prebuilt wheels cover Windows x64, macOS arm64 and manylinux x86_64 only.** CI builds
   and smoke-tests those six wheels on `main`. They are not published. Intel Macs, Linux
   aarch64, and Windows ARM build from source.
-- **Metal import is measured on this Mac; dma-buf import is not measured yet.**
+- **Metal import is measured on this Mac. Vulkan CPU upload is measured on a Mali-G610. dma-buf import is not.**
   `Viewport.submit_metal` / `Image.submit_metal` retain an `MTLTexture` (an integer or any
   object with `mtl_ptr`) and the viewport shader samples it. The fast mtlpy texture is
   `empty_texture(..., readable=True, writable=False, private=True)` in a float format such
@@ -287,9 +292,10 @@ has no Vulkan 1.3 device or the dma-buf extensions are missing. Windows has no d
   that first draws the submission. See [Frame upload](#frame-upload). `submit_dmabuf`
   (Linux) duplicates the caller's fd and samples a linear RGBA8 dma-buf (`modifier` must
   be 0; `stride` 0 means tightly packed). The producer finishes writing before the call.
-  `cargo run -p fastgui-render-vk --release --example upload_bench` times the Vulkan CPU
-  upload and that dma-buf sample. It has not been run on Windows or Linux hardware yet.
-  DRM modifiers and NV12 are not imported. A real dma-buf has not been timed.
+  On a Mali-G610 MC4 the host copy plus linear upload was 2.08 ms at 1080p and 8.37 ms at
+  4K. The offscreen sample of that upload was 3.25 ms and 11.85 ms. Linear RGBA8 was not
+  both exportable and importable there, so the dma-buf sample did not run. Windows has
+  not been measured. DRM modifiers and NV12 are not imported.
 - **Free-threaded Python means 3.14t.** PyO3 0.29 doesn't build for 3.13t (see
   [Install](#install)). GIL builds need CPython 3.11+.
 - **Text editing gaps:** `TextArea` has no soft wrap, the caret doesn't blink, and clicking a

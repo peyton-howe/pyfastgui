@@ -38,17 +38,20 @@ is on PyPI yet.
   linear RGBA8 image (`VK_KHR_external_memory_fd` / `VK_EXT_external_memory_dma_buf`,
   modifier 0). `create_cuda_surface` exports opaque fds when the device advertises
   the fd memory and semaphore extensions. DRM modifiers and NV12 are not imported.
-  The producer is assumed finished before `submit_dmabuf` (no sync-file). Neither
-  path has run on NVIDIA or on an RK3588 dma-buf. A missing extension drops the
+  The producer is assumed finished before `submit_dmabuf` (no sync-file). On a
+  Mali-G610 MC4 the headless CPU upload was 2.08 ms at 1080p and 8.37 ms at 4K; the
+  offscreen sample of that upload was 3.25 ms and 11.85 ms, and the center pixel
+  matched. Linear RGBA8 dma-buf was not both exportable and importable, so that
+  sample was skipped. NVIDIA is still unverified. A missing extension drops the
   import and keeps the previous frame.
 
 **Still open:**
 
 - Run `cargo run -p fastgui-render-vk --release --example upload_bench` on Windows and
-  Linux (RK3588 included) and record the numbers. The bench is headless: host copy plus
-  linear upload, that upload plus an offscreen sample, and on Linux a sample of a linear
-  RGBA8 dma-buf. It skips when the device or the dma-buf extensions are missing. Those
-  times are not measured yet. Unified DRAM does not make `submit_frame` zero-copy.
+  record the numbers. The Mali-G610 CPU-upload rows are in README "Frame upload".
+  Unified DRAM does not make `submit_frame` zero-copy. A producer-provided dma-buf on
+  that Mali was not timed: the driver does not offer linear RGBA8 as both exportable
+  and importable.
 - Run `python/examples/cuda_viewport.py` and `--surface` on NVIDIA Windows and Linux.
 - M8 release gate past CI: one real window from the installed wheel on macOS and
   Linux (smoke tests are headless), TestPyPI `0.0.1rc1`, then PyPI.
