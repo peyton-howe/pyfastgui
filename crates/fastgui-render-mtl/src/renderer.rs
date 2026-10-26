@@ -326,15 +326,9 @@ impl MetalRenderer {
         Ok(())
     }
 
-    /// An imported texture that a previous command buffer sampled has to finish before its
-    /// retain is released. One that never reached a command buffer just drops (and signals).
+    /// Command buffers retain sampled textures until completion. An import that never reached
+    /// a command buffer signals its producer on drop.
     fn retire_layer(&mut self, layer: ViewportLayer) {
-        let sampled = matches!(&layer.pixels, LayerPixels::Imported(import) if !import.sync_pending);
-        if sampled {
-            if let Some(commands) = &self.last_commands {
-                unsafe { commands.waitUntilCompleted() };
-            }
-        }
         drop(layer);
     }
 

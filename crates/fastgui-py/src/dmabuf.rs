@@ -39,12 +39,47 @@ pub(crate) fn prepare(fd: i32, width: u32, height: u32, stride: u32, modifier: u
 #[cfg(target_os = "linux")]
 fn dup_fd(fd: i32) -> Result<i32, ()> {
     extern "C" {
-        fn dup(fd: i32) -> i32;
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     }
-    let owned = unsafe { dup(fd) };
+    const F_DUPFD_CLOEXEC: i32 = 1030;
+    // SAFETY: `fd` must refer to the caller's open descriptor; fcntl rejects invalid fds.
+    // The fresh duplicate is uniquely owned and passed to DmaBufImport, which closes it on drop
+    // unless ownership is transferred to the driver.
+    let owned = unsafe { fcntl(fd, F_DUPFD_CLOEXEC, 0) };
     if owned < 0 {
         Err(())
     } else {
         Ok(owned)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::io::{ErrorKind, Read};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn duplicate_is_close_on_exec_and_owned_by_import() {
+        extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        const F_GETFD: i32 = 1;
+        const FD_CLOEXEC: i32 = 1;
+
+        let (source, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let import = DmaBufImport::new(dup_fd(source.as_raw_fd()).unwrap(), 1, 1, 4, 0);
+        // SAFETY: `import` keeps the duplicated fd open for this query.
+        let flags = unsafe { fcntl(import.fd(), F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & FD_CLOEXEC, 0);
+        drop(source);
+        let mut byte = [0];
+        assert_eq!(peer.read(&mut byte).unwrap_err().kind(), ErrorKind::WouldBlock);
+        drop(import);
+        assert_eq!(peer.read(&mut byte).unwrap(), 0);
+        assert!(dup_fd(-1).is_err());
     }
 }

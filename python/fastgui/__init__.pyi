@@ -1,5 +1,5 @@
 import os
-from typing import Any, Callable, Literal, Sequence, Union
+from typing import Any, Callable, Literal, Protocol, Sequence, Union
 
 RGBA = tuple[float, float, float, float]
 # A font size in points, or a theme size by name.
@@ -10,6 +10,9 @@ Spacing = Union[float, Literal["small", "medium", "large"]]
 # A CUDA stream: an int CUstream handle, torch.cuda.Stream, a cupy stream, or any object with
 # __cuda_stream__().
 CudaStream = Any
+
+class MetalPointer(Protocol):
+    mtl_ptr: int
 
 class CudaFrame:
     """One frame of a CudaSurface. Use as a context manager; inside the block it exposes
@@ -53,11 +56,11 @@ class Viewport:
         ...
     def submit_metal(
         self,
-        texture: int,
+        texture: int | MetalPointer,
         *,
-        wait_event: int | None = None,
+        wait_event: int | MetalPointer | None = None,
         wait_value: int = 0,
-        signal_event: int | None = None,
+        signal_event: int | MetalPointer | None = None,
         signal_value: int = 0,
     ) -> None:
         """Sample an MTLTexture in place (macOS). `texture` is a pointer or an object with
@@ -776,7 +779,8 @@ class ComboBox:
     def selected(self) -> int | None: ...
 
 class Image:
-    """Static CPU image composited like a `Viewport`. Feed pixels with `set_image`."""
+    """Image composited like a `Viewport`. Feed CPU pixels with `set_image`, or submit GPU
+    textures with `submit_metal` / `submit_dmabuf`."""
     def __init__(
         self,
         width: float | None = None,
@@ -794,11 +798,11 @@ class Image:
         ...
     def submit_metal(
         self,
-        texture: int,
+        texture: int | MetalPointer,
         *,
-        wait_event: int | None = None,
+        wait_event: int | MetalPointer | None = None,
         wait_value: int = 0,
-        signal_event: int | None = None,
+        signal_event: int | MetalPointer | None = None,
         signal_value: int = 0,
     ) -> None:
         """Sample an MTLTexture in place. See `Viewport.submit_metal`."""

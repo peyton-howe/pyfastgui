@@ -30,14 +30,30 @@ use std::sync::Arc;
 
 pub use error::CudaError;
 
-fn dup_fd(fd: i32) -> Result<i32, CudaError> {
+/// Owns a duplicate until a successful CUDA import consumes it.
+struct ImportFd(i32);
+
+impl Drop for ImportFd {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            extern "C" {
+                fn close(fd: c_int) -> c_int;
+            }
+            // SAFETY: this wrapper uniquely owns a valid duplicate from `dup_fd`.
+            unsafe { close(self.0) };
+        }
+    }
+}
+
+fn dup_fd(fd: i32) -> Result<ImportFd, CudaError> {
     #[cfg(unix)]
     {
         extern "C" {
             fn dup(fd: c_int) -> c_int;
         }
         let owned = unsafe { dup(fd) };
-        if owned < 0 { Err(CudaError::DupFd) } else { Ok(owned) }
+        if owned < 0 { Err(CudaError::DupFd) } else { Ok(ImportFd(owned)) }
     }
     #[cfg(not(unix))]
     {
@@ -441,16 +457,15 @@ impl ExternalMemory {
         unsafe {
             let desc = CudaExternalMemoryHandleDesc {
                 ty: CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
-                handle: CudaExternalMemoryHandle { fd: owned },
+                handle: CudaExternalMemoryHandle { fd: owned.0 },
                 size,
                 flags: if dedicated { CUDA_EXTERNAL_MEMORY_DEDICATED } else { 0 },
                 reserved: [0; 16],
             };
             let mut handle: CUexternalMemory = std::ptr::null_mut();
-            // The driver takes ownership of `owned` whether or not this call succeeds.
-            if let Err(err) = d.check((d.import_external_memory)(&mut handle, &desc)) {
-                return Err(err);
-            }
+            d.check((d.import_external_memory)(&mut handle, &desc))?;
+            // CUDA owns the fd only after a successful import.
+            std::mem::forget(owned);
             let buffer_desc = CudaExternalMemoryBufferDesc { offset: 0, size, flags: 0, reserved: [0; 16] };
             let mut device_ptr: CUdeviceptr = 0;
             if let Err(err) = d.check((d.external_memory_get_mapped_buffer)(&mut device_ptr, handle, &buffer_desc)) {
@@ -517,15 +532,14 @@ impl ExternalSemaphore {
         unsafe {
             let desc = CudaExternalSemaphoreHandleDesc {
                 ty: CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD,
-                handle: CudaExternalSemaphoreHandle { fd: owned },
+                handle: CudaExternalSemaphoreHandle { fd: owned.0 },
                 flags: 0,
                 reserved: [0; 16],
             };
             let mut handle: CUexternalSemaphore = std::ptr::null_mut();
-            // The driver takes ownership of `owned` whether or not this call succeeds.
-            if let Err(err) = d.check((d.import_external_semaphore)(&mut handle, &desc)) {
-                return Err(err);
-            }
+            d.check((d.import_external_semaphore)(&mut handle, &desc))?;
+            // CUDA owns the fd only after a successful import.
+            std::mem::forget(owned);
             Ok(Self { ctx: ctx.clone(), handle })
         }
     }
@@ -572,6 +586,23 @@ impl Drop for ExternalSemaphore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unconsumed_duplicate_is_closed_on_drop() {
+        use std::io::{ErrorKind, Read};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (source, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let owned = dup_fd(source.as_raw_fd()).unwrap();
+        drop(source);
+        let mut byte = [0];
+        assert_eq!(peer.read(&mut byte).unwrap_err().kind(), ErrorKind::WouldBlock);
+        drop(owned);
+        assert_eq!(peer.read(&mut byte).unwrap(), 0);
+    }
 
     /// On a machine without CUDA (like the one this was written on) every entry point fails
     /// cleanly with `Load` rather than crashing; with CUDA, loading succeeds.

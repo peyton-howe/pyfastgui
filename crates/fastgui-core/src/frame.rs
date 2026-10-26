@@ -308,30 +308,28 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dmabuf_drop_closes_fd_and_take_fd_disarms_it() {
+        use std::io::{ErrorKind, Read};
         use std::os::fd::{FromRawFd, OwnedFd};
-        extern "C" {
-            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
-        }
-        const F_GETFD: i32 = 1;
 
-        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        b.set_nonblocking(true).unwrap();
+        let mut byte = [0];
         let raw = std::os::fd::IntoRawFd::into_raw_fd(a);
-        drop(b);
         let mut import = DmaBufImport::new(raw, 2, 3, 8, 0);
         assert_eq!(import.fd(), raw);
         let taken = import.take_fd();
         assert_eq!(taken, raw);
         assert_eq!(import.fd(), -1);
         drop(import);
-        assert!(unsafe { fcntl(taken, F_GETFD) } >= 0, "take_fd leaves the fd open");
+        assert_eq!(b.read(&mut byte).unwrap_err().kind(), ErrorKind::WouldBlock);
         drop(unsafe { OwnedFd::from_raw_fd(taken) });
-        assert_eq!(unsafe { fcntl(raw, F_GETFD) }, -1);
+        assert_eq!(b.read(&mut byte).unwrap(), 0);
 
-        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        b.set_nonblocking(true).unwrap();
         let raw = std::os::fd::IntoRawFd::into_raw_fd(a);
-        drop(b);
         drop(DmaBufImport::new(raw, 1, 1, 4, 0));
-        assert_eq!(unsafe { fcntl(raw, F_GETFD) }, -1, "drop closes the fd");
+        assert_eq!(b.read(&mut byte).unwrap(), 0, "drop closes the fd");
     }
 
     #[test]

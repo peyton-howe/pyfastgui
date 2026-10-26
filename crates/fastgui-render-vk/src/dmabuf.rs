@@ -87,13 +87,12 @@ pub(crate) unsafe fn create_dma_image(
 ) -> Result<vk::Image, vk::Result> {
     let mut external = vk::ExternalMemoryImageCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let byte_size = u64::from(stride) * u64::from(height);
     let planes = [vk::SubresourceLayout {
         offset: 0,
-        size: byte_size,
+        size: 0,
         row_pitch: u64::from(stride),
-        array_pitch: byte_size,
-        depth_pitch: byte_size,
+        array_pitch: 0,
+        depth_pitch: 0,
     }];
     let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
         .drm_format_modifier(0)
@@ -156,9 +155,13 @@ pub unsafe fn import(
     };
 
     let image = create_dma_image(device, format, buf.width, buf.height, stride, tiling)?;
+    let aspect = match tiling {
+        ImportTiling::Linear => vk::ImageAspectFlags::COLOR,
+        ImportTiling::DrmLinear => vk::ImageAspectFlags::MEMORY_PLANE_0_EXT,
+    };
     let layout = device.get_image_subresource_layout(
         image,
-        vk::ImageSubresource::default().aspect_mask(vk::ImageAspectFlags::COLOR),
+        vk::ImageSubresource::default().aspect_mask(aspect),
     );
     if layout.offset != 0 || layout.row_pitch != u64::from(stride) {
         device.destroy_image(image, None);
@@ -214,10 +217,11 @@ pub unsafe fn import(
     if dedicated {
         alloc_info = alloc_info.push_next(&mut dedicated_info);
     }
-    // `VkImportMemoryFdInfoKHR` consumes `fd` on both success and failure.
+    // `VkImportMemoryFdInfoKHR` consumes `fd` only on success.
     let memory = match device.allocate_memory(&alloc_info, None) {
         Ok(memory) => memory,
         Err(err) => {
+            close_fd(fd);
             device.destroy_image(image, None);
             return Err(err.into());
         }

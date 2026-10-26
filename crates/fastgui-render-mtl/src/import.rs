@@ -5,7 +5,7 @@
 //! dropping it before a command buffer has encoded its signal unblocks the producer.
 
 use objc2::rc::Retained;
-use objc2::runtime::{Bool, ProtocolObject};
+use objc2::runtime::{AnyObject, AnyProtocol, Bool, ProtocolObject};
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent, MTLPixelFormat,
     MTLResource, MTLTexture, MTLTextureType, MTLTextureUsage,
@@ -20,14 +20,13 @@ pub(crate) struct OwnedMetalImport {
     pub(crate) height: u32,
     pub(crate) wait: Option<(Retained<ProtocolObject<dyn MTLEvent>>, u64)>,
     pub(crate) signal: Option<(Retained<ProtocolObject<dyn MTLEvent>>, u64)>,
-    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     /// Wait/signal still need to be encoded. Cleared once a command buffer has them.
     pub(crate) sync_pending: bool,
 }
 
-// Metal textures, events, and command queues may be retained and signaled from any thread.
+// Metal textures and events may be retained and signaled from any thread.
 // `Retained<ProtocolObject<dyn _>>` does not implement `Send` (the protocol object is a trait
-// object), but these three objects are thread-safe and the mailbox crosses threads.
+// object), but these objects are thread-safe and the mailbox crosses threads.
 unsafe impl Send for OwnedMetalImport {}
 
 impl Drop for OwnedMetalImport {
@@ -42,7 +41,8 @@ impl Drop for OwnedMetalImport {
         if signal_shared_event(&event, value) {
             return;
         }
-        let Some(command_buffer) = self.queue.commandBuffer() else { return };
+        let Some(queue) = self.texture.device().newCommandQueue() else { return };
+        let Some(command_buffer) = queue.commandBuffer() else { return };
         command_buffer.encodeSignalEvent_value(&event, value);
         command_buffer.commit();
     }
@@ -80,14 +80,12 @@ pub fn prepare_metal_import(
     }
     let wait = retain_event(wait_event, &device, "wait_event")?.map(|event| (event, wait_value));
     let signal = retain_event(signal_event, &device, "signal_event")?.map(|event| (event, signal_value));
-    let queue = device.newCommandQueue().ok_or("failed to create a Metal command queue")?;
     let retained = OwnedMetalImport {
         texture: retained_texture,
         width,
         height,
         wait,
         signal,
-        queue,
         sync_pending: true,
     };
     Ok(ImportedLayer::Metal {
@@ -106,6 +104,7 @@ fn retain_texture(
     ptr: usize,
     default_device: &ProtocolObject<dyn MTLDevice>,
 ) -> Result<Retained<ProtocolObject<dyn MTLTexture>>, String> {
+    require_protocol(ptr, "texture", "MTLTexture")?;
     let texture: Retained<ProtocolObject<dyn MTLTexture>> =
         unsafe { Retained::retain(ptr as *mut ProtocolObject<dyn MTLTexture>) }
             .ok_or("texture pointer is null")?;
@@ -141,6 +140,7 @@ fn retain_event(
     if ptr == 0 {
         return Ok(None);
     }
+    require_protocol(ptr, label, "MTLEvent")?;
     let event: Retained<ProtocolObject<dyn MTLEvent>> =
         unsafe { Retained::retain(ptr as *mut ProtocolObject<dyn MTLEvent>) }
             .ok_or_else(|| format!("{label} pointer is null"))?;
@@ -150,6 +150,19 @@ fn retain_event(
         }
     }
     Ok(Some(event))
+}
+
+fn require_protocol(ptr: usize, label: &str, name: &str) -> Result<(), String> {
+    // SAFETY: callers supply a live Objective-C object. Check its protocol before casting
+    // it to a Metal protocol object or sending any Metal selectors.
+    let object = unsafe { (ptr as *const AnyObject).as_ref() }
+        .ok_or_else(|| format!("{label} pointer is null"))?;
+    let protocol = AnyProtocol::get(name).ok_or_else(|| format!("Metal protocol {name} is unavailable"))?;
+    let conforms: Bool = unsafe { objc2::msg_send![object, conformsToProtocol: protocol] };
+    if !conforms.as_bool() {
+        return Err(format!("{label} object must conform to {name}"));
+    }
+    Ok(())
 }
 
 fn same_device(a: &ProtocolObject<dyn MTLDevice>, b: &ProtocolObject<dyn MTLDevice>) -> bool {
@@ -261,6 +274,21 @@ mod tests {
     fn null_texture_is_rejected() {
         let err = prepare_metal_import(0, 0, 0, 0, 0).unwrap_err();
         assert!(err.contains("null"), "{err}");
+    }
+
+    #[test]
+    fn wrong_object_protocols_are_rejected() {
+        let device = device();
+        let texture = texture(&device, MTLPixelFormat::RGBA8Unorm, MTLTextureUsage::ShaderRead);
+        let event = device.newSharedEvent().expect("shared event");
+        let event_ptr = Retained::as_ptr(&event) as usize;
+
+        let err = prepare_metal_import(event_ptr, 0, 0, 0, 0).unwrap_err();
+        assert!(err.contains("texture object must conform to MTLTexture"), "{err}");
+        let err = prepare_metal_import(ptr(&texture), ptr(&texture), 0, 0, 0).unwrap_err();
+        assert!(err.contains("wait_event object must conform to MTLEvent"), "{err}");
+        let err = prepare_metal_import(ptr(&texture), 0, 0, ptr(&texture), 0).unwrap_err();
+        assert!(err.contains("signal_event object must conform to MTLEvent"), "{err}");
     }
 
     #[test]
