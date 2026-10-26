@@ -70,14 +70,15 @@ is on PyPI yet.
   different GPU. Parked imports for a viewport that later shows a CPU frame are freed.
   `Viewport.submit_frame` could also use `VK_EXT_external_memory_host` (probed, 4096-byte
   alignment); not built.
+- The Windows `cargo run -p fastgui-render-vk --release --example upload_bench` run is done on
+  the Radeon 840M: CPU upload and the D3D11 probe lines; the D3D11 sample is a test, not a bench
+  row. The Mali-G610 rows are in README "Frame upload". Unified DRAM does not make
+  `submit_frame` zero-copy.
 
 **Still open:**
 
-- Run `cargo run -p fastgui-render-vk --release --example upload_bench` on Windows (done on
-  the Radeon 840M: CPU upload and the D3D11 probe lines; the D3D11 sample is a test, not a bench
-  row). The Mali-G610 rows are in README "Frame upload". Unified DRAM
-  does not make `submit_frame` zero-copy. A dma-buf from a camera or other producer is
-  still untimed. Non-zero DRM modifiers are not imported.
+- A dma-buf from a camera or other producer is still untimed. Non-zero DRM modifiers are
+  not imported.
 - Run `python/examples/cuda_viewport.py` and `--surface` on NVIDIA Windows and Linux.
 - M8 release gate past CI: one real window from the installed wheel on macOS and
   Linux (smoke tests are headless), TestPyPI `0.0.1rc1`, then PyPI.

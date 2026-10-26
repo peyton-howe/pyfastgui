@@ -822,7 +822,7 @@ class ComboBox:
 
 class Image:
     """Image composited like a `Viewport`. Feed CPU pixels with `set_image`, or submit GPU
-    textures with `submit_metal` / `submit_dmabuf`."""
+    textures with `submit_metal` / `submit_dmabuf` / `submit_d3d11`."""
     def __init__(
         self,
         width: float | None = None,

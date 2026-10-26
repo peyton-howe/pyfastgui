@@ -1091,7 +1091,6 @@ impl DmaProbe {
     }
 }
 
-#[cfg(any(target_os = "linux", windows))]
 fn feature_text(flags: vk::ExternalMemoryFeatureFlags) -> String {
     let mut parts = Vec::new();
     if flags.contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE) {
