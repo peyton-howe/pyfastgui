@@ -82,6 +82,42 @@ class Viewport:
         tightly packed. `modifier` must be 0. The producer finishes writing before this call.
         Raises on other platforms."""
         ...
+    def submit_d3d11(
+        self,
+        handle: int,
+        width: int,
+        height: int,
+        *,
+        format: Literal["rgba8", "bgra8"] | None = None,
+        fence: int | None = None,
+        wait_value: int = 0,
+        signal_value: int = 0,
+    ) -> None:
+        """Sample a shared Direct3D 11 texture in place (Windows, Vulkan). `handle` is an NT handle
+        from `IDXGIResource1::CreateSharedHandle` on a 2D R8G8B8A8_UNORM or B8G8R8A8_UNORM texture
+        created with `D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE`; it is
+        duplicated, so the caller keeps theirs. Create the D3D device on the adapter whose LUID is
+        `adapter_luid()`.
+
+        fastgui reads the texture's real size and format from D3D: `width` and `height` must match,
+        and `format` is detected when `None` and checked when given. A mismatch, or a handle it
+        can't open, is reported in `d3d11_status` and the previous frame stays.
+
+        `fence` is an NT handle from a shared `ID3D11Fence`/`ID3D12Fence`. fastgui waits for
+        `wait_value` before sampling (up to 100 ms; if it is late the submission is dropped) and
+        signals `signal_value` once the frame that first draws this submission has finished
+        sampling; `0` skips that half. Without a fence the producer must have finished (flushed and
+        waited) before the call. Resubmit the same handle each frame: a texture already imported
+        (up to four per viewport) is not imported again.
+
+        Raises `ValueError` on a bad handle, size, format or fence, `RuntimeError` on other
+        platforms."""
+        ...
+    @property
+    def d3d11_status(self) -> str:
+        """What the render thread did with the last `submit_d3d11`: `"ok: ..."`, `"unavailable: ..."`
+        when this GPU can't import it, or a message saying what to fix. `"unused"` before any."""
+        ...
     def submit_cuda(self, array: Any, stream: CudaStream | None = None) -> None:
         """Submit a CUDA array (anything with __cuda_array_interface__: torch, cupy, numba,
         jax) shaped (H, W, 4) uint8 with contiguous pixels. Copied after the work queued on
@@ -296,6 +332,12 @@ def set_theme(theme: Theme) -> None:
     Use `Window.set_theme` to restyle a window that's already showing."""
 
 def get_theme() -> Theme: ...
+
+def adapter_luid() -> int | None:
+    """The adapter LUID (`low | high << 32`) of the GPU windows render on, so a Direct3D device can be
+    created on the same adapter for `Viewport.submit_d3d11`. `None` off Windows or when it can't be
+    found."""
+    ...
 
 class ListView:
     """A virtualized list of text rows: only the rows in view are drawn, so it handles millions.
@@ -817,6 +859,23 @@ class Image:
         modifier: int = 0,
     ) -> None:
         """Sample a linear RGBA8 dma-buf. See `Viewport.submit_dmabuf`."""
+        ...
+    def submit_d3d11(
+        self,
+        handle: int,
+        width: int,
+        height: int,
+        *,
+        format: Literal["rgba8", "bgra8"] | None = None,
+        fence: int | None = None,
+        wait_value: int = 0,
+        signal_value: int = 0,
+    ) -> None:
+        """Sample a shared Direct3D 11 texture. See `Viewport.submit_d3d11`."""
+        ...
+    @property
+    def d3d11_status(self) -> str:
+        """What the render thread did with the last `submit_d3d11`. See `Viewport.d3d11_status`."""
         ...
     def load(self, path: str | os.PathLike[str]) -> None:
         """Show a PNG or JPEG file (chosen by content, not extension). Raises `OSError` if it

@@ -179,7 +179,8 @@ All under [`python/examples/`](python/examples/), runnable directly once install
   name theme tokens.
 - **Content**: `Label`, `Button`, `Slider`, `TextInput`, `TextArea`, `Checkbox`, `Radio`, `Toggle`,
   `SpinBox`, `NumericScrub`, `ProgressBar`, `ComboBox`, `Image`, `Viewport` (CPU frames,
-  an `MTLTexture` via `submit_metal`, a linear dma-buf via `submit_dmabuf`, or CUDA).
+  an `MTLTexture` via `submit_metal`, a linear dma-buf via `submit_dmabuf`, a shared D3D11
+  texture via `submit_d3d11`, or CUDA).
 - **Docking**: `Panel` (titled, draggable container), `Tabs` (several `Panel`s sharing one
   region), `DockArea` (a split-tree of panels/tabs with full drag-to-rearrange — split, tab-merge
   including growing an existing `Tabs` group, ungroup, whole-window edge drops, and re-docking
@@ -260,7 +261,52 @@ Plain `VK_IMAGE_TILING_LINEAR` on this Mali is export-only. `submit_dmabuf` impo
 and importable. The dma-buf row is that image, exported and imported in this process. The
 center pixel matched. Non-zero modifiers are still not imported. Windows has not been
 measured. The same command skips, and still exits 0, when the machine has no Vulkan 1.3
-device. Windows has no dma-buf path.
+device. Windows has no dma-buf path; its zero-copy path is `submit_d3d11`.
+
+Windows `submit_d3d11` imports a shared Direct3D 11 texture through `VK_KHR_external_memory_win32`,
+and the viewport shader samples it with no CPU copy. The texture is 2D, `R8G8B8A8_UNORM` or
+`B8G8R8A8_UNORM` (what DXGI desktop duplication and most video output produce), created with
+`D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE`. Pass the NT handle from
+`IDXGIResource1::CreateSharedHandle`; fastgui duplicates it. Create the D3D device on the
+adapter whose LUID is `fastgui.adapter_luid()`.
+
+- **Checked against D3D.** Vulkan takes any size for an imported texture, so fastgui opens the
+  handle on a D3D11 device on the window's adapter and reads the texture's real size, format,
+  mip count and sample count. `width` and `height` must match, `format` (`"rgba8"`/`"bgra8"`) is
+  detected when left `None`, and a mismatch, a handle that is not a texture, or a texture on a
+  different GPU is refused instead of imported. `Viewport.d3d11_status` / `Image.d3d11_status`
+  say what the render thread did with the last submission, and the previous frame stays.
+- **Cached.** Create the handle once per texture and resubmit it. fastgui recognizes a duplicate
+  of a texture it has already imported (`CompareObjectHandles`) and acquires the same image
+  instead of importing again, so the producer's new pixels show up. Up to four textures per
+  viewport stay imported, so double or triple buffering hits too. A new handle from another
+  `CreateSharedHandle` is imported again.
+- **Sync.** Without a fence the producer finishes (flush, then wait on an event query) before the
+  call. With `fence=` (a shared `ID3D11Fence`/`ID3D12Fence` NT handle) fastgui waits for
+  `wait_value` before sampling, for at most 100 ms on the render thread. A late fence drops the
+  submission and keeps the previous frame, so a stalled producer cannot hang the window.
+  `signal_value` is signaled once the frame that first draws the submission has finished
+  sampling; a producer that reuses a texture waits for it. Keyed mutexes are not used.
+
+`python/examples/d3d11_viewport.py` is a ctypes-only producer (no pywin32) that renders into a ring
+of shared textures: `--bgra`, `--fence`, `--color R,G,B`, `--seconds N`. The Rust tests
+(`cargo test -p fastgui-render-vk --release d3d11 -- --nocapture`) create real D3D11 textures on the
+Vulkan device's adapter (matched by LUID) and check: pixels at the corners and middle for RGBA and
+BGRA, the producer rewriting a cached texture, every wrong size/format/handle refused, and the
+fence wait, timeout and signal-back. Measured on a Radeon 840M (2026-10-26), median of 40 frames,
+headless (not a vsync present), `upload_bench` and the D3D11 test run back to back:
+
+| | 1920×1080 | 3840×2160 |
+|---|---:|---:|
+| CPU upload + offscreen sample | 1.8 ms | 7.9 to 8.7 ms |
+| `submit_d3d11`, first submit of a texture (import + sample) | 2.5 to 2.8 ms | 3.6 to 4.1 ms |
+| `submit_d3d11`, texture already imported (acquire + sample) | 0.27 ms | 0.9 to 1.0 ms |
+
+The first submit of a texture costs about 2 ms of import at any size and, with the D3D check
+and fence import on top, is not faster than the CPU path at 1080p; the saving is the cached
+row. In a real window the example shows the producer's color on screen (`--color 255,64,0`
+reads back as exactly 255, 64, 0 for RGBA, BGRA, and BGRA with a fence, on 3.14 and 3.14t) with
+zero validation messages.
 
 ## Known limitations
 
@@ -298,8 +344,12 @@ device. Windows has no dma-buf path.
   On a Mali-G610 MC4 the host copy plus linear upload was 1.87 ms at 1080p and 7.79 ms at
   4K. The offscreen sample of that upload was 3.25 ms and 11.46 ms. Plain linear tiling is
   export-only there, so import uses DRM-modifier tiling with modifier 0. Sampling that
-  imported image was 1.09 ms and 2.00 ms, and the center pixel matched. Windows has not
-  been measured. Non-zero DRM modifiers and NV12 are not imported.
+  imported image was 1.09 ms and 2.00 ms, and the center pixel matched. Non-zero DRM
+  modifiers and NV12 are not imported. `submit_d3d11` (Windows) samples a shared D3D11
+  RGBA8 or BGRA8 texture, checks its size and format against D3D, keeps up to four imports per
+  viewport, optionally syncs on a shared fence, and is verified on an AMD GPU in tests and in a
+  real window (see [Frame upload](#frame-upload)); D3D12 resources, keyed mutexes, NV12, and
+  textures from another GPU are not imported.
 - **Free-threaded Python means 3.14t.** PyO3 0.29 doesn't build for 3.13t (see
   [Install](#install)). GIL builds need CPython 3.11+.
 - **Text editing gaps:** `TextArea` has no soft wrap, the caret doesn't blink, and clicking a
@@ -312,7 +362,7 @@ device. Windows has no dma-buf path.
 - **`Viewport` and `Image` stretch by default**; pass `fit="contain"` to letterbox.
 - **`Table`** has no column resize or sort, and **`DockArea`** layouts aren't saved or restored.
 - **`Viewport.submit_frame` always copies** the numpy/buffer into an owned `Vec<u8>` before
-  upload. That is the CPU path. Zero-copy is `submit_metal`, `submit_dmabuf`, or
+  upload. That is the CPU path. Zero-copy is `submit_metal`, `submit_dmabuf`, `submit_d3d11`, or
   `create_cuda_surface`. From a numpy array, mtlpy's blit into a private texture is still
   a copy, and on this Mac it is faster than `submit_frame` plus `replaceRegion`. See
   [Frame upload](#frame-upload).

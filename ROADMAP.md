@@ -45,11 +45,37 @@ is on PyPI yet.
   dma-buf was 1.09 ms and 2.00 ms, and the center pixel matched. That buffer was
   exported by the bench in-process, not by a camera. NVIDIA is still unverified. A
   missing extension drops the import and keeps the previous frame.
+- Windows (Vulkan, no CUDA): `submit_d3d11` imports a shared D3D11 RGBA8 or BGRA8 NT handle
+  (`VK_KHR_external_memory_win32`, `D3D11_TEXTURE`, optimal tiling, dedicated allocation,
+  `initialLayout` UNDEFINED as the spec requires for external memory, first use an acquire from
+  `VK_QUEUE_FAMILY_EXTERNAL`). Verified on the Radeon 840M three ways: Rust tests with a real D3D11
+  producer on the Vulkan adapter (LUID match; pixels at corners and middle for both formats, a
+  rewritten cached texture, wrong size/format/handle refused, fence wait/timeout/signal-back, all
+  zero validation errors with the layer forced on); the live window via
+  `python/examples/d3d11_viewport.py` (RGBA, BGRA, fence, 3.14 and 3.14t: a fixed color reads back
+  exactly from the composed window, zero validation messages, clean close); and the failure paths
+  in a window (each gives a specific `d3d11_status`). The live run found one real spec error the
+  headless tests could not (`PREINITIALIZED` with external memory, VUID-01443), now fixed.
+  Details: Vulkan accepts any claimed size for an imported texture, so `D3dProbe` opens the handle
+  on a D3D11 device on the window's adapter and reads the real size, format, mips and samples
+  first (`check_texture`). A duplicate handle of a texture already shown, or one of three parked
+  per viewport (`ImportRing`), is matched with `CompareObjectHandles` and re-acquired instead of
+  imported. A shared fence (`ID3D11Fence`/`ID3D12Fence`) is imported as a timeline semaphore
+  (`D3D12_FENCE`): the wait is a bounded 100 ms `vkWaitSemaphores` on the render thread (a late
+  fence drops the submission), the signal rides the frame's submit. `d3d11_status` reports the last
+  outcome; `fastgui.adapter_luid()` names the GPU to create the producer on. First submit (import +
+  sample) 2.5 to 2.8 ms at 1080p and 3.6 to 4.1 ms at 4K; cached 0.27 ms and 0.9 to 1.0 ms; CPU
+  upload + sample 1.8 ms and 7.9 to 8.7 ms. Not done: keyed mutexes, D3D12 resources (the same
+  `D3D12_RESOURCE` handle type probes importable here), NV12, KMT handles, textures from a
+  different GPU. Parked imports for a viewport that later shows a CPU frame are freed.
+  `Viewport.submit_frame` could also use `VK_EXT_external_memory_host` (probed, 4096-byte
+  alignment); not built.
 
 **Still open:**
 
-- Run `cargo run -p fastgui-render-vk --release --example upload_bench` on Windows and
-  record the numbers. The Mali-G610 rows are in README "Frame upload". Unified DRAM
+- Run `cargo run -p fastgui-render-vk --release --example upload_bench` on Windows (done on
+  the Radeon 840M: CPU upload and the D3D11 probe lines; the D3D11 sample is a test, not a bench
+  row). The Mali-G610 rows are in README "Frame upload". Unified DRAM
   does not make `submit_frame` zero-copy. A dma-buf from a camera or other producer is
   still untimed. Non-zero DRM modifiers are not imported.
 - Run `python/examples/cuda_viewport.py` and `--surface` on NVIDIA Windows and Linux.

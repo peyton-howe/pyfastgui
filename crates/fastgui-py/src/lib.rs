@@ -2,6 +2,7 @@ mod backend;
 mod charts;
 mod cuda;
 mod dialogs;
+mod d3d11_import;
 mod dmabuf;
 mod image_file;
 mod interaction;
@@ -12,12 +13,12 @@ mod theme;
 mod widgets;
 
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use std::sync::atomic::AtomicU64;
 
 use backend::{Command, CommandDispatch, EventWaker, RenderThreadHandles};
-use fastgui_core::{command_channel, CommandReceiver, CpuFrame, FrameSlot, ImportedLayer, PixelFormat, Readback};
+use fastgui_core::{command_channel, CommandReceiver, CpuFrame, FrameSlot, ImportStatus, ImportedLayer, PixelFormat, Readback};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -33,12 +34,15 @@ pub(crate) fn next_viewport_id() -> u64 {
 }
 
 /// A GPU-displayed image. CPU pixels go through `submit_frame`. Zero-copy paths are
-/// `submit_metal` (macOS), `submit_dmabuf` (Linux), and `create_cuda_surface` / `submit_cuda`.
+/// `submit_metal` (macOS), `submit_dmabuf` (Linux), `submit_d3d11` (Windows), and
+/// `create_cuda_surface` / `submit_cuda`.
 #[pyclass]
 pub(crate) struct Viewport {
     viewport_id: u64,
     frame_slot: FrameSlot<CpuFrame>,
     imported: FrameSlot<ImportedLayer>,
+    /// What the render thread did with the last `submit_d3d11`.
+    d3d11_status: Arc<ImportStatus>,
     // Set by `Window.set_viewport` / `set_content` as soon as this viewport is attached to a
     // window, so `submit_frame` can wake the idle event loop and the CUDA paths can reach the
     // right render thread.
@@ -66,6 +70,7 @@ impl Viewport {
             viewport_id: next_viewport_id(),
             frame_slot: FrameSlot::new(),
             imported: FrameSlot::new(),
+            d3d11_status: Arc::default(),
             dispatch: Mutex::new(None),
             fit,
             cuda: Mutex::new(cuda::CudaState::default()),
@@ -167,6 +172,46 @@ impl Viewport {
         Ok(())
     }
 
+    /// Sample a shared Direct3D 11 texture in place (Windows, Vulkan). `handle` is an NT handle
+    /// from `IDXGIResource1::CreateSharedHandle` on a 2D `R8G8B8A8_UNORM` or `B8G8R8A8_UNORM`
+    /// texture created with `D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE`. It is
+    /// duplicated; the caller keeps and closes theirs. The D3D device must be on the window's GPU:
+    /// create it on the adapter whose LUID is `fastgui.adapter_luid()`.
+    ///
+    /// fastgui reads the texture's real size and format from D3D, so `width` and `height` must match
+    /// it, and `format` (`"rgba8"` or `"bgra8"`) is detected when left `None` and checked when given.
+    /// A mismatch or a handle fastgui can't open is reported in `d3d11_status` and the previous frame
+    /// stays.
+    ///
+    /// Sync: pass `fence`, an NT handle from `ID3D11Fence`/`ID3D12Fence` `CreateSharedHandle` (a
+    /// shared fence), to wait for `wait_value` before sampling (up to 100 ms on the render thread;
+    /// if it is late the submission is dropped and the previous frame stays) and to have
+    /// `signal_value` signaled once the frame that first draws this submission has finished sampling.
+    /// `0` skips that half. Without a fence the producer must have finished (flush, then wait on an
+    /// event query) before the call. Keyed mutexes are not used.
+    ///
+    /// Create the handle once per texture and resubmit it each frame: a duplicate of a texture
+    /// already imported (up to four per viewport) is not imported again. Clears any pending CPU frame.
+    /// `d3d11_status` says what the render thread did with the last submission.
+    #[pyo3(signature = (handle, width, height, *, format=None, fence=None, wait_value=0, signal_value=0))]
+    fn submit_d3d11(
+        &self,
+        handle: isize,
+        width: u32,
+        height: u32,
+        format: Option<&str>,
+        fence: Option<isize>,
+        wait_value: u64,
+        signal_value: u64,
+    ) -> PyResult<()> {
+        let options = d3d11_import::Options { format, fence, wait_value, signal_value };
+        let layer = d3d11_import::prepare(handle, width, height, options, &self.d3d11_status)?;
+        self.imported.submit(layer);
+        self.frame_slot.clear();
+        self.wake();
+        Ok(())
+    }
+
     /// Submit a CUDA array as the viewport's next frame: anything with
     /// `__cuda_array_interface__` (torch, cupy, numba, jax), shaped `(height, width, 4)` uint8
     /// with contiguous pixels (rows may be padded). Host arrays go to `submit_frame`.
@@ -213,6 +258,13 @@ impl Viewport {
     #[pyo3(signature = (on_drop))]
     fn set_file_drop(&self, on_drop: Option<Py<PyAny>>) -> PyResult<()> {
         self.interaction.set_file_drop(on_drop, &self.id, &self.sender)
+    }
+
+    /// What the render thread did with the last `submit_d3d11`: `"ok: ..."`, `"unavailable: ..."`
+    /// when this GPU can't import it, or a message saying what to fix. `"unused"` before any.
+    #[getter]
+    fn d3d11_status(&self) -> String {
+        self.d3d11_status.get()
     }
 
     /// How the last `submit_cuda` reached the screen: `"interop"` (GPU-to-GPU), `"host copy:
@@ -590,8 +642,16 @@ fn rebind_floating_panels(window: &Bound<'_, Window>, content: Option<&Bound<'_,
     Ok(())
 }
 
+/// The adapter LUID (`low | high << 32`) of the GPU windows render on, so a Direct3D device can be
+/// created on the same adapter for `submit_d3d11`. `None` off Windows or when it can't be found.
+#[pyfunction]
+fn adapter_luid() -> Option<u64> {
+    d3d11_import::adapter_luid()
+}
+
 #[pymodule]
 fn _fastgui(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(adapter_luid, m)?)?;
     m.add_class::<Window>()?;
     m.add_class::<Viewport>()?;
     m.add_class::<cuda::CudaSurface>()?;

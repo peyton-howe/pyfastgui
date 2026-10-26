@@ -3661,12 +3661,13 @@ impl ComboBox {
 }
 
 /// A static image composited like a `Viewport`. Feed pixels with `set_image`, or
-/// `submit_metal` / `submit_dmabuf` to sample a GPU texture in place.
+/// `submit_metal` / `submit_dmabuf` / `submit_d3d11` to sample a GPU texture in place.
 #[pyclass]
 pub(crate) struct Image {
     image_id: u64,
     frames: FrameSlot<CpuFrame>,
     imported: FrameSlot<ImportedLayer>,
+    d3d11_status: Arc<fastgui_core::ImportStatus>,
     dispatch: Mutex<Option<CommandDispatch>>,
     id: IdCell,
     sender: SenderCell,
@@ -3701,6 +3702,7 @@ impl Image {
             image_id: next_image_id(),
             frames: FrameSlot::new(),
             imported: FrameSlot::new(),
+            d3d11_status: Arc::default(),
             dispatch: Mutex::new(None),
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
@@ -3772,6 +3774,32 @@ impl Image {
     #[pyo3(signature = (fd, width, height, *, stride=0, modifier=0))]
     fn submit_dmabuf(&self, fd: i32, width: u32, height: u32, stride: u32, modifier: u64) -> PyResult<()> {
         let layer = crate::dmabuf::prepare(fd, width, height, stride, modifier)?;
+        self.imported.submit(layer);
+        self.frames.clear();
+        self.wake();
+        Ok(())
+    }
+
+    /// What the render thread did with the last `submit_d3d11`. See `Viewport.d3d11_status`.
+    #[getter]
+    fn d3d11_status(&self) -> String {
+        self.d3d11_status.get()
+    }
+
+    /// Sample a shared Direct3D 11 texture. See `Viewport.submit_d3d11`.
+    #[pyo3(signature = (handle, width, height, *, format=None, fence=None, wait_value=0, signal_value=0))]
+    fn submit_d3d11(
+        &self,
+        handle: isize,
+        width: u32,
+        height: u32,
+        format: Option<&str>,
+        fence: Option<isize>,
+        wait_value: u64,
+        signal_value: u64,
+    ) -> PyResult<()> {
+        let options = crate::d3d11_import::Options { format, fence, wait_value, signal_value };
+        let layer = crate::d3d11_import::prepare(handle, width, height, options, &self.d3d11_status)?;
         self.imported.submit(layer);
         self.frames.clear();
         self.wake();
