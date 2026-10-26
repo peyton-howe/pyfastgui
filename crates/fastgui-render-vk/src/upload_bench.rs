@@ -2,7 +2,9 @@
 //!
 //! No window, no swapchain, and no validation layer. Prints the median of 40 frames after 8
 //! warmup frames at 1920×1080 and 3840×2160. Exits 0 when this machine has no Vulkan 1.3 device,
-//! and skips the dma-buf row when the extensions are missing (Windows never has them).
+//! and skips the dma-buf row when the extensions are missing (Windows never has them). It also
+//! prints probes for Windows D3D11/D3D12 handle import and host-pointer import; those only ask
+//! the driver and do not import anything yet.
 //!
 //! ```text
 //! cargo run -p fastgui-render-vk --release --example upload_bench
@@ -36,8 +38,12 @@ pub fn run_upload_bench() {
 struct Bench {
     _entry: Entry,
     instance: Instance,
-    #[cfg(target_os = "linux")]
     pdevice: vk::PhysicalDevice,
+    #[cfg(all(windows, test))]
+    family: u32,
+    #[cfg(windows)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    d3d: Option<crate::d3d_import::D3dSupport>,
     device: Device,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     queue: vk::Queue,
@@ -169,17 +175,47 @@ impl Bench {
             device_extension_names.push(ash::ext::image_drm_format_modifier::NAME.as_ptr());
         }
 
+        #[cfg(windows)]
+        let rgba8 = crate::d3d_import::texture_importable(&instance, pdevice, fastgui_core::SharedFormat::Rgba8);
+        #[cfg(windows)]
+        let bgra8 = crate::d3d_import::texture_importable(&instance, pdevice, fastgui_core::SharedFormat::Bgra8);
+        #[cfg(windows)]
+        let d3d11 = has_dev(ash::khr::external_memory::NAME)
+            && has_dev(ash::khr::external_memory_win32::NAME)
+            && (rgba8 || bgra8);
+        #[cfg(windows)]
+        let d3d_fence = d3d11
+            && has_dev(ash::khr::external_semaphore::NAME)
+            && has_dev(ash::khr::external_semaphore_win32::NAME)
+            && crate::d3d_import::fence_importable(&instance, pdevice);
+        #[cfg(windows)]
+        if d3d11 {
+            device_extension_names.extend([
+                ash::khr::external_memory::NAME.as_ptr(),
+                ash::khr::external_memory_win32::NAME.as_ptr(),
+            ]);
+        }
+        #[cfg(windows)]
+        if d3d_fence {
+            device_extension_names.extend([
+                ash::khr::external_semaphore::NAME.as_ptr(),
+                ash::khr::external_semaphore_win32::NAME.as_ptr(),
+            ]);
+        }
+
         let priorities = [1.0];
         let queue_infos = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
             .queue_priorities(&priorities)];
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
         let device = match instance.create_device(
             pdevice,
             &vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_infos)
                 .enabled_extension_names(&device_extension_names)
-                .push_next(&mut features13),
+                .push_next(&mut features13)
+                .push_next(&mut features12),
             None,
         ) {
             Ok(device) => device,
@@ -240,11 +276,23 @@ impl Bench {
         let memory_fd =
             dmabuf.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
 
+        #[cfg(windows)]
+        let d3d = d3d11.then(|| crate::d3d_import::D3dSupport {
+            memory: ash::khr::external_memory_win32::Device::new(&instance, &device),
+            semaphore: d3d_fence.then(|| ash::khr::external_semaphore_win32::Device::new(&instance, &device)),
+            rgba8,
+            bgra8,
+            probe: crate::d3d_probe::for_device(&instance, pdevice),
+        });
+
         Some(Self {
             _entry: entry,
             instance,
-            #[cfg(target_os = "linux")]
             pdevice,
+            #[cfg(all(windows, test))]
+            family,
+            #[cfg(windows)]
+            d3d,
             device,
             memory_properties,
             queue,
@@ -272,6 +320,8 @@ impl Bench {
             "dma-buf sample imports a modifier-0 image this process exported, then samples it"
         );
         let dma = self.choose_dmabuf();
+        self.probe_windows_interop();
+        self.probe_host_pointer();
         for (width, height) in SIZES {
             if let Err(err) = self.time_size(width, height, dma.as_ref()) {
                 eprintln!("{width}x{height}: {err}");
@@ -646,6 +696,107 @@ impl Bench {
         self.check_readback(pixels, target, width, height, "dma-buf sample");
     }
 
+    #[cfg(not(windows))]
+    unsafe fn probe_windows_interop(&self) {}
+
+    /// Ask the driver which Windows handle types an RGBA8 sampled image can be imported from
+    /// or exported to. D3D11 and D3D12 producers (Media Foundation, D3D11VA, DirectML) hand
+    /// out these handles, so import support here is what a `submit_d3d11` would rely on.
+    #[cfg(windows)]
+    unsafe fn probe_windows_interop(&self) {
+        let handle_types = [
+            ("opaque win32", vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32),
+            ("opaque win32 kmt", vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32_KMT),
+            ("d3d11 texture", vk::ExternalMemoryHandleTypeFlags::D3D11_TEXTURE),
+            ("d3d11 texture kmt", vk::ExternalMemoryHandleTypeFlags::D3D11_TEXTURE_KMT),
+            ("d3d12 resource", vk::ExternalMemoryHandleTypeFlags::D3D12_RESOURCE),
+        ];
+        let tilings = [
+            ("optimal", vk::ImageTiling::OPTIMAL),
+            ("linear", vk::ImageTiling::LINEAR),
+        ];
+        for (name, handle_type) in handle_types {
+            for (tiling_name, tiling) in tilings {
+                let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
+                    .handle_type(handle_type);
+                let info = vk::PhysicalDeviceImageFormatInfo2::default()
+                    .format(FORMAT)
+                    .ty(vk::ImageType::TYPE_2D)
+                    .tiling(tiling)
+                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                    .push_next(&mut external);
+                let mut external_props = vk::ExternalImageFormatProperties::default();
+                let mut props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+                match self
+                    .instance
+                    .get_physical_device_image_format_properties2(self.pdevice, &info, &mut props)
+                {
+                    Ok(()) => eprintln!(
+                        "win32 probe: {name} {tiling_name} rgba8: {}",
+                        feature_text(external_props.external_memory_properties.external_memory_features)
+                    ),
+                    Err(err) => eprintln!("win32 probe: {name} {tiling_name} rgba8: {err}"),
+                }
+            }
+        }
+        let sync = [
+            ("d3d12 fence", vk::ExternalSemaphoreHandleTypeFlags::D3D12_FENCE),
+            ("opaque win32 semaphore", vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_WIN32),
+        ];
+        for (name, handle_type) in sync {
+            let info = vk::PhysicalDeviceExternalSemaphoreInfo::default().handle_type(handle_type);
+            let mut props = vk::ExternalSemaphoreProperties::default();
+            self.instance
+                .get_physical_device_external_semaphore_properties(self.pdevice, &info, &mut props);
+            let mut parts = Vec::new();
+            if props.external_semaphore_features.contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE) {
+                parts.push("export");
+            }
+            if props.external_semaphore_features.contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE) {
+                parts.push("import");
+            }
+            let text = if parts.is_empty() { "none".to_string() } else { parts.join(" ") };
+            eprintln!("win32 probe: {name}: {text}");
+        }
+    }
+
+    /// `VK_EXT_external_memory_host` imports an existing allocation, such as a numpy buffer,
+    /// as device memory. Print whether it is advertised, the required pointer alignment, and
+    /// whether a host-allocation buffer can be imported.
+    unsafe fn probe_host_pointer(&self) {
+        let advertised = self
+            .instance
+            .enumerate_device_extension_properties(self.pdevice)
+            .map(|list| {
+                list.iter().any(|e| {
+                    e.extension_name_as_c_str() == Ok(ash::ext::external_memory_host::NAME)
+                })
+            })
+            .unwrap_or(false);
+        if !advertised {
+            eprintln!("host pointer probe: VK_EXT_external_memory_host is not advertised");
+            return;
+        }
+        let mut host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+        let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
+        self.instance
+            .get_physical_device_properties2(self.pdevice, &mut props);
+        eprintln!(
+            "host pointer probe: min imported pointer alignment {} bytes",
+            host.min_imported_host_pointer_alignment
+        );
+        let info = vk::PhysicalDeviceExternalBufferInfo::default()
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+        let mut external = vk::ExternalBufferProperties::default();
+        self.instance
+            .get_physical_device_external_buffer_properties(self.pdevice, &info, &mut external);
+        eprintln!(
+            "host pointer probe: host allocation buffer: {}",
+            feature_text(external.external_memory_properties.external_memory_features)
+        );
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn choose_dmabuf(&self) -> Option<DmaChoice> {
         None
@@ -940,7 +1091,7 @@ impl DmaProbe {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn feature_text(flags: vk::ExternalMemoryFeatureFlags) -> String {
     let mut parts = Vec::new();
     if flags.contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE) {
@@ -1253,3 +1404,7 @@ fn memory_type_for_export(
     })
     .or_else(|| find_memory_type_index(properties, type_bits, vk::MemoryPropertyFlags::empty()))
 }
+
+#[cfg(all(windows, test))]
+#[path = "d3d_test.rs"]
+mod d3d11_tests;

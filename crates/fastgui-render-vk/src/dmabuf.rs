@@ -119,18 +119,35 @@ pub(crate) unsafe fn create_dma_image(
 
 pub struct ImportedImage {
     pub(crate) image: vk::Image,
-    memory: vk::DeviceMemory,
+    pub(crate) memory: vk::DeviceMemory,
     pub view: vk::ImageView,
     pub width: u32,
     pub height: u32,
+    pub(crate) format: vk::Format,
     pub current_layout: vk::ImageLayout,
+    /// The image's first use is an ownership acquire from `VK_QUEUE_FAMILY_EXTERNAL` (a D3D
+    /// texture); a dma-buf is synchronized by the producer finishing before the import.
+    pub(crate) acquire_external: bool,
+    /// An NT handle this image keeps so a later submit of the same texture can reuse it. Closed
+    /// by `destroy`. Only a D3D import has one.
+    pub(crate) shared_handle: Option<isize>,
+    /// The D3D fence this image's producer shares, imported as a timeline semaphore.
+    pub(crate) fence: Option<crate::d3d_import::ImportedFence>,
+    /// A fence value to signal once the frame that draws this submission has finished.
+    pub(crate) pending_signal: Option<u64>,
 }
 
 impl ImportedImage {
     pub unsafe fn destroy(self, device: &Device) {
+        if let Some(fence) = self.fence {
+            fence.destroy(device);
+        }
         device.destroy_image_view(self.view, None);
         device.destroy_image(self.image, None);
         device.free_memory(self.memory, None);
+        if let Some(handle) = self.shared_handle {
+            crate::d3d_import::close_handle(handle);
+        }
     }
 }
 
@@ -258,7 +275,12 @@ pub unsafe fn import(
         view,
         width: buf.width,
         height: buf.height,
+        format,
         current_layout: vk::ImageLayout::PREINITIALIZED,
+        acquire_external: false,
+        shared_handle: None,
+        fence: None,
+        pending_signal: None,
     })
 }
 

@@ -302,7 +302,7 @@ mod tests {
                 let owned = retained.downcast::<OwnedMetalImport>().expect("owned import");
                 assert!(std::ptr::eq(&*owned.texture, &*texture));
             }
-            ImportedLayer::DmaBuf(_) => panic!("metal import"),
+            ImportedLayer::DmaBuf(_) | ImportedLayer::D3d11(_) => panic!("metal import"),
         }
     }
 

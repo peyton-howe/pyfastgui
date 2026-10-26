@@ -43,6 +43,10 @@ pub enum VkRendererError {
     DmaBufStride { stride: u32, row_pitch: u64 },
     #[error("no memory type can import this dma-buf")]
     DmaBufMemory,
+    #[error("D3D11 texture width and height must be at least 1")]
+    D3d11Extent,
+    #[error("no memory type can import this D3D11 texture")]
+    D3d11Memory,
     #[error("the render thread hasn't finished starting up yet")]
     RendererNotReady,
 }
