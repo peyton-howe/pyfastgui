@@ -817,10 +817,6 @@ impl VulkanRenderer {
             .get_mut(&viewport_id)
             .and_then(|ring| ring.find_mut(|layer| matches!(&layer.image, GpuImage::Imported(i) if i.is_import_of(&texture))));
         if let Some(SampledLayer { image: GpuImage::Imported(image), .. }) = parked {
-            if let Err(err) = device.queue_wait_idle(queue) {
-                status.set(format!("waiting for the queue failed: {err}"));
-                return;
-            }
             if let Err(message) = sync_import(&device, queue, &support, image, fence) {
                 status.set(message);
                 return;
