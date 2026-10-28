@@ -1,5 +1,5 @@
 import os
-from typing import Any, Callable, Literal, Sequence, Union
+from typing import Any, Callable, Literal, Protocol, Sequence, Union
 
 RGBA = tuple[float, float, float, float]
 # A font size in points, or a theme size by name.
@@ -10,6 +10,9 @@ Spacing = Union[float, Literal["small", "medium", "large"]]
 # A CUDA stream: an int CUstream handle, torch.cuda.Stream, a cupy stream, or any object with
 # __cuda_stream__().
 CudaStream = Any
+
+class MetalPointer(Protocol):
+    mtl_ptr: int
 
 class CudaFrame:
     """One frame of a CudaSurface. Use as a context manager; inside the block it exposes
@@ -51,12 +54,76 @@ class Viewport:
         """Submit a (H, W, 3|4) uint8 frame. Copies into an owned buffer today; a packed-RGBA
         high-FPS path will want fewer copies later."""
         ...
+    def submit_metal(
+        self,
+        texture: int | MetalPointer,
+        *,
+        wait_event: int | MetalPointer | None = None,
+        wait_value: int = 0,
+        signal_event: int | MetalPointer | None = None,
+        signal_value: int = 0,
+    ) -> None:
+        """Sample an MTLTexture in place (macOS). `texture` is a pointer or an object with
+        `mtl_ptr` (mtlpy `Texture`, `readable=True`, a float/unorm format such as rgba8Unorm).
+        `wait_event` and `signal_event` are MTLSharedEvent pointers; fastgui waits and signals
+        once, on the command buffer that first draws this submission. Clears a pending CPU frame.
+        Raises on other platforms."""
+        ...
+    def submit_dmabuf(
+        self,
+        fd: int,
+        width: int,
+        height: int,
+        *,
+        stride: int = 0,
+        modifier: int = 0,
+    ) -> None:
+        """Sample a linear RGBA8 dma-buf (Linux). `fd` is duplicated. `stride` 0 means
+        tightly packed. `modifier` must be 0. The producer finishes writing before this call.
+        Raises on other platforms."""
+        ...
+    def submit_d3d11(
+        self,
+        handle: int,
+        width: int,
+        height: int,
+        *,
+        format: Literal["rgba8", "bgra8"] | None = None,
+        fence: int | None = None,
+        wait_value: int = 0,
+        signal_value: int = 0,
+    ) -> None:
+        """Sample a shared Direct3D 11 texture in place (Windows, Vulkan). `handle` is an NT handle
+        from `IDXGIResource1::CreateSharedHandle` on a 2D R8G8B8A8_UNORM or B8G8R8A8_UNORM texture
+        created with `D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE`; it is
+        duplicated, so the caller keeps theirs. Create the D3D device on the adapter whose LUID is
+        `adapter_luid()`.
+
+        fastgui reads the texture's real size and format from D3D: `width` and `height` must match,
+        and `format` is detected when `None` and checked when given. A mismatch, or a handle it
+        can't open, is reported in `d3d11_status` and the previous frame stays.
+
+        `fence` is an NT handle from a shared `ID3D11Fence`/`ID3D12Fence`. fastgui waits for
+        `wait_value` before sampling (up to 100 ms; if it is late the submission is dropped) and
+        signals `signal_value` once the frame that first draws this submission has finished
+        sampling; `0` skips that half. Without a fence the producer must have finished (flushed and
+        waited) before the call. Resubmit the same handle each frame: a texture already imported
+        (up to four per viewport) is not imported again.
+
+        Raises `ValueError` on a bad handle, size, format or fence, `RuntimeError` on other
+        platforms."""
+        ...
+    @property
+    def d3d11_status(self) -> str:
+        """What the render thread did with the last `submit_d3d11`: `"ok: ..."`, `"unavailable: ..."`
+        when this GPU can't import it, or a message saying what to fix. `"unused"` before any."""
+        ...
     def submit_cuda(self, array: Any, stream: CudaStream | None = None) -> None:
         """Submit a CUDA array (anything with __cuda_array_interface__: torch, cupy, numba,
         jax) shaped (H, W, 4) uint8 with contiguous pixels. Copied after the work queued on
         `stream` (default: the array's own), and `stream` waits for the copy, so the array can
-        be reused right away. One GPU-to-GPU copy on Windows/Vulkan/NVIDIA; elsewhere (macOS,
-        Linux for now, a non-NVIDIA window GPU, before run()) a copy through host memory.
+        be reused right away. One GPU-to-GPU copy on Windows or Linux with Vulkan and NVIDIA;
+        elsewhere (macOS, a non-NVIDIA window GPU, before run()) a copy through host memory.
         Host arrays go to submit_frame. Unverified on NVIDIA hardware."""
         ...
     @property
@@ -65,10 +132,11 @@ class Viewport:
         "unused"."""
         ...
     def create_cuda_surface(self, width: int, height: int) -> CudaSurface:
-        """Zero-copy CUDA surface (Windows/Vulkan/NVIDIA). Call after set_viewport(), once
+        """Zero-copy CUDA surface (Windows or Linux, Vulkan, NVIDIA). Call after set_viewport(), once
         window.run() has started, from a thread other than the one run() blocks on. A widget
         callback is that thread and raises RuntimeError. Also raises if run() hasn't started
-        within ~2s, or where interop isn't available (submit_cuda works everywhere)."""
+        within ~2s, or where interop isn't available (macOS, or a device without the export
+        extensions; submit_cuda works everywhere). Linux exports opaque fds. Unverified on NVIDIA."""
         ...
 
 class Label:
@@ -264,6 +332,12 @@ def set_theme(theme: Theme) -> None:
     Use `Window.set_theme` to restyle a window that's already showing."""
 
 def get_theme() -> Theme: ...
+
+def adapter_luid() -> int | None:
+    """The adapter LUID (`low | high << 32`) of the GPU windows render on, so a Direct3D device can be
+    created on the same adapter for `Viewport.submit_d3d11`. `None` off Windows or when it can't be
+    found."""
+    ...
 
 class ListView:
     """A virtualized list of text rows: only the rows in view are drawn, so it handles millions.
@@ -747,7 +821,8 @@ class ComboBox:
     def selected(self) -> int | None: ...
 
 class Image:
-    """Static CPU image composited like a `Viewport`. Feed pixels with `set_image`."""
+    """Image composited like a `Viewport`. Feed CPU pixels with `set_image`, or submit GPU
+    textures with `submit_metal` / `submit_dmabuf` / `submit_d3d11`."""
     def __init__(
         self,
         width: float | None = None,
@@ -762,6 +837,45 @@ class Image:
         ...
     def set_image(self, data: Any) -> None:
         """Submit a (H, W, 3|4) uint8 array."""
+        ...
+    def submit_metal(
+        self,
+        texture: int | MetalPointer,
+        *,
+        wait_event: int | MetalPointer | None = None,
+        wait_value: int = 0,
+        signal_event: int | MetalPointer | None = None,
+        signal_value: int = 0,
+    ) -> None:
+        """Sample an MTLTexture in place. See `Viewport.submit_metal`."""
+        ...
+    def submit_dmabuf(
+        self,
+        fd: int,
+        width: int,
+        height: int,
+        *,
+        stride: int = 0,
+        modifier: int = 0,
+    ) -> None:
+        """Sample a linear RGBA8 dma-buf. See `Viewport.submit_dmabuf`."""
+        ...
+    def submit_d3d11(
+        self,
+        handle: int,
+        width: int,
+        height: int,
+        *,
+        format: Literal["rgba8", "bgra8"] | None = None,
+        fence: int | None = None,
+        wait_value: int = 0,
+        signal_value: int = 0,
+    ) -> None:
+        """Sample a shared Direct3D 11 texture. See `Viewport.submit_d3d11`."""
+        ...
+    @property
+    def d3d11_status(self) -> str:
+        """What the render thread did with the last `submit_d3d11`. See `Viewport.d3d11_status`."""
         ...
     def load(self, path: str | os.PathLike[str]) -> None:
         """Show a PNG or JPEG file (chosen by content, not extension). Raises `OSError` if it

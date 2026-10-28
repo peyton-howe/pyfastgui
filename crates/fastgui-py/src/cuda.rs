@@ -205,17 +205,29 @@ impl CudaLink {
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "the window is drawn by a GPU CUDA doesn't drive (not the NVIDIA one)".to_owned())?;
         let ctx = PrimaryContext::new(ordinal).map_err(|e| e.to_string())?;
-        let memory = ExternalMemory::import_win32(
-            &ctx,
-            handles.memory_win32_handle,
-            handles.memory_size,
-            handles.memory_dedicated,
-        )
+        let memory = if handles.memory_fd >= 0 {
+            ExternalMemory::import_fd(&ctx, handles.memory_fd, handles.memory_size, handles.memory_dedicated)
+        } else {
+            ExternalMemory::import_win32(
+                &ctx,
+                handles.memory_win32_handle,
+                handles.memory_size,
+                handles.memory_dedicated,
+            )
+        }
         .map_err(|e| e.to_string())?;
-        let ready = ExternalSemaphore::import_win32_timeline(&ctx, handles.ready_win32_handle)
-            .map_err(|e| e.to_string())?;
-        let release = ExternalSemaphore::import_win32_timeline(&ctx, handles.release_win32_handle)
-            .map_err(|e| e.to_string())?;
+        let ready = if handles.ready_fd >= 0 {
+            ExternalSemaphore::import_fd_timeline(&ctx, handles.ready_fd)
+        } else {
+            ExternalSemaphore::import_win32_timeline(&ctx, handles.ready_win32_handle)
+        }
+        .map_err(|e| e.to_string())?;
+        let release = if handles.release_fd >= 0 {
+            ExternalSemaphore::import_fd_timeline(&ctx, handles.release_fd)
+        } else {
+            ExternalSemaphore::import_win32_timeline(&ctx, handles.release_win32_handle)
+        }
+        .map_err(|e| e.to_string())?;
         let stream = Stream::new(&ctx).map_err(|e| e.to_string())?;
         Ok(Self {
             stream,

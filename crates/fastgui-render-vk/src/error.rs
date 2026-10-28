@@ -24,15 +24,29 @@ pub enum VkRendererError {
     #[error("failed to read shader SPIR-V: {0}")]
     ShaderCode(#[from] std::io::Error),
     #[error(
-        "this GPU/driver doesn't support the win32 external memory/semaphore extensions \
-         CUDA interop needs (VK_KHR_external_memory_win32, VK_KHR_external_semaphore_win32)"
+        "this GPU/driver doesn't support the external memory and semaphore extensions \
+         CUDA interop needs"
     )]
     CudaInteropUnsupported,
     #[error(
-        "CUDA interop is not implemented on Linux yet -- only the Windows (win32 handle) \
-         path exists. Use Viewport.submit_frame() (CPU copy) instead."
+        "CUDA interop is not implemented on this platform. Use Viewport.submit_frame() \
+         (CPU copy) instead."
     )]
     CudaInteropNotImplemented,
+    #[error("dma-buf width and height must be at least 1")]
+    DmaBufExtent,
+    #[error("DRM format modifiers are not imported yet; submit a linear dma-buf (modifier 0)")]
+    DmaBufModifier,
+    #[error(
+        "dma-buf row stride is {stride} bytes; this device samples linear RGBA8 at {row_pitch} bytes per row"
+    )]
+    DmaBufStride { stride: u32, row_pitch: u64 },
+    #[error("no memory type can import this dma-buf")]
+    DmaBufMemory,
+    #[error("D3D11 texture width and height must be at least 1")]
+    D3d11Extent,
+    #[error("no memory type can import this D3D11 texture")]
+    D3d11Memory,
     #[error("the render thread hasn't finished starting up yet")]
     RendererNotReady,
 }

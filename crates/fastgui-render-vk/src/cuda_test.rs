@@ -17,7 +17,7 @@ use std::time::Duration;
 use ash::{ext::debug_utils, khr, vk, Device, Entry, Instance};
 use fastgui_app::CudaExportHandles;
 
-use crate::cuda_texture::CudaLayer;
+use crate::cuda_texture::{CudaExternal, CudaLayer};
 use crate::texture::find_memory_type_index;
 
 static VALIDATION_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -350,8 +350,7 @@ fn cuda_layer_round_trip_on_vulkan() {
     unsafe {
         let (mut layer, handles): (CudaLayer, CudaExportHandles) = CudaLayer::new(
             &gpu.device,
-            &gpu.memory_win32,
-            &gpu.semaphore_win32,
+            CudaExternal::Win32 { memory: &gpu.memory_win32, semaphore: &gpu.semaphore_win32 },
             &gpu.memory_properties,
             gpu.uuid,
             width,

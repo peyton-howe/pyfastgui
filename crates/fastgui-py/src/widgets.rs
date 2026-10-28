@@ -12,7 +12,7 @@ use fastgui_core::widget::{
 };
 use fastgui_core::dnd::TreePlace;
 use fastgui_core::text_edit::TextEdit;
-use fastgui_core::{CpuFrame, FrameSlot, PixelFormat, Readback, MAX_CPU_FRAME_EXTENT};
+use fastgui_core::{CpuFrame, FrameSlot, ImportedLayer, PixelFormat, Readback, MAX_CPU_FRAME_EXTENT};
 use crate::theme::{FontSize, Spacing};
 use crate::interaction::{Interaction, InteractionSpec};
 use crate::backend::{Command, CommandDispatch};
@@ -379,6 +379,7 @@ struct TabBarSpec {
 pub(crate) fn described_viewport(
     viewport_id: u64,
     frames: fastgui_core::FrameSlot<fastgui_core::CpuFrame>,
+    imported: fastgui_core::FrameSlot<fastgui_core::ImportedLayer>,
     fit: fastgui_core::widget::LayerFit,
     id_cell: IdCell,
     sender_cell: SenderCell,
@@ -386,7 +387,7 @@ pub(crate) fn described_viewport(
 ) -> DescribedWidget {
     DescribedWidget {
         style: StyleParams::leaf(1.0, None, None),
-        kind: WidgetKind::Viewport { viewport_id, frames, fit },
+        kind: WidgetKind::Viewport { viewport_id, frames, imported, fit },
         id_cell,
         sender_cell,
         children: Vec::new(),
@@ -3659,11 +3660,14 @@ impl ComboBox {
     }
 }
 
-/// A static CPU image composited like a `Viewport`. Feed pixels with `set_image`.
+/// A static image composited like a `Viewport`. Feed pixels with `set_image`, or
+/// `submit_metal` / `submit_dmabuf` / `submit_d3d11` to sample a GPU texture in place.
 #[pyclass]
 pub(crate) struct Image {
     image_id: u64,
     frames: FrameSlot<CpuFrame>,
+    imported: FrameSlot<ImportedLayer>,
+    d3d11_status: Arc<fastgui_core::ImportStatus>,
     dispatch: Mutex<Option<CommandDispatch>>,
     id: IdCell,
     sender: SenderCell,
@@ -3697,6 +3701,8 @@ impl Image {
         Ok(Self {
             image_id: next_image_id(),
             frames: FrameSlot::new(),
+            imported: FrameSlot::new(),
+            d3d11_status: Arc::default(),
             dispatch: Mutex::new(None),
             id: Arc::new(Mutex::new(None)),
             sender: Arc::new(Mutex::new(None)),
@@ -3741,10 +3747,62 @@ impl Image {
             }
             out
         };
+        self.imported.clear();
         self.frames.submit(CpuFrame { width, height, format: PixelFormat::Rgba8, data: rgba });
-        if let Some(dispatch) = self.dispatch.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-            dispatch.waker.wake();
-        }
+        self.wake();
+        Ok(())
+    }
+
+    /// Sample an existing `MTLTexture` in place. See `Viewport.submit_metal`.
+    #[pyo3(signature = (texture, *, wait_event=None, wait_value=0, signal_event=None, signal_value=0))]
+    fn submit_metal(
+        &self,
+        texture: &Bound<'_, PyAny>,
+        wait_event: Option<&Bound<'_, PyAny>>,
+        wait_value: u64,
+        signal_event: Option<&Bound<'_, PyAny>>,
+        signal_value: u64,
+    ) -> PyResult<()> {
+        let layer = crate::metal_import::prepare(texture, wait_event, wait_value, signal_event, signal_value)?;
+        self.imported.submit(layer);
+        self.frames.clear();
+        self.wake();
+        Ok(())
+    }
+
+    /// Sample a linear RGBA8 dma-buf. See `Viewport.submit_dmabuf`.
+    #[pyo3(signature = (fd, width, height, *, stride=0, modifier=0))]
+    fn submit_dmabuf(&self, fd: i32, width: u32, height: u32, stride: u32, modifier: u64) -> PyResult<()> {
+        let layer = crate::dmabuf::prepare(fd, width, height, stride, modifier)?;
+        self.imported.submit(layer);
+        self.frames.clear();
+        self.wake();
+        Ok(())
+    }
+
+    /// What the render thread did with the last `submit_d3d11`. See `Viewport.d3d11_status`.
+    #[getter]
+    fn d3d11_status(&self) -> String {
+        self.d3d11_status.get()
+    }
+
+    /// Sample a shared Direct3D 11 texture. See `Viewport.submit_d3d11`.
+    #[pyo3(signature = (handle, width, height, *, format=None, fence=None, wait_value=0, signal_value=0))]
+    fn submit_d3d11(
+        &self,
+        handle: isize,
+        width: u32,
+        height: u32,
+        format: Option<&str>,
+        fence: Option<isize>,
+        wait_value: u64,
+        signal_value: u64,
+    ) -> PyResult<()> {
+        let options = crate::d3d11_import::Options { format, fence, wait_value, signal_value };
+        let layer = crate::d3d11_import::prepare(handle, width, height, options, &self.d3d11_status)?;
+        self.imported.submit(layer);
+        self.frames.clear();
+        self.wake();
         Ok(())
     }
 
@@ -3758,10 +3816,9 @@ impl Image {
                 PyValueError::new_err(format!("{}: {message}", path.display()))
             }
         })?;
+        self.imported.clear();
         self.frames.submit(frame);
-        if let Some(dispatch) = self.dispatch.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-            dispatch.waker.wake();
-        }
+        self.wake();
         Ok(())
     }
 }
@@ -3791,12 +3848,19 @@ impl Image {
         *self.dispatch.lock().unwrap_or_else(|p| p.into_inner()) = Some(dispatch);
     }
 
+    fn wake(&self) {
+        if let Some(dispatch) = self.dispatch.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            dispatch.waker.wake();
+        }
+    }
+
     fn describe(&self) -> DescribedWidget {
         DescribedWidget {
             style: StyleParams::leaf(self.flex_grow, self.width, self.height),
             kind: WidgetKind::Image {
                 image_id: self.image_id,
                 frames: self.frames.clone(),
+                imported: self.imported.clone(),
                 fit: self.fit,
                 on_pointer: self.pointer_callback(),
             },

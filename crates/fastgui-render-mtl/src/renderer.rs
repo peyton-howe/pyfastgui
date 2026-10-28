@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use fastgui_app::ViewportDraw;
-use fastgui_core::{ChromeFrame, ChromeQuad, ChromeQuads, CpuFrame};
+use fastgui_core::{ChromeFrame, ChromeQuad, ChromeQuads, CpuFrame, ImportedLayer};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::ClassType;
@@ -13,17 +13,43 @@ use objc2_metal::{
     MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
     MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLResourceOptions, MTLScissorRect, MTLStoreAction,
-    MTLViewport,
+    MTLTexture, MTLViewport,
 };
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
 
 use crate::error::MtlRendererError as Error;
+use crate::import::{OwnedMetalImport, PendingSync};
 use crate::pipeline::{QuadPipeline, ViewportPipeline};
 use crate::texture::ViewportTexture;
 
 struct SampledLayer {
     texture: ViewportTexture,
+}
+
+enum LayerPixels {
+    Owned(ViewportTexture),
+    Imported(OwnedMetalImport),
+}
+
+struct ViewportLayer {
+    pixels: LayerPixels,
+}
+
+impl ViewportLayer {
+    fn size(&self) -> (u32, u32) {
+        match &self.pixels {
+            LayerPixels::Owned(texture) => (texture.width, texture.height),
+            LayerPixels::Imported(texture) => (texture.width, texture.height),
+        }
+    }
+
+    fn texture(&self) -> &ProtocolObject<dyn MTLTexture> {
+        match &self.pixels {
+            LayerPixels::Owned(texture) => &texture.texture,
+            LayerPixels::Imported(texture) => &texture.texture,
+        }
+    }
 }
 
 /// Chrome as GPU draw data (`set_chrome_quads`): the instance buffer and the atlas it samples.
@@ -137,8 +163,8 @@ pub struct MetalRenderer {
     quad_chrome: Option<QuadChrome>,
     /// The last submitted frame, waited on before a repacked atlas is overwritten.
     last_commands: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
-    /// GPU textures for in-tree `Viewport` widgets, keyed by the stable `viewport_id`.
-    layers: HashMap<u64, SampledLayer>,
+    /// GPU textures for in-tree `Viewport` / `Image` widgets, keyed by the stable layer id.
+    layers: HashMap<u64, ViewportLayer>,
     width: u32,
     height: u32,
 }
@@ -267,31 +293,78 @@ impl MetalRenderer {
 
     pub fn set_layer_frame(&mut self, viewport_id: u64, frame: CpuFrame) -> Result<(), Error> {
         let existing = self.layers.remove(&viewport_id);
-        let layer = self.upsert_cpu_layer(existing, frame)?;
-        self.layers.insert(viewport_id, layer);
+        match existing {
+            Some(ViewportLayer { pixels: LayerPixels::Owned(texture) })
+                if texture.width == frame.width && texture.height == frame.height =>
+            {
+                texture.upload(&frame.data);
+                self.layers.insert(viewport_id, ViewportLayer { pixels: LayerPixels::Owned(texture) });
+            }
+            other => {
+                if let Some(old) = other {
+                    self.retire_layer(old);
+                }
+                let texture = ViewportTexture::new(&self.device, frame.width, frame.height)?;
+                texture.upload(&frame.data);
+                self.layers.insert(viewport_id, ViewportLayer { pixels: LayerPixels::Owned(texture) });
+            }
+        }
         Ok(())
     }
 
-    fn upsert_cpu_layer(
-        &self,
-        existing: Option<SampledLayer>,
-        frame: CpuFrame,
-    ) -> Result<SampledLayer, Error> {
-        let texture = match existing {
-            Some(SampledLayer { texture })
-                if texture.width == frame.width && texture.height == frame.height =>
-            {
-                texture
-            }
-            _ => ViewportTexture::new(&self.device, frame.width, frame.height)?,
+    pub fn set_imported_layer(&mut self, viewport_id: u64, layer: ImportedLayer) -> Result<(), Error> {
+        let ImportedLayer::Metal { retained, .. } = layer else {
+            return Ok(());
         };
-        texture.upload(&frame.data);
-        Ok(SampledLayer { texture })
+        let Ok(import) = retained.downcast::<OwnedMetalImport>() else {
+            return Ok(());
+        };
+        if let Some(old) = self.layers.remove(&viewport_id) {
+            self.retire_layer(old);
+        }
+        self.layers.insert(viewport_id, ViewportLayer { pixels: LayerPixels::Imported(*import) });
+        Ok(())
+    }
+
+    /// Command buffers retain sampled textures until completion. An import that never reached
+    /// a command buffer signals its producer on drop.
+    fn retire_layer(&mut self, layer: ViewportLayer) {
+        drop(layer);
     }
 
     pub fn retain_layers(&mut self, live_ids: &[u64]) {
         let live: HashSet<u64> = live_ids.iter().copied().collect();
-        self.layers.retain(|id, _| live.contains(id));
+        let stale: Vec<u64> = self.layers.keys().copied().filter(|id| !live.contains(id)).collect();
+        for id in stale {
+            if let Some(layer) = self.layers.remove(&id) {
+                self.retire_layer(layer);
+            }
+        }
+    }
+
+    /// Waits and signals for imports this frame will actually sample. Hidden layers keep their
+    /// sync until a later frame draws them, so a producer is not told the GPU is done early.
+    fn take_pending_sync(&mut self, draws: &[ViewportDraw]) -> Vec<PendingSync> {
+        let mut ids = Vec::new();
+        for draw in draws {
+            let Some(layer) = self.layers.get(&draw.viewport_id) else { continue };
+            let (width, height) = layer.size();
+            if draw.letterboxed(width, height).viewport_and_scissor(self.width, self.height).is_some() {
+                ids.push(draw.viewport_id);
+            }
+        }
+        let mut sync = Vec::new();
+        for id in ids {
+            let Some(ViewportLayer { pixels: LayerPixels::Imported(import) }) = self.layers.get_mut(&id) else {
+                continue;
+            };
+            if !import.sync_pending {
+                continue;
+            }
+            import.sync_pending = false;
+            sync.push(PendingSync { wait: import.wait.clone(), signal: import.signal.clone() });
+        }
+        sync
     }
 
     pub fn render_frame(
@@ -310,6 +383,7 @@ impl MetalRenderer {
         let Some(drawable) = (unsafe { self.layer.nextDrawable() }) else {
             return Ok(());
         };
+        let sync = self.take_pending_sync(viewports);
 
         let pass = MTLRenderPassDescriptor::renderPassDescriptor();
         let color_attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
@@ -324,10 +398,20 @@ impl MetalRenderer {
             alpha: clear_color[3] as f64,
         });
 
-        let command_buffer = self.queue.commandBuffer().ok_or(Error::NoCommandBuffer)?;
-        let encoder = command_buffer
-            .renderCommandEncoderWithDescriptor(&pass)
-            .ok_or(Error::NoEncoder)?;
+        let Some(command_buffer) = self.queue.commandBuffer() else {
+            flush_sync(&self.queue, &sync);
+            return Err(Error::NoCommandBuffer);
+        };
+        for op in &sync {
+            op.encode_waits(&command_buffer);
+        }
+        let Some(encoder) = command_buffer.renderCommandEncoderWithDescriptor(&pass) else {
+            for op in &sync {
+                op.encode_signal(&command_buffer);
+            }
+            command_buffer.commit();
+            return Err(Error::NoEncoder);
+        };
 
         if draw_chrome {
             if let Some(chrome) = &self.quad_chrome {
@@ -337,7 +421,7 @@ impl MetalRenderer {
                 encoder.setRenderPipelineState(self.pipeline.state());
                 self.draw_sampled(
                     &encoder,
-                    chrome,
+                    &chrome.texture.texture,
                     MTLViewport {
                         originX: 0.0,
                         originY: 0.0,
@@ -360,7 +444,8 @@ impl MetalRenderer {
         }
         for draw in viewports {
             let Some(layer) = self.layers.get(&draw.viewport_id) else { continue };
-            let draw = draw.letterboxed(layer.texture.width, layer.texture.height);
+            let (content_w, content_h) = layer.size();
+            let draw = draw.letterboxed(content_w, content_h);
             let Some(([x, y, w, h], [sx, sy, sw, sh])) = draw.viewport_and_scissor(self.width, self.height) else {
                 continue;
             };
@@ -373,7 +458,7 @@ impl MetalRenderer {
                 zfar: 1.0,
             };
             let scissor = MTLScissorRect { x: sx as usize, y: sy as usize, width: sw as usize, height: sh as usize };
-            self.draw_sampled(&encoder, layer, viewport, scissor);
+            self.draw_sampled(&encoder, layer.texture(), viewport, scissor);
         }
         // Popups go over video too.
         if draw_chrome {
@@ -383,6 +468,9 @@ impl MetalRenderer {
         }
 
         encoder.endEncoding();
+        for op in &sync {
+            op.encode_signal(&command_buffer);
+        }
         command_buffer.presentDrawable(ProtocolObject::from_ref(&*drawable));
         command_buffer.commit();
         self.last_commands = Some(command_buffer);
@@ -392,18 +480,30 @@ impl MetalRenderer {
     fn draw_sampled(
         &self,
         encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
-        layer: &SampledLayer,
+        texture: &ProtocolObject<dyn MTLTexture>,
         viewport: MTLViewport,
         scissor: MTLScissorRect,
     ) {
         encoder.setViewport(viewport);
         encoder.setScissorRect(scissor);
         unsafe {
-            encoder.setFragmentTexture_atIndex(Some(&layer.texture.texture), 0);
+            encoder.setFragmentTexture_atIndex(Some(texture), 0);
             encoder.setFragmentSamplerState_atIndex(Some(self.pipeline.sampler()), 0);
             encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
         }
     }
+}
+
+fn flush_sync(queue: &ProtocolObject<dyn MTLCommandQueue>, sync: &[PendingSync]) {
+    if sync.is_empty() {
+        return;
+    }
+    let Some(command_buffer) = queue.commandBuffer() else { return };
+    for op in sync {
+        op.encode_waits(&command_buffer);
+        op.encode_signal(&command_buffer);
+    }
+    command_buffer.commit();
 }
 
 
@@ -434,6 +534,10 @@ impl fastgui_app::SurfaceBackend for MetalRenderer {
         MetalRenderer::set_layer_frame(self, viewport_id, frame)
     }
 
+    fn set_imported_layer(&mut self, viewport_id: u64, layer: ImportedLayer) -> Result<(), Self::Error> {
+        MetalRenderer::set_imported_layer(self, viewport_id, layer)
+    }
+
     fn retain_layers(&mut self, live_ids: &[u64]) {
         MetalRenderer::retain_layers(self, live_ids)
     }
@@ -450,4 +554,298 @@ impl fastgui_app::SurfaceBackend for MetalRenderer {
     ) -> Result<(), Self::Error> {
         MetalRenderer::render_frame(self, clear, draw_chrome, draws)
     }
+}
+
+mod window_time {
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+    use std::time::Instant;
+
+    use fastgui_core::widget::{LayerFit, Rect};
+    use fastgui_core::{CpuFrame, PixelFormat};
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::{
+        MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice,
+        MTLDevice, MTLPixelFormat, MTLResourceOptions, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor,
+        MTLTextureUsage,
+    };
+    use winit::application::ApplicationHandler;
+    use winit::dpi::LogicalSize;
+    use winit::event::WindowEvent;
+    use winit::event_loop::ActiveEventLoop;
+    use winit::window::{Window, WindowId};
+
+    use super::MetalRenderer;
+    use crate::import::prepare_metal_import;
+    use fastgui_app::ViewportDraw;
+
+    const WARMUP: usize = 8;
+    const FRAMES: usize = 40;
+
+    fn solid(width: u32, height: u32) -> Vec<u8> {
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        for px in pixels.chunks_exact_mut(4) {
+            px.copy_from_slice(&[220, 40, 40, 255]);
+        }
+        pixels
+    }
+
+    fn private_texture(pixels: &[u8], width: u32, height: u32) -> Retained<ProtocolObject<dyn MTLTexture>> {
+        let device: Retained<ProtocolObject<dyn MTLDevice>> =
+            unsafe { Retained::from_raw(MTLCreateSystemDefaultDevice()) }.expect("device");
+        let descriptor = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::RGBA8Unorm,
+                width as usize,
+                height as usize,
+                false,
+            )
+        };
+        descriptor.setUsage(MTLTextureUsage::ShaderRead);
+        descriptor.setStorageMode(MTLStorageMode::Private);
+        let texture = device.newTextureWithDescriptor(&descriptor).expect("texture");
+        let staging = unsafe {
+            device.newBufferWithBytes_length_options(
+                NonNull::new(pixels.as_ptr() as *mut c_void).unwrap(),
+                pixels.len(),
+                MTLResourceOptions::MTLResourceStorageModeShared,
+            )
+        }
+        .expect("staging");
+        let queue = device.newCommandQueue().expect("queue");
+        let commands = queue.commandBuffer().expect("command buffer");
+        let blit = commands.blitCommandEncoder().expect("blit");
+        unsafe {
+            blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                &staging,
+                0,
+                (width as usize) * 4,
+                pixels.len(),
+                MTLSize { width: width as usize, height: height as usize, depth: 1 },
+                &texture,
+                0,
+                0,
+                objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+        }
+        blit.endEncoding();
+        commands.commit();
+        unsafe { commands.waitUntilCompleted() };
+        texture
+    }
+
+    fn summarize(label: &str, mut samples: Vec<f64>) {
+        assert!(!samples.is_empty(), "{label} produced no frames");
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        eprintln!(
+            "{label}: n={} min={:.3} median={:.3} mean={:.3} max={:.3} ms",
+            samples.len(),
+            samples[0],
+            samples[samples.len() / 2],
+            mean,
+            samples[samples.len() - 1],
+        );
+    }
+
+    pub(super) struct Bench {
+        pub(super) window: Option<Window>,
+        pub(super) done: bool,
+    }
+
+    fn time_offscreen(pixels: &[u8], texture: &ProtocolObject<dyn MTLTexture>, width: u32, height: u32) {
+        use objc2_metal::{
+            MTLCommandQueue, MTLLoadAction, MTLPrimitiveType, MTLRenderCommandEncoder,
+            MTLRenderPassDescriptor, MTLResource, MTLScissorRect, MTLStoreAction, MTLViewport,
+        };
+
+        use crate::pipeline::ViewportPipeline;
+        use crate::texture::ViewportTexture;
+
+        let device = texture.device();
+        let pipeline = ViewportPipeline::new(&device, MTLPixelFormat::BGRA8Unorm).expect("pipeline");
+        let target_desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::BGRA8Unorm,
+                width as usize,
+                height as usize,
+                false,
+            )
+        };
+        target_desc.setUsage(MTLTextureUsage::RenderTarget);
+        target_desc.setStorageMode(MTLStorageMode::Private);
+        let target = device.newTextureWithDescriptor(&target_desc).expect("target");
+        let queue = device.newCommandQueue().expect("queue");
+        let owned = ViewportTexture::new(&device, width, height).expect("owned");
+
+        let mut sample = Vec::new();
+        let mut upload = Vec::new();
+        for i in 0..WARMUP + FRAMES {
+            let started = Instant::now();
+            let commands = queue.commandBuffer().expect("command buffer");
+            let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+            let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+            attachment.setTexture(Some(&target));
+            attachment.setLoadAction(MTLLoadAction::Clear);
+            attachment.setStoreAction(MTLStoreAction::Store);
+            let encoder = commands.renderCommandEncoderWithDescriptor(&pass).expect("encoder");
+            encoder.setRenderPipelineState(pipeline.state());
+            encoder.setViewport(MTLViewport {
+                originX: 0.0,
+                originY: 0.0,
+                width: width as f64,
+                height: height as f64,
+                znear: 0.0,
+                zfar: 1.0,
+            });
+            encoder.setScissorRect(MTLScissorRect { x: 0, y: 0, width: width as usize, height: height as usize });
+            unsafe {
+                encoder.setFragmentTexture_atIndex(Some(texture), 0);
+                encoder.setFragmentSamplerState_atIndex(Some(pipeline.sampler()), 0);
+                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            }
+            encoder.endEncoding();
+            commands.commit();
+            unsafe { commands.waitUntilCompleted() };
+            if i >= WARMUP {
+                sample.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+
+            let started = Instant::now();
+            owned.upload(pixels);
+            let commands = queue.commandBuffer().expect("command buffer");
+            let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+            let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+            attachment.setTexture(Some(&target));
+            attachment.setLoadAction(MTLLoadAction::Clear);
+            attachment.setStoreAction(MTLStoreAction::Store);
+            let encoder = commands.renderCommandEncoderWithDescriptor(&pass).expect("encoder");
+            encoder.setRenderPipelineState(pipeline.state());
+            encoder.setViewport(MTLViewport {
+                originX: 0.0,
+                originY: 0.0,
+                width: width as f64,
+                height: height as f64,
+                znear: 0.0,
+                zfar: 1.0,
+            });
+            encoder.setScissorRect(MTLScissorRect { x: 0, y: 0, width: width as usize, height: height as usize });
+            unsafe {
+                encoder.setFragmentTexture_atIndex(Some(&owned.texture), 0);
+                encoder.setFragmentSamplerState_atIndex(Some(pipeline.sampler()), 0);
+                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            }
+            encoder.endEncoding();
+            commands.commit();
+            unsafe { commands.waitUntilCompleted() };
+            if i >= WARMUP {
+                upload.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        summarize(&format!("offscreen sample {width}x{height}"), sample);
+        summarize(&format!("offscreen upload+sample {width}x{height}"), upload);
+    }
+
+    impl Bench {
+        fn present(renderer: &mut MetalRenderer, draw: &ViewportDraw) -> Option<f64> {
+            let before = renderer.last_commands.as_ref().map(|commands| Retained::as_ptr(commands) as usize);
+            let started = Instant::now();
+            renderer.render_frame([0.05, 0.05, 0.05, 1.0], false, std::slice::from_ref(draw)).expect("render");
+            let Some(commands) = &renderer.last_commands else { return None };
+            if Some(Retained::as_ptr(commands) as usize) == before {
+                return None;
+            }
+            unsafe { commands.waitUntilCompleted() };
+            Some(started.elapsed().as_secs_f64() * 1e3)
+        }
+
+        fn time_import(renderer: &mut MetalRenderer, draw: &ViewportDraw, texture: &ProtocolObject<dyn MTLTexture>) {
+            let layer = prepare_metal_import(texture as *const _ as usize, 0, 0, 0, 0).expect("import");
+            renderer.set_imported_layer(draw.viewport_id, layer).expect("install");
+            let mut present = Vec::new();
+            while present.len() < WARMUP + FRAMES {
+                if let Some(ms) = Self::present(renderer, draw) {
+                    present.push(ms);
+                }
+            }
+            summarize(
+                &format!("import present {}x{}", texture.width(), texture.height()),
+                present.split_off(WARMUP),
+            );
+        }
+
+        fn time_upload(renderer: &mut MetalRenderer, draw: &ViewportDraw, pixels: &[u8], width: u32, height: u32) {
+            let mut upload = Vec::new();
+            let mut present = Vec::new();
+            while present.len() < WARMUP + FRAMES {
+                let started = Instant::now();
+                let frame = CpuFrame {
+                    width,
+                    height,
+                    format: PixelFormat::Rgba8,
+                    data: pixels.to_vec(),
+                };
+                renderer.set_layer_frame(draw.viewport_id, frame).expect("upload");
+                let upload_ms = started.elapsed().as_secs_f64() * 1e3;
+                if let Some(ms) = Self::present(renderer, draw) {
+                    upload.push(upload_ms);
+                    present.push(ms);
+                }
+            }
+            summarize(
+                &format!("cpu copy+upload {width}x{height}"),
+                upload.split_off(WARMUP),
+            );
+            summarize(
+                &format!("cpu present {width}x{height}"),
+                present.split_off(WARMUP),
+            );
+        }
+    }
+
+    impl ApplicationHandler for Bench {
+        fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+            let window = event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("fastgui — import timing")
+                        .with_inner_size(LogicalSize::new(960.0, 540.0)),
+                )
+                .expect("window");
+            window.request_redraw();
+            self.window = Some(window);
+        }
+
+        fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+            if self.done || !matches!(event, WindowEvent::RedrawRequested) {
+                return;
+            }
+            self.done = true;
+            let window = self.window.as_ref().expect("window");
+            let size = window.inner_size();
+            let mut renderer = MetalRenderer::new(window, size.width, size.height).expect("renderer");
+            let draw = ViewportDraw {
+                viewport_id: 1,
+                rect: Rect { x: 0.0, y: 0.0, width: renderer.width as f32, height: renderer.height as f32 },
+                visible: Rect { x: 0.0, y: 0.0, width: renderer.width as f32, height: renderer.height as f32 },
+                fit: LayerFit::Stretch,
+            };
+            for (width, height) in [(1920, 1080), (3840, 2160)] {
+                let pixels = solid(width, height);
+                let texture = private_texture(&pixels, width, height);
+                time_offscreen(&pixels, &texture, width, height);
+                Self::time_import(&mut renderer, &draw, &texture);
+                Self::time_upload(&mut renderer, &draw, &pixels, width, height);
+            }
+            event_loop.exit();
+        }
+    }
+
+}
+
+pub fn run_import_window_bench() {
+    use winit::event_loop::EventLoop;
+    let event_loop = EventLoop::new().expect("event loop");
+    event_loop.run_app(&mut window_time::Bench { window: None, done: false }).expect("run");
 }

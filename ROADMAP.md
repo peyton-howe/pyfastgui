@@ -22,25 +22,64 @@ arm64, and manylinux x86_64, each as `cp311-abi3` and `cp314t`, plus sdist and
 install-from-wheel smoke tests. The publish job did not run (it is tag-only). Nothing
 is on PyPI yet.
 
-**Next implementation:** Metal zero-copy from mtlpy. macOS is its own silo (no CUDA).
-`Texture.mtl_ptr` is already a public `id<MTLTexture>` on the same default `MTLDevice`
-fastgui creates. A viewport should retain that texture and sample it while drawing,
-instead of uploading CPU bytes. `readable=True` and a float format such as `rgba8Unorm`
-match the current shader. Ordering can start as a CPU `SharedEvent.wait` before submit,
-plus a completion signal when fastgui's command buffer finishes. Exposing
-`SharedEvent.mtl_ptr` (it exists on the raw binding, not the Python wrapper) lets
-fastgui wait on the GPU. Wrapping a fastgui-owned texture inside mtlpy is a later
-mtlpy change, not required for this direction.
+**Zero-copy (in tree, not yet shown on the hardware it targets):**
 
-**Still open after that:**
+- macOS: `Viewport.submit_metal` / `Image.submit_metal` retain an `MTLTexture` and
+  sample it. The fast mtlpy texture is `readable=True`, `writable=False`,
+  `private=True` (`rgba8Unorm`). A hot loop reuses one `Buffer` and
+  `upload_from_buffer`, then `submit_metal`. Offscreen readback of a private texture
+  matched. A window running `python/examples/metal_import_demo.py` stayed up and
+  closed cleanly. On this Mac (Apple GPU, 2026-10-19) the mtlpy blit was 0.38 ms at
+  1080p and 0.88 ms at 4K; `submit_frame` plus `replaceRegion` was 1.01 ms and
+  3.40 ms. Sampling an already-resident texture was 0.26 ms and 0.39 ms. See
+  README "Frame upload". Wrapping a fastgui-owned texture inside mtlpy is still a
+  later mtlpy change. No CUDA on this silo.
+- Linux: `submit_dmabuf` duplicates the caller's fd and the Vulkan backend samples a
+  linear RGBA8 image (`VK_KHR_external_memory_fd` / `VK_EXT_external_memory_dma_buf`,
+  modifier 0). `create_cuda_surface` exports opaque fds when the device advertises
+  the fd memory and semaphore extensions. DRM modifiers and NV12 are not imported.
+  The producer is assumed finished before `submit_dmabuf` (no sync-file). On a
+  Mali-G610 MC4, plain linear tiling is export-only. Import uses DRM-modifier tiling
+  with modifier 0. The headless CPU upload was 1.87 ms at 1080p and 7.79 ms at 4K;
+  the offscreen sample of that upload was 3.25 ms and 11.46 ms. Sampling the imported
+  dma-buf was 1.09 ms and 2.00 ms, and the center pixel matched. That buffer was
+  exported by the bench in-process, not by a camera. NVIDIA is still unverified. A
+  missing extension drops the import and keeps the previous frame.
+- Windows (Vulkan, no CUDA): `submit_d3d11` imports a shared D3D11 RGBA8 or BGRA8 NT handle
+  (`VK_KHR_external_memory_win32`, `D3D11_TEXTURE`, optimal tiling, dedicated allocation,
+  `initialLayout` UNDEFINED as the spec requires for external memory, first use an acquire from
+  `VK_QUEUE_FAMILY_EXTERNAL`). Verified on the Radeon 840M three ways: Rust tests with a real D3D11
+  producer on the Vulkan adapter (LUID match; pixels at corners and middle for both formats, a
+  rewritten cached texture, wrong size/format/handle refused, fence wait/timeout/signal-back, all
+  zero validation errors with the layer forced on); the live window via
+  `python/examples/d3d11_viewport.py` (RGBA, BGRA, fence, 3.14 and 3.14t: a fixed color reads back
+  exactly from the composed window, zero validation messages, clean close); and the failure paths
+  in a window (each gives a specific `d3d11_status`). The live run found one real spec error the
+  headless tests could not (`PREINITIALIZED` with external memory, VUID-01443), now fixed.
+  Details: Vulkan accepts any claimed size for an imported texture, so `D3dProbe` opens the handle
+  on a D3D11 device on the window's adapter and reads the real size, format, mips and samples
+  first (`check_texture`). A duplicate handle of a texture already shown, or one of three parked
+  per viewport (`ImportRing`), is matched with `CompareObjectHandles` and re-acquired instead of
+  imported. A shared fence (`ID3D11Fence`/`ID3D12Fence`) is imported as a timeline semaphore
+  (`D3D12_FENCE`): the wait is a bounded 100 ms `vkWaitSemaphores` on the render thread (a late
+  fence drops the submission), the signal rides the frame's submit. `d3d11_status` reports the last
+  outcome; `fastgui.adapter_luid()` names the GPU to create the producer on. First submit (import +
+  sample) 2.5 to 2.8 ms at 1080p and 3.6 to 4.1 ms at 4K; cached 0.27 ms and 0.9 to 1.0 ms; CPU
+  upload + sample 1.8 ms and 7.9 to 8.7 ms. Not done: keyed mutexes, D3D12 resources (the same
+  `D3D12_RESOURCE` handle type probes importable here), NV12, KMT handles, textures from a
+  different GPU. Parked imports for a viewport that later shows a CPU frame are freed.
+  `Viewport.submit_frame` could also use `VK_EXT_external_memory_host` (probed, 4096-byte
+  alignment); not built.
+- The Windows `cargo run -p fastgui-render-vk --release --example upload_bench` run is done on
+  the Radeon 840M: CPU upload and the D3D11 probe lines; the D3D11 sample is a test, not a bench
+  row. The Mali-G610 rows are in README "Frame upload". Unified DRAM does not make
+  `submit_frame` zero-copy.
 
-- Linux CUDA / Vulkan-only zero-copy: `create_cuda_surface` returns
-  `CudaInteropNotImplemented` off Windows. Export an opaque fd or a dma-buf
-  (`VK_KHR_external_memory_fd` / `VK_EXT_external_memory_dma_buf`) and sample it.
-  An RK3588 is this path without CUDA: import the camera or RGA dma-buf. Unified
-  DRAM does not make `submit_frame` zero-copy.
-- Run `python/examples/cuda_viewport.py` and `--surface` on an NVIDIA GPU. The
-  Windows Vulkan half is tested headless only.
+**Still open:**
+
+- A dma-buf from a camera or other producer is still untimed. Non-zero DRM modifiers are
+  not imported.
+- Run `python/examples/cuda_viewport.py` and `--surface` on NVIDIA Windows and Linux.
 - M8 release gate past CI: one real window from the installed wheel on macOS and
   Linux (smoke tests are headless), TestPyPI `0.0.1rc1`, then PyPI.
 - Accessibility (`accesskit`). HiDPI chrome already shipped with the shared app loop.
@@ -219,8 +258,9 @@ done reading), but users hand it CUDA arrays instead of writing into a raw point
   against cuda-bindings 13.4.3 (measured through its compiled structs); Python validation and
   fallback tests on 3.14 and 3.14t; live window fallback check. **Still never run on NVIDIA.**
   First thing to try there: `python/examples/cuda_viewport.py` and `--surface`.
-- Follow-ups: Linux opaque-fd export; DLPack input (JAX-only users); float/grayscale input needs
-  a conversion kernel; viewports in floating panels only get the host copy.
+- Follow-ups: Linux opaque-fd export and linear RGBA8 dma-buf import are implemented and
+  unverified on NVIDIA and on a real dma-buf; DLPack input (JAX-only users); float/grayscale
+  input needs a conversion kernel; viewports in floating panels only get the host copy.
 
 **M4 — Widget tree, layout, text rendering, input.** `fastgui_core::widget::WidgetTree` wraps
 `taffy::TaffyTree`; `WidgetKind` enum (`Container`/`Label`/`Button`/`Slider`); absolute-rect
@@ -1557,9 +1597,10 @@ itself. Adding widgets before 7A lands means more `Slider`-style self-contained 
 
 ### Suggested order
 
-7A–7E and 7F.1/7F.2 are done; this order is historical. Next is the Metal/mtlpy import in
-**Current status** above, then Linux dma-buf export. Accessibility still wants the focus
-order from 7A.1 as its navigation order.
+7A–7E and 7F.1/7F.2 are done; this order is historical. Metal import, Linux dma-buf import,
+and Linux opaque-fd CUDA export are in tree (see **Current status**). Next is proving those
+on real hardware, then the M8 window check and a first publish. Accessibility still wants
+the focus order from 7A.1 as its navigation order.
 
 ## How this project has been built (read before continuing)
 

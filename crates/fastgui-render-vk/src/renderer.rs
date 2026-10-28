@@ -8,10 +8,14 @@ use ash::{
     vk, Device, Entry, Instance,
 };
 use fastgui_app::ViewportDraw;
-use fastgui_core::{ChromeFrame, ChromeQuads, CpuFrame, PixelRect};
+use fastgui_core::{
+    ChromeFrame, ChromeQuads, CpuFrame, D3d11Fence, D3d11Import, ImportedLayer, PixelRect, SharedFormat,
+};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
-use crate::cuda_texture::{CudaExportHandles, CudaLayer};
+use crate::cuda_texture::{CudaExportHandles, CudaExternal, CudaLayer};
+use crate::d3d_import::{D3dSupport, ImportRing};
+use crate::dmabuf::ImportedImage;
 use crate::error::VkRendererError as Error;
 use crate::pipeline::ViewportPipeline;
 use crate::quad::{QuadChrome, QuadPipeline};
@@ -22,6 +26,7 @@ const FRAMES_IN_FLIGHT: usize = 2;
 enum GpuImage {
     Cpu(ViewportTexture),
     Cuda(CudaLayer),
+    Imported(ImportedImage),
 }
 
 struct SampledLayer {
@@ -63,18 +68,32 @@ pub struct VulkanRenderer {
     quad_chrome: QuadChrome,
     /// GPU textures for in-tree `Viewport` widgets, keyed by the stable `viewport_id`.
     layers: HashMap<u64, SampledLayer>,
-    // `None` on GPUs/drivers without VK_KHR_external_memory_win32 + VK_KHR_external_semaphore_win32
-    // (both widely supported on Windows, but not guaranteed) — `create_cuda_surface` reports a
-    // clear error instead of the device just failing to come up at all for everyone.
+    /// D3D11 imports that are not on screen, per viewport, so resubmitting a texture the
+    /// producer reuses costs a barrier instead of an import. See `set_imported_layer`.
+    parked_imports: HashMap<u64, ImportRing<SampledLayer>>,
+    // `None` when this device can't export memory CUDA can import (win32 on Windows, opaque fd
+    // on Linux). `create_cuda_surface` reports that instead of failing device creation.
     cuda_interop: Option<CudaInteropLoaders>,
+    /// `VK_EXT_external_memory_dma_buf` + `VK_KHR_external_memory_fd`, when the device has them.
+    dmabuf: Option<khr::external_memory_fd::Device>,
+    /// Tiling used to import a modifier-0 RGBA8 dma-buf. `None` when that image is not importable.
+    dmabuf_tiling: Option<crate::dmabuf::ImportTiling>,
+    /// What this device can import from Direct3D (Windows): textures, and shared fences.
+    d3d11: Option<D3dSupport>,
     queue_family_index: u32,
     /// `VkPhysicalDeviceIDProperties::deviceUUID`, handed to CUDA to find the same GPU.
     device_uuid: [u8; 16],
 }
 
-struct CudaInteropLoaders {
-    external_memory_win32: khr::external_memory_win32::Device,
-    external_semaphore_win32: khr::external_semaphore_win32::Device,
+enum CudaInteropLoaders {
+    Win32 {
+        external_memory_win32: khr::external_memory_win32::Device,
+        external_semaphore_win32: khr::external_semaphore_win32::Device,
+    },
+    OpaqueFd {
+        external_memory_fd: khr::external_memory_fd::Device,
+        external_semaphore_fd: khr::external_semaphore_fd::Device,
+    },
 }
 
 unsafe extern "system" fn debug_callback(
@@ -223,10 +242,34 @@ impl VulkanRenderer {
                     .iter()
                     .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == name)
             };
-            let cuda_interop_available = has_device_extension(khr::external_memory::NAME)
+            let cuda_win32 = cfg!(windows)
+                && has_device_extension(khr::external_memory::NAME)
                 && has_device_extension(khr::external_memory_win32::NAME)
                 && has_device_extension(khr::external_semaphore::NAME)
                 && has_device_extension(khr::external_semaphore_win32::NAME);
+            let cuda_fd = cfg!(target_os = "linux")
+                && has_device_extension(khr::external_memory::NAME)
+                && has_device_extension(khr::external_memory_fd::NAME)
+                && has_device_extension(khr::external_semaphore::NAME)
+                && has_device_extension(khr::external_semaphore_fd::NAME);
+            let dmabuf_import = has_device_extension(khr::external_memory::NAME)
+                && has_device_extension(khr::external_memory_fd::NAME)
+                && has_device_extension(ash::ext::external_memory_dma_buf::NAME);
+            let d3d11_import = cfg!(windows)
+                && has_device_extension(khr::external_memory::NAME)
+                && has_device_extension(khr::external_memory_win32::NAME)
+                && (crate::d3d_import::texture_importable(&instance, pdevice, SharedFormat::Rgba8)
+                    || crate::d3d_import::texture_importable(&instance, pdevice, SharedFormat::Bgra8));
+            let d3d_fence = d3d11_import
+                && has_device_extension(khr::external_semaphore::NAME)
+                && has_device_extension(khr::external_semaphore_win32::NAME)
+                && crate::d3d_import::fence_importable(&instance, pdevice);
+            let drm_modifier_ext = has_device_extension(ash::ext::image_drm_format_modifier::NAME);
+            let dmabuf_tiling = if dmabuf_import {
+                crate::dmabuf::rgba8_import_tiling(&instance, pdevice, drm_modifier_ext)
+            } else {
+                None
+            };
 
             let mut device_extension_names_raw = vec![swapchain::NAME.as_ptr()];
             // Required on a portability driver whenever the device lists it.
@@ -234,13 +277,40 @@ impl VulkanRenderer {
             if has_device_extension(portability_subset) {
                 device_extension_names_raw.push(portability_subset.as_ptr());
             }
-            if cuda_interop_available {
+            if cuda_win32 {
                 device_extension_names_raw.extend([
                     khr::external_memory::NAME.as_ptr(),
                     khr::external_memory_win32::NAME.as_ptr(),
                     khr::external_semaphore::NAME.as_ptr(),
                     khr::external_semaphore_win32::NAME.as_ptr(),
                 ]);
+            } else if d3d11_import {
+                device_extension_names_raw
+                    .extend([khr::external_memory::NAME.as_ptr(), khr::external_memory_win32::NAME.as_ptr()]);
+                if d3d_fence {
+                    device_extension_names_raw.extend([
+                        khr::external_semaphore::NAME.as_ptr(),
+                        khr::external_semaphore_win32::NAME.as_ptr(),
+                    ]);
+                }
+            }
+            if cuda_fd || dmabuf_import {
+                device_extension_names_raw.extend([
+                    khr::external_memory::NAME.as_ptr(),
+                    khr::external_memory_fd::NAME.as_ptr(),
+                ]);
+            }
+            if cuda_fd {
+                device_extension_names_raw.extend([
+                    khr::external_semaphore::NAME.as_ptr(),
+                    khr::external_semaphore_fd::NAME.as_ptr(),
+                ]);
+            }
+            if dmabuf_import {
+                device_extension_names_raw.push(ash::ext::external_memory_dma_buf::NAME.as_ptr());
+            }
+            if dmabuf_import && drm_modifier_ext {
+                device_extension_names_raw.push(ash::ext::image_drm_format_modifier::NAME.as_ptr());
             }
 
             let queue_priorities = [1.0f32];
@@ -264,11 +334,27 @@ impl VulkanRenderer {
             let queue = device.get_device_queue(queue_family_index, 0);
             let swapchain_loader = swapchain::Device::new(&instance, &device);
 
-            let cuda_interop = cuda_interop_available.then(|| CudaInteropLoaders {
-                external_memory_win32: khr::external_memory_win32::Device::new(&instance, &device),
-                external_semaphore_win32: khr::external_semaphore_win32::Device::new(
-                    &instance, &device,
-                ),
+            let cuda_interop = if cuda_win32 {
+                Some(CudaInteropLoaders::Win32 {
+                    external_memory_win32: khr::external_memory_win32::Device::new(&instance, &device),
+                    external_semaphore_win32: khr::external_semaphore_win32::Device::new(&instance, &device),
+                })
+            } else if cuda_fd {
+                Some(CudaInteropLoaders::OpaqueFd {
+                    external_memory_fd: khr::external_memory_fd::Device::new(&instance, &device),
+                    external_semaphore_fd: khr::external_semaphore_fd::Device::new(&instance, &device),
+                })
+            } else {
+                None
+            };
+            let dmabuf = dmabuf_import.then(|| khr::external_memory_fd::Device::new(&instance, &device));
+            let d3d11 = d3d11_import.then(|| D3dSupport {
+                memory: khr::external_memory_win32::Device::new(&instance, &device),
+                semaphore: d3d_fence.then(|| khr::external_semaphore_win32::Device::new(&instance, &device)),
+                rgba8: crate::d3d_import::texture_importable(&instance, pdevice, SharedFormat::Rgba8),
+                bgra8: crate::d3d_import::texture_importable(&instance, pdevice, SharedFormat::Bgra8),
+                #[cfg(windows)]
+                probe: crate::d3d_probe::for_device(&instance, pdevice),
             });
 
             // UNORM, deliberately not SRGB: an `_SRGB` surface format makes the GPU apply an
@@ -347,7 +433,11 @@ impl VulkanRenderer {
                 quad_chrome: QuadChrome::new(FRAMES_IN_FLIGHT),
                 chrome: None,
                 layers: HashMap::new(),
+                parked_imports: HashMap::new(),
                 cuda_interop,
+                dmabuf,
+                dmabuf_tiling,
+                d3d11,
                 queue_family_index,
                 device_uuid,
             };
@@ -498,6 +588,15 @@ impl VulkanRenderer {
         if let Some(layer) = slot {
             self.layers.insert(viewport_id, layer);
         }
+        // This viewport now shows CPU frames, so its parked D3D imports would only hold GPU memory.
+        if let Some(mut ring) = self.parked_imports.remove(&viewport_id) {
+            unsafe {
+                let _ = self.device.queue_wait_idle(self.queue);
+                for layer in ring.drain() {
+                    self.destroy_layer(layer);
+                }
+            }
+        }
         result
     }
 
@@ -517,7 +616,7 @@ impl VulkanRenderer {
                 Some(SampledLayer { image: GpuImage::Cpu(texture), .. }) => {
                     texture.width != width || texture.height != height
                 }
-                Some(SampledLayer { image: GpuImage::Cuda(_), .. }) | None => true,
+                Some(SampledLayer { image: GpuImage::Cuda(_) | GpuImage::Imported(_), .. }) | None => true,
             };
 
             if need_recreate {
@@ -556,27 +655,29 @@ impl VulkanRenderer {
         width: u32,
         height: u32,
     ) -> Result<CudaExportHandles, Error> {
-        // TODO(linux): export via VK_KHR_external_memory_fd / VK_KHR_external_semaphore_fd
-        // (OPAQUE_FD, or dma-buf) and import with cuImportExternalMemory's
-        // CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD. Untestable without an NVIDIA GPU, so until
-        // then fail with a clear message rather than the win32-extension error below, which
-        // reads like a driver problem.
-        if cfg!(not(windows)) {
-            return Err(Error::CudaInteropNotImplemented);
-        }
         if self.cuda_interop.is_none() {
-            return Err(Error::CudaInteropUnsupported);
+            return Err(if cfg!(any(windows, target_os = "linux")) {
+                Error::CudaInteropUnsupported
+            } else {
+                Error::CudaInteropNotImplemented
+            });
         }
         unsafe {
             self.device.device_wait_idle()?;
             if let Some(old) = self.layers.remove(&viewport_id) {
                 self.destroy_layer(old);
             }
-            let loaders = self.cuda_interop.as_ref().expect("checked above");
+            let external = match self.cuda_interop.as_ref().expect("checked above") {
+                CudaInteropLoaders::Win32 { external_memory_win32, external_semaphore_win32 } => {
+                    CudaExternal::Win32 { memory: external_memory_win32, semaphore: external_semaphore_win32 }
+                }
+                CudaInteropLoaders::OpaqueFd { external_memory_fd, external_semaphore_fd } => {
+                    CudaExternal::OpaqueFd { memory: external_memory_fd, semaphore: external_semaphore_fd }
+                }
+            };
             let (texture, handles) = CudaLayer::new(
                 &self.device,
-                &loaders.external_memory_win32,
-                &loaders.external_semaphore_win32,
+                external,
                 &self.memory_properties,
                 self.device_uuid,
                 width,
@@ -595,7 +696,8 @@ impl VulkanRenderer {
     pub fn retain_layers(&mut self, live_ids: &[u64]) {
         let live: HashSet<u64> = live_ids.iter().copied().collect();
         let drop_ids: Vec<u64> = self.layers.keys().copied().filter(|id| !live.contains(id)).collect();
-        if drop_ids.is_empty() {
+        let drop_parked: Vec<u64> = self.parked_imports.keys().copied().filter(|id| !live.contains(id)).collect();
+        if drop_ids.is_empty() && drop_parked.is_empty() {
             return;
         }
         unsafe {
@@ -605,6 +707,176 @@ impl VulkanRenderer {
                     self.destroy_layer(layer);
                 }
             }
+            for id in drop_parked {
+                if let Some(mut ring) = self.parked_imports.remove(&id) {
+                    for layer in ring.drain() {
+                        self.destroy_layer(layer);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn set_imported_layer(&mut self, viewport_id: u64, layer: ImportedLayer) -> Result<(), Error> {
+        let imported = match layer {
+            ImportedLayer::DmaBuf(buf) => {
+                let (Some(memory_fd), Some(tiling)) = (&self.dmabuf, self.dmabuf_tiling) else {
+                    return Ok(());
+                };
+                let imported = unsafe {
+                    crate::dmabuf::import(
+                        &self.device,
+                        memory_fd,
+                        &self.memory_properties,
+                        buf,
+                        vk::Format::R8G8B8A8_UNORM,
+                        tiling,
+                    )
+                };
+                match imported {
+                    Ok(imported) => imported,
+                    // A bad fd or stride must not tear down the window. The previous frame stays.
+                    Err(_) => return Ok(()),
+                }
+            }
+            ImportedLayer::D3d11(texture) => {
+                unsafe { self.submit_d3d11(viewport_id, texture) };
+                return Ok(());
+            }
+            ImportedLayer::Metal { .. } => return Ok(()),
+        };
+        unsafe {
+            let _ = self.install_import(viewport_id, imported);
+        }
+        Ok(())
+    }
+
+    /// Show `imported` for `viewport_id` and retire what was there. On `Err` the previous frame
+    /// stays and `imported` is already destroyed.
+    unsafe fn install_import(&mut self, viewport_id: u64, imported: ImportedImage) -> Result<(), String> {
+        // Allocate before retiring the previous layer so a pool failure keeps the old frame
+        // and does not fail the window.
+        let descriptor_set = match self.viewport_pipeline.alloc_set(&self.device) {
+            Ok(set) => set,
+            Err(err) => {
+                imported.destroy(&self.device);
+                return Err(format!("no descriptor set for the import: {err}"));
+            }
+        };
+        if let Err(err) = self.device.queue_wait_idle(self.queue) {
+            imported.destroy(&self.device);
+            self.viewport_pipeline.free_set(&self.device, descriptor_set);
+            return Err(format!("waiting for the queue failed: {err}"));
+        }
+        self.viewport_pipeline.bind_texture(&self.device, descriptor_set, imported.view);
+        let new = SampledLayer { image: GpuImage::Imported(imported), descriptor_set };
+        if let Some(old) = self.layers.insert(viewport_id, new) {
+            self.retire_layer(viewport_id, old);
+        }
+        Ok(())
+    }
+
+    /// Show a shared D3D11 texture. A texture this viewport already imported (on screen or parked)
+    /// is re-acquired instead of imported again; the producer's fence, when it gave one, is waited
+    /// on first. Every outcome lands in `texture.status`, and a failure keeps the previous frame.
+    unsafe fn submit_d3d11(&mut self, viewport_id: u64, mut texture: D3d11Import) {
+        let status = texture.status.clone();
+        let Some(support) = self.d3d11.clone() else {
+            status.set("unavailable: this GPU or driver cannot import D3D11 textures (VK_KHR_external_memory_win32)");
+            return;
+        };
+        let fence = texture.fence.take();
+        if fence.is_some() && support.semaphore.is_none() {
+            status.set("unavailable: this GPU cannot import D3D fences; submit without a fence");
+            return;
+        }
+        let device = self.device.clone();
+        let queue = self.queue;
+
+        let shown = matches!(
+            self.layers.get(&viewport_id),
+            Some(SampledLayer { image: GpuImage::Imported(image), .. }) if image.is_import_of(&texture)
+        );
+        if shown {
+            let Some(SampledLayer { image: GpuImage::Imported(image), .. }) = self.layers.get_mut(&viewport_id) else {
+                return;
+            };
+            match sync_import(&device, queue, &support, image, fence) {
+                // The producer rewrote the texture since we last sampled it, so the next draw
+                // acquires it from the external queue family again.
+                Ok(()) => {
+                    image.acquire_external = true;
+                    status.set("ok: showing a texture that was already imported");
+                }
+                Err(message) => status.set(message),
+            }
+            return;
+        }
+        let parked = self
+            .parked_imports
+            .get_mut(&viewport_id)
+            .and_then(|ring| ring.find_mut(|layer| matches!(&layer.image, GpuImage::Imported(i) if i.is_import_of(&texture))));
+        if let Some(SampledLayer { image: GpuImage::Imported(image), .. }) = parked {
+            if let Err(message) = sync_import(&device, queue, &support, image, fence) {
+                status.set(message);
+                return;
+            }
+            image.acquire_external = true;
+            let found = self
+                .parked_imports
+                .get_mut(&viewport_id)
+                .and_then(|ring| ring.take(|layer| matches!(&layer.image, GpuImage::Imported(i) if i.is_import_of(&texture))));
+            if let Some(found) = found {
+                if let Some(old) = self.layers.insert(viewport_id, found) {
+                    self.retire_layer(viewport_id, old);
+                }
+            }
+            status.set("ok: showing a texture that was already imported");
+            return;
+        }
+
+        // Vulkan takes any size for an imported texture, so read the real one from D3D first.
+        let format = match check_texture(&support, &texture) {
+            Ok(format) => format,
+            Err(message) => {
+                status.set(message);
+                return;
+            }
+        };
+        let (width, height) = (texture.width, texture.height);
+        let mut imported =
+            match crate::d3d_import::import(&device, &support.memory, &self.memory_properties, texture, format) {
+                Ok(imported) => imported,
+                Err(err) => {
+                    status.set(format!("import failed: {err} ({format:?}, {width}x{height})"));
+                    return;
+                }
+            };
+        if let Err(message) = sync_import(&device, queue, &support, &mut imported, fence) {
+            imported.destroy(&device);
+            status.set(message);
+            return;
+        }
+        match self.install_import(viewport_id, imported) {
+            Ok(()) => status.set("ok: imported a new texture"),
+            Err(message) => status.set(message),
+        }
+    }
+
+    /// Take a layer off screen. A D3D import that keeps its handle is parked for reuse; anything
+    /// else is destroyed. Callers have already waited for the GPU to finish with it.
+    unsafe fn retire_layer(&mut self, viewport_id: u64, layer: SampledLayer) {
+        let cacheable = matches!(&layer.image, GpuImage::Imported(img) if img.shared_handle.is_some());
+        if !cacheable {
+            self.destroy_layer(layer);
+            return;
+        }
+        let evicted = self.parked_imports.entry(viewport_id).or_default().park(layer);
+        if !evicted.is_empty() {
+            let _ = self.device.queue_wait_idle(self.queue);
+            for layer in evicted {
+                self.destroy_layer(layer);
+            }
         }
     }
 
@@ -612,6 +884,7 @@ impl VulkanRenderer {
         match layer.image {
             GpuImage::Cpu(texture) => texture.destroy(&self.device),
             GpuImage::Cuda(texture) => texture.destroy(&self.device),
+            GpuImage::Imported(texture) => texture.destroy(&self.device),
         }
         self.viewport_pipeline.free_set(&self.device, layer.descriptor_set);
     }
@@ -716,15 +989,18 @@ impl VulkanRenderer {
                     sync_sampled_image(
                         &mut layer.image,
                         color_subresource,
+                        self.queue_family_index,
                         &mut barriers,
                     );
                 }
             }
+            let graphics_family = self.queue_family_index;
             for draw in viewports {
                 if let Some(layer) = self.layers.get_mut(&draw.viewport_id) {
                     sync_sampled_image(
                         &mut layer.image,
                         color_subresource,
+                        graphics_family,
                         &mut barriers,
                     );
                 }
@@ -791,6 +1067,7 @@ impl VulkanRenderer {
                 let (cw, ch) = match &layer.image {
                     GpuImage::Cpu(texture) => (texture.width, texture.height),
                     GpuImage::Cuda(cuda) => cuda.size(),
+                    GpuImage::Imported(imported) => (imported.width, imported.height),
                 };
                 let draw = draw.letterboxed(cw, ch);
                 let Some(([x, y, width, height], [sx, sy, sw, sh])) =
@@ -841,6 +1118,20 @@ impl VulkanRenderer {
                     }
                 }
             }
+            // A D3D producer's fence: signaled when this frame has finished sampling its texture.
+            let signal_result = viewports.iter().try_for_each(|draw| -> Result<(), vk::Result> {
+                if let Some(SampledLayer { image: GpuImage::Imported(image), .. }) = self.layers.get_mut(&draw.viewport_id)
+                {
+                    if let (Some(value), Some(fence)) = (image.pending_signal.take(), &image.fence) {
+                        let current = self.device.get_semaphore_counter_value(fence.semaphore)?;
+                        if value > current {
+                            signal_semaphores.push(fence.semaphore);
+                            signal_values.push(value);
+                        }
+                    }
+                }
+                Ok(())
+            });
             let cmds = [cmd];
             let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
                 .wait_semaphore_values(&wait_values)
@@ -851,9 +1142,8 @@ impl VulkanRenderer {
                 .command_buffers(&cmds)
                 .signal_semaphores(&signal_semaphores)
                 .push_next(&mut timeline_info);
-            let submitted = self
-                .device
-                .end_command_buffer(cmd)
+            let submitted = signal_result
+                .and_then(|()| self.device.end_command_buffer(cmd))
                 .and_then(|()| self.device.queue_submit(self.queue, &[submit_info], fence));
             for id in &pickups {
                 if let Some(SampledLayer { image: GpuImage::Cuda(layer), .. }) = self.layers.get_mut(id) {
@@ -906,9 +1196,81 @@ impl VulkanRenderer {
 }
 
 
+/// What `texture` really is, from D3D, checked against what the caller said and what this GPU can
+/// import. `Err` is the status message; the submission is then dropped.
+#[cfg(windows)]
+pub(crate) fn check_texture(support: &D3dSupport, texture: &D3d11Import) -> Result<SharedFormat, String> {
+    let probe = support
+        .probe
+        .as_ref()
+        .map_err(|why| format!("cannot check the texture, so it is not imported: {why}"))?;
+    let real = probe.describe(texture.handle())?;
+    if (real.width, real.height) != (texture.width, texture.height) {
+        return Err(format!(
+            "the texture is {}x{} but submit_d3d11 was told {}x{}",
+            real.width, real.height, texture.width, texture.height
+        ));
+    }
+    if let Some(said) = texture.format {
+        if said != real.format {
+            return Err(format!("the texture is {:?} but submit_d3d11 was told {:?}", real.format, said));
+        }
+    }
+    if !support.supports(real.format) {
+        return Err(format!("this GPU cannot import {:?} D3D11 textures", real.format));
+    }
+    Ok(real.format)
+}
+
+#[cfg(not(windows))]
+fn check_texture(_support: &D3dSupport, _texture: &D3d11Import) -> Result<SharedFormat, String> {
+    Err("D3D11 import is Windows-only".to_string())
+}
+
+/// Attach `fence` to `image` (or keep the one it already has when it is the same fence) and wait
+/// for its `wait_value`. `Err` carries the status message; the submission is then dropped.
+pub(crate) unsafe fn sync_import(
+    device: &Device,
+    queue: vk::Queue,
+    support: &D3dSupport,
+    image: &mut ImportedImage,
+    fence: Option<D3d11Fence>,
+) -> Result<(), String> {
+    let Some(mut fence) = fence else {
+        image.pending_signal = None;
+        return Ok(());
+    };
+    let loader = support.semaphore.as_ref().ok_or("this GPU cannot import D3D fences")?;
+    if !image.fence.as_ref().is_some_and(|kept| kept.is_import_of(fence.handle())) {
+        let imported = crate::d3d_import::import_fence(device, loader, &mut fence)
+            .map_err(|err| format!("could not import the fence: {err} (it must be a shared ID3D11Fence or ID3D12Fence NT handle)"))?;
+        if let Some(old) = image.fence.replace(imported) {
+            let _ = device.queue_wait_idle(queue);
+            old.destroy(device);
+        }
+    }
+    let semaphore = image.fence.as_ref().map(|kept| kept.semaphore).ok_or("fence missing after import")?;
+    if fence.wait_value > 0 {
+        match crate::d3d_import::wait_fence(device, semaphore, fence.wait_value) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(format!(
+                    "timed out after {} ms waiting for fence value {}; the previous frame stays",
+                    crate::d3d_import::FENCE_WAIT.as_millis(),
+                    fence.wait_value
+                ))
+            }
+            Err(err) => return Err(format!("waiting for the fence failed: {err}")),
+        }
+    }
+    image.pending_signal = (fence.signal_value > 0).then_some(fence.signal_value);
+    Ok(())
+}
+
 fn sync_sampled_image(
     image: &mut GpuImage,
     color_subresource: vk::ImageSubresourceRange,
+    graphics_family: u32,
     barriers: &mut Vec<vk::ImageMemoryBarrier<'_>>,
 ) {
     match image {
@@ -928,6 +1290,28 @@ fn sync_sampled_image(
         }
         // Synchronized by its own pickup barriers (`CudaLayer::record_pickup`).
         GpuImage::Cuda(_) => {}
+        GpuImage::Imported(texture) => {
+            // A D3D texture is acquired from the external queue family on its first use. After
+            // that it has been ours, and the barrier only keeps the layout GENERAL.
+            let (src_family, dst_family) = if texture.acquire_external {
+                (vk::QUEUE_FAMILY_EXTERNAL, graphics_family)
+            } else {
+                (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
+            };
+            texture.acquire_external = false;
+            barriers.push(
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(texture.current_layout)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(src_family)
+                    .dst_queue_family_index(dst_family)
+                    .image(texture.image)
+                    .subresource_range(color_subresource)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ),
+            );
+            texture.current_layout = vk::ImageLayout::GENERAL;
+        }
     }
 }
 
@@ -960,6 +1344,14 @@ impl Drop for VulkanRenderer {
             for id in ids {
                 if let Some(layer) = self.layers.remove(&id) {
                     self.destroy_layer(layer);
+                }
+            }
+            let parked: Vec<u64> = self.parked_imports.keys().copied().collect();
+            for id in parked {
+                if let Some(mut ring) = self.parked_imports.remove(&id) {
+                    for layer in ring.drain() {
+                        self.destroy_layer(layer);
+                    }
                 }
             }
             self.quad_chrome.destroy(&self.device, &self.viewport_pipeline);
@@ -1016,6 +1408,10 @@ impl fastgui_app::SurfaceBackend for VulkanRenderer {
 
     fn set_layer_frame(&mut self, viewport_id: u64, frame: CpuFrame) -> Result<(), Self::Error> {
         VulkanRenderer::set_layer_frame(self, viewport_id, frame)
+    }
+
+    fn set_imported_layer(&mut self, viewport_id: u64, layer: ImportedLayer) -> Result<(), Self::Error> {
+        VulkanRenderer::set_imported_layer(self, viewport_id, layer)
     }
 
     fn retain_layers(&mut self, live_ids: &[u64]) {

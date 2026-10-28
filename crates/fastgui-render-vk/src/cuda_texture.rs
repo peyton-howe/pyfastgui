@@ -8,6 +8,35 @@ use crate::texture::find_memory_type_index;
 
 pub use fastgui_app::CudaExportHandles;
 
+/// Which external-handle family `CudaLayer::new` exports. Windows uses NT handles. Linux uses
+/// POSIX opaque fds. The slot protocol is the same either way.
+pub enum CudaExternal<'a> {
+    Win32 {
+        memory: &'a khr::external_memory_win32::Device,
+        semaphore: &'a khr::external_semaphore_win32::Device,
+    },
+    OpaqueFd {
+        memory: &'a khr::external_memory_fd::Device,
+        semaphore: &'a khr::external_semaphore_fd::Device,
+    },
+}
+
+impl CudaExternal<'_> {
+    fn memory_type(&self) -> vk::ExternalMemoryHandleTypeFlags {
+        match self {
+            Self::Win32 { .. } => vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32,
+            Self::OpaqueFd { .. } => vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD,
+        }
+    }
+
+    fn semaphore_type(&self) -> vk::ExternalSemaphoreHandleTypeFlags {
+        match self {
+            Self::Win32 { .. } => vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_WIN32,
+            Self::OpaqueFd { .. } => vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD,
+        }
+    }
+}
+
 const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 /// Slot starts are aligned to this so CUDA gets nicely aligned pointers (texel copies only need 4).
 const SLOT_ALIGN: u64 = 256;
@@ -47,8 +76,7 @@ pub struct CudaLayer {
 impl CudaLayer {
     pub unsafe fn new(
         device: &Device,
-        external_memory_win32: &khr::external_memory_win32::Device,
-        external_semaphore_win32: &khr::external_semaphore_win32::Device,
+        external: CudaExternal<'_>,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
         device_uuid: [u8; 16],
         width: u32,
@@ -59,7 +87,7 @@ impl CudaLayer {
 
         // Exported slot buffer. TRANSFER_DST only so tests can stand in for CUDA.
         let mut external_buffer_info = vk::ExternalMemoryBufferCreateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
+            .handle_types(external.memory_type());
         let buffer = device.create_buffer(
             &vk::BufferCreateInfo::default()
                 .size(slot_stride * CUDA_SLOTS as u64)
@@ -85,7 +113,7 @@ impl CudaLayer {
         )
         .ok_or(Error::NoDeviceLocalTextureMemory)?;
         let mut export_info = vk::ExportMemoryAllocateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
+            .handle_types(external.memory_type());
         let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
         let mut alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
@@ -140,8 +168,9 @@ impl CudaLayer {
             None,
         )?;
 
-        let ready = create_exported_timeline(device)?;
-        let release = create_exported_timeline(device)?;
+        let semaphore_type = external.semaphore_type();
+        let ready = create_exported_timeline(device, semaphore_type)?;
+        let release = create_exported_timeline(device, semaphore_type)?;
 
         let shared = Arc::new(CudaLayerShared::default());
         let layer = Self {
@@ -165,20 +194,32 @@ impl CudaLayer {
         // handle exported before the failure is closed when the partial `CudaExportHandles` drops.
         let mut handles = CudaExportHandles {
             memory_win32_handle: 0,
+            memory_fd: -1,
             memory_size: requirements.size,
             memory_dedicated: dedicated,
             slot_stride,
             width,
             height,
             ready_win32_handle: 0,
+            ready_fd: -1,
             release_win32_handle: 0,
+            release_fd: -1,
             device_uuid,
             shared,
         };
         let exported = (|| -> Result<(), Error> {
-            handles.memory_win32_handle = export_memory(external_memory_win32, device, buffer_memory)?;
-            handles.ready_win32_handle = export_semaphore(external_semaphore_win32, device, ready)?;
-            handles.release_win32_handle = export_semaphore(external_semaphore_win32, device, release)?;
+            match external {
+                CudaExternal::Win32 { memory, semaphore } => {
+                    handles.memory_win32_handle = export_memory_win32(memory, device, buffer_memory)?;
+                    handles.ready_win32_handle = export_semaphore_win32(semaphore, device, ready)?;
+                    handles.release_win32_handle = export_semaphore_win32(semaphore, device, release)?;
+                }
+                CudaExternal::OpaqueFd { memory, semaphore } => {
+                    handles.memory_fd = export_memory_fd(memory, buffer_memory)?;
+                    handles.ready_fd = export_semaphore_fd(semaphore, ready)?;
+                    handles.release_fd = export_semaphore_fd(semaphore, release)?;
+                }
+            }
             Ok(())
         })();
         match exported {
@@ -323,7 +364,7 @@ impl CudaLayer {
         device.free_memory(self.buffer_memory, None);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn test_parts(&self) -> (vk::Buffer, vk::Image, vk::Semaphore, vk::Semaphore, u64) {
         (self.buffer, self.image, self.ready, self.release, self.slot_stride)
     }
@@ -336,19 +377,21 @@ fn color_range() -> vk::ImageSubresourceRange {
         .layer_count(1)
 }
 
-unsafe fn create_exported_timeline(device: &Device) -> Result<vk::Semaphore, Error> {
+unsafe fn create_exported_timeline(
+    device: &Device,
+    handle_types: vk::ExternalSemaphoreHandleTypeFlags,
+) -> Result<vk::Semaphore, Error> {
     let mut type_info = vk::SemaphoreTypeCreateInfo::default()
         .semaphore_type(vk::SemaphoreType::TIMELINE)
         .initial_value(0);
-    let mut export_info = vk::ExportSemaphoreCreateInfo::default()
-        .handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_WIN32);
+    let mut export_info = vk::ExportSemaphoreCreateInfo::default().handle_types(handle_types);
     Ok(device.create_semaphore(
         &vk::SemaphoreCreateInfo::default().push_next(&mut type_info).push_next(&mut export_info),
         None,
     )?)
 }
 
-unsafe fn export_memory(
+unsafe fn export_memory_win32(
     loader: &khr::external_memory_win32::Device,
     device: &Device,
     memory: vk::DeviceMemory,
@@ -367,7 +410,29 @@ unsafe fn export_memory(
     Ok(handle as isize)
 }
 
-unsafe fn export_semaphore(
+unsafe fn export_memory_fd(
+    loader: &khr::external_memory_fd::Device,
+    memory: vk::DeviceMemory,
+) -> Result<i32, Error> {
+    Ok(loader.get_memory_fd(
+        &vk::MemoryGetFdInfoKHR::default()
+            .memory(memory)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD),
+    )?)
+}
+
+unsafe fn export_semaphore_fd(
+    loader: &khr::external_semaphore_fd::Device,
+    semaphore: vk::Semaphore,
+) -> Result<i32, Error> {
+    Ok(loader.get_semaphore_fd(
+        &vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD),
+    )?)
+}
+
+unsafe fn export_semaphore_win32(
     loader: &khr::external_semaphore_win32::Device,
     device: &Device,
     semaphore: vk::Semaphore,
