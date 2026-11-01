@@ -286,7 +286,9 @@ adapter whose LUID is `fastgui.adapter_luid()`.
   `wait_value` before sampling, for at most 100 ms on the render thread. A late fence drops the
   submission and keeps the previous frame, so a stalled producer cannot hang the window.
   `signal_value` is signaled once the frame that first draws the submission has finished
-  sampling; a producer that reuses a texture waits for it. Keyed mutexes are not used.
+  sampling; a producer that reuses a texture waits for it. It must be greater than `wait_value`
+  and than the fence's current value, since a value already reached would say sampling is done
+  before it is; such a submission is refused. Keyed mutexes are not used.
 
 `python/examples/d3d11_viewport.py` is a ctypes-only producer (no pywin32) that renders into a ring
 of shared textures: `--bgra`, `--fence`, `--color R,G,B`, `--seconds N`. The Rust tests

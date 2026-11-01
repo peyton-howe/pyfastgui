@@ -1123,6 +1123,8 @@ impl VulkanRenderer {
                 if let Some(SampledLayer { image: GpuImage::Imported(image), .. }) = self.layers.get_mut(&draw.viewport_id)
                 {
                     if let (Some(value), Some(fence)) = (image.pending_signal.take(), &image.fence) {
+                        // `sync_import` refused a value at or below the fence; this only catches a
+                        // producer that advanced the fence past it since.
                         let current = self.device.get_semaphore_counter_value(fence.semaphore)?;
                         if value > current {
                             signal_semaphores.push(fence.semaphore);
@@ -1261,6 +1263,21 @@ pub(crate) unsafe fn sync_import(
                 ))
             }
             Err(err) => return Err(format!("waiting for the fence failed: {err}")),
+        }
+    }
+    if fence.signal_value > 0 {
+        // A value the fence has already reached (which includes `wait_value` once the wait above
+        // succeeded) would read as "done sampling" before the draw, so the producer could rewrite
+        // the texture while it is still being sampled. The draw-time check would also skip it.
+        let current = device
+            .get_semaphore_counter_value(semaphore)
+            .map_err(|err| format!("reading the fence value failed: {err}"))?;
+        if fence.signal_value <= current.max(fence.wait_value) {
+            return Err(format!(
+                "signal_value {} must be greater than wait_value {} and the fence's current value {}; \
+                 the submission was dropped",
+                fence.signal_value, fence.wait_value, current
+            ));
         }
     }
     image.pending_signal = (fence.signal_value > 0).then_some(fence.signal_value);

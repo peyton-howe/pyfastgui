@@ -106,7 +106,8 @@ class Viewport:
         `fence` is an NT handle from a shared `ID3D11Fence`/`ID3D12Fence`. fastgui waits for
         `wait_value` before sampling (up to 100 ms; if it is late the submission is dropped) and
         signals `signal_value` once the frame that first draws this submission has finished
-        sampling; `0` skips that half. Without a fence the producer must have finished (flushed and
+        sampling; `0` skips that half. `signal_value` must be greater than `wait_value` and than the fence's current value,
+        or the submission is refused. Without a fence the producer must have finished (flushed and
         waited) before the call. Resubmit the same handle each frame: a texture already imported
         (up to four per viewport) is not imported again.
 

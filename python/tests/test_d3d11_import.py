@@ -30,6 +30,11 @@ class SubmitD3d11Tests(unittest.TestCase):
                     widget.submit_d3d11(0x7FFFFFF0, 4, 4, wait_value=3)  # a value needs a fence
                 with self.assertRaises(ValueError):
                     widget.submit_d3d11(0x7FFFFFF0, 4, 4, fence=0x7FFFFFF0)  # neither is a handle
+                for wait, signal in ((2, 2), (3, 2)):  # a signal must come after the wait
+                    with self.assertRaisesRegex(ValueError, "signal_value must be greater"):
+                        widget.submit_d3d11(
+                            0x7FFFFFF0, 4, 4, fence=0x7FFFFFF0, wait_value=wait, signal_value=signal
+                        )
             else:
                 with self.assertRaises(RuntimeError):
                     widget.submit_d3d11(0, 4, 4)

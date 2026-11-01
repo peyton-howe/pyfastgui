@@ -187,7 +187,9 @@ impl Viewport {
     /// shared fence), to wait for `wait_value` before sampling (up to 100 ms on the render thread;
     /// if it is late the submission is dropped and the previous frame stays) and to have
     /// `signal_value` signaled once the frame that first draws this submission has finished sampling.
-    /// `0` skips that half. Without a fence the producer must have finished (flush, then wait on an
+    /// `0` skips that half. `signal_value` must be greater than `wait_value` and than the fence's current value (a value
+    /// already reached would say sampling is done before it is); otherwise the submission is
+    /// refused. Without a fence the producer must have finished (flush, then wait on an
     /// event query) before the call. Keyed mutexes are not used.
     ///
     /// Create the handle once per texture and resubmit it each frame: a duplicate of a texture

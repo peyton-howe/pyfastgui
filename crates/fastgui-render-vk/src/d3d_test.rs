@@ -489,6 +489,23 @@ fn imported_d3d_fence_waits_for_the_producer_and_signals_back() {
             std::thread::yield_now();
         }
 
+        // A signal value the fence has already reached is refused, not reported as ok: the
+        // producer would read it as "done sampling" before the draw. The fence is at 2 here.
+        for (wait, signal) in [(2, 2), (1, 1), (0, 2), (0, 1)] {
+            let refused = crate::renderer::sync_import(
+                &bench.device,
+                bench.queue,
+                support,
+                &mut imported,
+                Some(ticket(wait, signal)),
+            )
+            .expect_err("a signal value at or below the fence must be refused");
+            assert!(refused.contains("must be greater than"), "wait {wait}, signal {signal}: {refused}");
+        }
+        crate::renderer::sync_import(&bench.device, bench.queue, support, &mut imported, Some(ticket(2, 3)))
+            .expect("a signal value above the fence is accepted");
+        assert_eq!(imported.pending_signal, Some(3));
+
         // No fence in a submission clears a stale signal request.
         imported.pending_signal = Some(9);
         crate::renderer::sync_import(&bench.device, bench.queue, support, &mut imported, None).unwrap();

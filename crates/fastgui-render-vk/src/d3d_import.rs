@@ -12,7 +12,10 @@
 //! thread, bounded by [`FENCE_WAIT`], before the texture is sampled; if the fence is late the
 //! submission is dropped and the previous frame stays, so a stalled producer cannot hang the window.
 //! `signal_value` is signaled when the frame that first draws the submission has finished on the
-//! GPU. Submissions that fail or are replaced before being drawn never signal their `signal_value`.
+//! GPU, so it must be greater than `wait_value` and than the fence's current value: a value the
+//! fence has already reached would tell the producer sampling is done before it is. Such a
+//! submission is refused (the status says why) rather than reported as `ok`.
+//! Submissions that fail or are replaced before being drawn never signal their `signal_value`.
 //! Producers waiting on `signal_value` must check `d3d11_status` and use a timeout.
 //! Without a fence the producer must have finished (flushed and waited) before the call.
 

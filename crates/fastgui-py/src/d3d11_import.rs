@@ -49,6 +49,11 @@ pub(crate) fn prepare(
         if options.fence.is_none() && (options.wait_value != 0 || options.signal_value != 0) {
             return Err(PyValueError::new_err("wait_value and signal_value need a fence"));
         }
+        if options.signal_value != 0 && options.signal_value <= options.wait_value {
+            return Err(PyValueError::new_err(
+                "signal_value must be greater than wait_value (or 0 to not signal)",
+            ));
+        }
         let duped = dup_handle(handle).map_err(|_| {
             PyValueError::new_err("handle is not a valid NT handle (use IDXGIResource1::CreateSharedHandle)")
         })?;
