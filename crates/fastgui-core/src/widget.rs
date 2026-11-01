@@ -822,12 +822,15 @@ pub enum WidgetKind {
         closes_on_anchor_click: bool,
         open: Option<Readback<bool>>,
     },
-    /// A GPU/CPU image rect composited on top of chrome. `frames` is the same latest-wins
-    /// mailbox `Viewport.submit_frame` writes; `viewport_id` is a stable identity for the
-    /// renderer's GPU texture cache across tree rebuilds (unlike `WidgetId`).
+    /// A GPU/CPU image rect composited on top of chrome. `frames` is the latest-wins mailbox
+    /// `Viewport.submit_frame` writes; `imported` is the mailbox for a GPU resource sampled in
+    /// place (`submit_metal`, and a dma-buf on Vulkan). Each submit clears the other mailbox.
+    /// `viewport_id` is a stable identity for the renderer's GPU texture cache across tree
+    /// rebuilds (unlike `WidgetId`).
     Viewport {
         viewport_id: u64,
         frames: FrameSlot<crate::CpuFrame>,
+        imported: FrameSlot<crate::ImportedLayer>,
         fit: LayerFit,
     },
     /// A labeled on/off control. `checked` is the current value; `on_change` fires on toggle
@@ -910,6 +913,7 @@ pub enum WidgetKind {
     Image {
         image_id: u64,
         frames: FrameSlot<crate::CpuFrame>,
+        imported: FrameSlot<crate::ImportedLayer>,
         fit: LayerFit,
         /// When set, wheel / drag / hover over this image are delivered here instead of
         /// scrolling a parent `ScrollArea`.
@@ -4090,7 +4094,12 @@ mod tests {
                 size: Size { width: Dimension::percent(1.0), height: Dimension::percent(1.0) },
                 ..Default::default()
             },
-            WidgetKind::Viewport { viewport_id: 1, frames: slot.clone(), fit: LayerFit::Stretch },
+            WidgetKind::Viewport {
+                viewport_id: 1,
+                frames: slot.clone(),
+                imported: FrameSlot::new(),
+                fit: LayerFit::Stretch,
+            },
         );
         tree.add_child(root, id);
         tree.compute_layout(64.0, 32.0);

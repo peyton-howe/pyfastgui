@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use fastgui_core::widget::{LayerFit, Rect};
-use fastgui_core::{ChromeFrame, ChromeQuads, CpuFrame};
+use fastgui_core::{ChromeFrame, ChromeQuads, CpuFrame, ImportedLayer};
 use winit::window::Window;
 
 use crate::constants::RESIZE_DEBOUNCE;
@@ -98,6 +98,13 @@ pub trait SurfaceBackend: Sized {
     fn set_chrome_quads(&mut self, frame: &ChromeQuads<'_>) -> Result<(), Self::Error>;
 
     fn set_layer_frame(&mut self, viewport_id: u64, frame: CpuFrame) -> Result<(), Self::Error>;
+
+    /// Sample `layer` for `viewport_id` instead of uploading CPU bytes. The default drops the
+    /// import and leaves whatever that layer already shows: a backend that cannot use this kind
+    /// must not fail the frame. Callers validate before queueing.
+    fn set_imported_layer(&mut self, _viewport_id: u64, _layer: ImportedLayer) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     fn retain_layers(&mut self, live_ids: &[u64]);
 

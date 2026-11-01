@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use fastgui_chrome::ChromeRenderer;
 use fastgui_core::theme::chrome_theme;
+use fastgui_core::{CpuFrame, ImportedLayer};
 use fastgui_core::widget::{
     Color, LayerFit, PointerCallback, PopupAnchor, PopupPress, PopupSide, Rect, WidgetId,
     WidgetKind, WidgetTree, SPLITTER_HIT_SLOP,
@@ -255,6 +256,11 @@ struct App<B: SurfaceBackend> {
     error: Option<RunError<B::Error>>,
 }
 
+enum LayerUpload {
+    Cpu(CpuFrame),
+    Imported(ImportedLayer),
+}
+
 impl<B: SurfaceBackend> App<B> {
     /// Apply every command queued since the last frame.
     /// Needs `event_loop` so `AddFloatingPanel` can create additional winit windows.
@@ -504,23 +510,9 @@ impl<B: SurfaceBackend> App<B> {
             self.last_raster_scale = self.scale_factor;
         }
 
-        let mut live_ids = Vec::new();
-        let mut uploads = Vec::new();
-        for id in self.widget_tree.walk() {
-            let (layer_id, frames) = match self.widget_tree.kind(id) {
-                Some(WidgetKind::Viewport { viewport_id, frames, .. }) => (*viewport_id, frames),
-                Some(WidgetKind::Image { image_id, frames, .. }) => (*image_id, frames),
-                _ => continue,
-            };
-            live_ids.push(layer_id);
-            if let Some(frame) = frames.take_latest() {
-                uploads.push((layer_id, frame));
-            }
-        }
+        let (live_ids, uploads) = Self::collect_layer_uploads(&self.widget_tree);
         if let Some(renderer) = &mut self.renderer {
-            for (viewport_id, frame) in uploads {
-                renderer.set_layer_frame(viewport_id, frame)?;
-            }
+            Self::apply_layer_uploads(renderer, uploads)?;
             renderer.retain_layers(&live_ids);
         }
         Ok(())
@@ -552,23 +544,45 @@ impl<B: SurfaceBackend> App<B> {
             floater.last_raster_scale = floater.scale_factor;
         }
 
+        let (live_ids, uploads) = Self::collect_layer_uploads(&floater.widget_tree);
+        Self::apply_layer_uploads(&mut floater.renderer, uploads)?;
+        floater.renderer.retain_layers(&live_ids);
+        Ok(())
+    }
+
+    /// Latest CPU frame and latest imported GPU resource for every viewport and image.
+    /// Submits clear the other mailbox; if both are set anyway (two threads raced), the import
+    /// is the one applied.
+    fn collect_layer_uploads(tree: &WidgetTree) -> (Vec<u64>, Vec<(u64, LayerUpload)>) {
         let mut live_ids = Vec::new();
         let mut uploads = Vec::new();
-        for id in floater.widget_tree.walk() {
-            let (layer_id, frames) = match floater.widget_tree.kind(id) {
-                Some(WidgetKind::Viewport { viewport_id, frames, .. }) => (*viewport_id, frames),
-                Some(WidgetKind::Image { image_id, frames, .. }) => (*image_id, frames),
+        for id in tree.walk() {
+            let (layer_id, frames, imported) = match tree.kind(id) {
+                Some(WidgetKind::Viewport { viewport_id, frames, imported, .. }) => {
+                    (*viewport_id, frames, imported)
+                }
+                Some(WidgetKind::Image { image_id, frames, imported, .. }) => (*image_id, frames, imported),
                 _ => continue,
             };
             live_ids.push(layer_id);
-            if let Some(frame) = frames.take_latest() {
-                uploads.push((layer_id, frame));
+            let cpu = frames.take_latest();
+            let foreign = imported.take_latest();
+            match (cpu, foreign) {
+                (_, Some(layer)) => uploads.push((layer_id, LayerUpload::Imported(layer))),
+                (Some(frame), None) => uploads.push((layer_id, LayerUpload::Cpu(frame))),
+                (None, None) => {}
             }
         }
-        for (viewport_id, frame) in uploads {
-            floater.renderer.set_layer_frame(viewport_id, frame)?;
+        (live_ids, uploads)
+    }
+
+    fn apply_layer_uploads(renderer: &mut B, uploads: Vec<(u64, LayerUpload)>) -> Result<(), B::Error> {
+        for (viewport_id, upload) in uploads {
+            match upload {
+                LayerUpload::Cpu(frame) => renderer.set_layer_frame(viewport_id, frame)?,
+                LayerUpload::Imported(layer) => renderer.set_imported_layer(viewport_id, layer)?,
+            }
         }
-        floater.renderer.retain_layers(&live_ids);
         Ok(())
     }
 

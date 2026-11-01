@@ -1,4 +1,5 @@
 from ._fastgui import (
+    adapter_luid,
     Box,
     Button,
     Checkbox,
@@ -1041,6 +1042,7 @@ from .tier4 import CodeEditor, CommandPalette, ImageViewer, LogView, Observable
 
 
 __all__ = [
+    "adapter_luid",
     "Box",
     "Button",
     "Checkbox",

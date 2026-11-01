@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 /// Pixel layout of a `CpuFrame`. RGBA8 only for now — enough to cover numpy/buffer-protocol
@@ -171,6 +172,257 @@ impl<T> FrameSlot<T> {
     pub fn take_latest(&self) -> Option<T> {
         self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
     }
+
+    /// Drop a pending frame. A CPU submit and an imported submit share a layer, and each one
+    /// clears the other so the render thread does not upload bytes it is about to replace.
+    pub fn clear(&self) {
+        *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+/// A GPU resource the viewport samples directly, instead of copying a `CpuFrame`.
+///
+/// `Metal` carries an already-retained backend object in `retained` (`fastgui-render-mtl`
+/// downcasts it). `DmaBuf` owns a duplicated file descriptor; dropping it closes that fd unless
+/// [`DmaBufImport::take_fd`] has handed the fd to the driver. `D3d11` owns a duplicated NT handle
+/// to a shared Direct3D 11 texture; Vulkan does not take ownership of it, so dropping it always
+/// closes the handle.
+pub enum ImportedLayer {
+    Metal {
+        /// `id<MTLTexture>`, retained inside `retained`.
+        texture: usize,
+        width: u32,
+        height: u32,
+        /// `id<MTLEvent>`, or 0 when this submission does not wait.
+        wait_event: usize,
+        wait_value: u64,
+        /// `id<MTLEvent>`, or 0 when this submission does not signal.
+        signal_event: usize,
+        signal_value: u64,
+        retained: Box<dyn Any + Send>,
+    },
+    DmaBuf(DmaBufImport),
+    D3d11(D3d11Import),
+}
+
+/// Linear RGBA8 dma-buf (or opaque fd) to import as a sampled image. `modifier == 0` means
+/// linear, with no DRM format modifier. The first cut does not accept NV12.
+#[derive(Debug)]
+pub struct DmaBufImport {
+    fd: i32,
+    pub width: u32,
+    pub height: u32,
+    /// Bytes from the start of one row to the next. `0` means tightly packed (`width * 4`).
+    pub stride: u32,
+    pub modifier: u64,
+}
+
+impl DmaBufImport {
+    pub fn new(fd: i32, width: u32, height: u32, stride: u32, modifier: u64) -> Self {
+        Self { fd, width, height, stride, modifier }
+    }
+
+    pub fn fd(&self) -> i32 {
+        self.fd
+    }
+
+    /// The fd the driver is about to consume. Later drops do not close it.
+    pub fn take_fd(&mut self) -> i32 {
+        let fd = self.fd;
+        self.fd = -1;
+        fd
+    }
+}
+
+impl Drop for DmaBufImport {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            close_fd(self.fd);
+            self.fd = -1;
+        }
+    }
+}
+
+/// Channel order of a shared Direct3D texture. Both are 8 bits per channel, unsigned normalized.
+/// `Bgra8` is what DXGI desktop duplication, most Media Foundation output, and swapchain-style
+/// textures use; the viewport shader reads it as ordinary RGBA.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SharedFormat {
+    #[default]
+    Rgba8,
+    Bgra8,
+}
+
+/// What the render thread last did with a Direct3D submission, readable from Python. Shared
+/// between a `Viewport`/`Image` and the layers it submits.
+#[derive(Debug, Default)]
+pub struct ImportStatus(Mutex<String>);
+
+impl ImportStatus {
+    pub fn set(&self, message: impl Into<String>) {
+        *self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = message.into();
+    }
+
+    /// `"unused"` until the render thread has processed a submission.
+    pub fn get(&self) -> String {
+        let message = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        if message.is_empty() {
+            "unused".to_string()
+        } else {
+            message
+        }
+    }
+}
+
+/// An `ID3D11Fence` / `ID3D12Fence` NT handle (created shared) this value owns, with the values to
+/// wait for before sampling and to signal once the draw that first uses the submission has finished
+/// on the GPU. `0` means that half is unused.
+#[derive(Debug)]
+pub struct D3d11Fence {
+    handle: isize,
+    pub wait_value: u64,
+    pub signal_value: u64,
+}
+
+impl D3d11Fence {
+    pub fn new(handle: isize, wait_value: u64, signal_value: u64) -> Self {
+        Self { handle, wait_value, signal_value }
+    }
+
+    pub fn handle(&self) -> isize {
+        self.handle
+    }
+
+    /// The handle the importer will keep. Later drops do not close it.
+    pub fn take_handle(&mut self) -> isize {
+        std::mem::replace(&mut self.handle, 0)
+    }
+}
+
+impl Drop for D3d11Fence {
+    fn drop(&mut self) {
+        if self.handle != 0 {
+            close_handle(self.handle);
+            self.handle = 0;
+        }
+    }
+}
+
+/// A shared 8-bit RGBA or BGRA Direct3D 11 texture (created with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE`)
+/// to import as a sampled image. `handle` is an NT handle this value owns; legacy `GetSharedHandle`
+/// handles are not accepted.
+#[derive(Debug)]
+pub struct D3d11Import {
+    handle: isize,
+    pub width: u32,
+    pub height: u32,
+    /// `None` takes the format from the texture itself.
+    pub format: Option<SharedFormat>,
+    pub fence: Option<D3d11Fence>,
+    pub status: Arc<ImportStatus>,
+}
+
+impl D3d11Import {
+    pub fn new(handle: isize, width: u32, height: u32) -> Self {
+        Self {
+            handle,
+            width,
+            height,
+            format: None,
+            fence: None,
+            status: Arc::default(),
+        }
+    }
+
+    pub fn with_format(mut self, format: Option<SharedFormat>) -> Self {
+        self.format = format;
+        self
+    }
+
+    pub fn with_fence(mut self, fence: Option<D3d11Fence>) -> Self {
+        self.fence = fence;
+        self
+    }
+
+    pub fn with_status(mut self, status: Arc<ImportStatus>) -> Self {
+        self.status = status;
+        self
+    }
+
+    pub fn handle(&self) -> isize {
+        self.handle
+    }
+
+    /// The handle the importer will keep. Later drops do not close it.
+    pub fn take_handle(&mut self) -> isize {
+        std::mem::replace(&mut self.handle, 0)
+    }
+}
+
+impl Drop for D3d11Import {
+    fn drop(&mut self) {
+        if self.handle != 0 {
+            close_handle(self.handle);
+            self.handle = 0;
+        }
+    }
+}
+
+impl std::fmt::Debug for ImportedLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImportedLayer::Metal {
+                texture,
+                width,
+                height,
+                wait_event,
+                wait_value,
+                signal_event,
+                signal_value,
+                ..
+            } => f
+                .debug_struct("Metal")
+                .field("texture", texture)
+                .field("width", width)
+                .field("height", height)
+                .field("wait_event", wait_event)
+                .field("wait_value", wait_value)
+                .field("signal_event", signal_event)
+                .field("signal_value", signal_value)
+                .finish(),
+            ImportedLayer::DmaBuf(buf) => f.debug_tuple("DmaBuf").field(buf).finish(),
+            ImportedLayer::D3d11(tex) => f.debug_tuple("D3d11").field(tex).finish(),
+        }
+    }
+}
+
+fn close_handle(handle: isize) {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CloseHandle(handle: isize) -> i32;
+        }
+        unsafe { CloseHandle(handle) };
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = handle;
+    }
+}
+
+fn close_fd(fd: i32) {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn close(fd: i32) -> i32;
+        }
+        unsafe { close(fd) };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+    }
 }
 
 impl<T> Default for FrameSlot<T> {
@@ -192,6 +444,36 @@ mod tests {
         slot.submit(3);
         assert_eq!(slot.take_latest(), Some(3));
         assert!(slot.take_latest().is_none());
+        slot.submit(4);
+        slot.clear();
+        assert!(slot.take_latest().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dmabuf_drop_closes_fd_and_take_fd_disarms_it() {
+        use std::io::{ErrorKind, Read};
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        b.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        let raw = std::os::fd::IntoRawFd::into_raw_fd(a);
+        let mut import = DmaBufImport::new(raw, 2, 3, 8, 0);
+        assert_eq!(import.fd(), raw);
+        let taken = import.take_fd();
+        assert_eq!(taken, raw);
+        assert_eq!(import.fd(), -1);
+        drop(import);
+        assert_eq!(b.read(&mut byte).unwrap_err().kind(), ErrorKind::WouldBlock);
+        drop(unsafe { OwnedFd::from_raw_fd(taken) });
+        assert_eq!(b.read(&mut byte).unwrap(), 0);
+
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        b.set_nonblocking(true).unwrap();
+        let raw = std::os::fd::IntoRawFd::into_raw_fd(a);
+        drop(DmaBufImport::new(raw, 1, 1, 4, 0));
+        assert_eq!(b.read(&mut byte).unwrap(), 0, "drop closes the fd");
     }
 
     #[test]

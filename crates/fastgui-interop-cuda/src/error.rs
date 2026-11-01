@@ -8,4 +8,6 @@ pub enum CudaError {
     MissingSymbol(&'static str),
     #[error("CUDA driver call failed: {message} (CUresult {code})")]
     Driver { code: CUresult, message: String },
+    #[error("failed to duplicate a file descriptor for CUDA import")]
+    DupFd,
 }

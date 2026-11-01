@@ -299,6 +299,7 @@ pub(crate) fn describe_image(
         WidgetKind::Image {
             image_id,
             frames: frames.clone(),
+            imported: fastgui_core::FrameSlot::new(),
             fit,
             on_pointer,
         },

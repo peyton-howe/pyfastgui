@@ -1038,6 +1038,7 @@ fn form_controls_rasterize_without_panicking() {
         WidgetKind::Image {
             image_id: 99,
             frames: fastgui_core::FrameSlot::new(),
+            imported: fastgui_core::FrameSlot::new(),
             fit: fastgui_core::widget::LayerFit::Stretch,
             on_pointer: None,
         },

@@ -7,3 +7,12 @@ pub use fastgui_render_mtl::{run, Command, CommandDispatch, EventWaker, RenderTh
 
 #[cfg(not(target_os = "macos"))]
 pub use fastgui_render_vk::{run, Command, CommandDispatch, EventWaker, RenderThreadHandles};
+
+/// The window GPU's adapter LUID (Windows). Metal has none.
+#[cfg(target_os = "macos")]
+pub fn adapter_luid() -> Option<u64> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub use fastgui_render_vk::adapter_luid;
